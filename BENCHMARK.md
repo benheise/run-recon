@@ -345,3 +345,64 @@ and every lab certificate is now `CertUntrusted` (`--tls`). Baseline: v1.17.0, f
   owner name for its NSEC record walks the whole chain and is what run-recon does.
 - **CoreDNS cannot serve an NSEC3-signed zone**, and a failed reload keeps the previous configuration live,
   so NSEC3 is covered by the suite's mocks only.
+
+## v1.19.0: Batch 2, HTTP detail
+
+Same lab, same method; baseline v1.18.0 frozen from the repository tag. Batch 2 appends 17 columns and
+adds opt-in stages (`--extras`, the favicon-hash pivot in `--favicon`, `ptr` under `--enrich`). The
+default path gets the header-derived columns from the request it already sends (`httpx -irh -hash
+sha256`), so it had to stay as fast with identical output on every existing column.
+
+The lab changed for this batch (robots.txt, security.txt and security-header fixtures in the
+Caddyfile, a basic-auth `/private/` and `vpn-legacy.walk.test`, a reverse zone). Both versions ran
+against the same lab, so the A/B holds; absolute times are not comparable with the v1.18 section
+(the same v1.18.0 farm run took 94.4 s here and 88.8 s there; the lab host restarted between the two).
+
+### A/B: v1.18.0 vs v1.19.0
+
+| Scenario | v1.18.0 wall s | v1.19.0 wall s | v1.18.0 CPU s | v1.19.0 CPU s | accuracy | `--exact` on existing columns |
+|---|---:|---:|---:|---:|---|---|
+| lab, default flags | 22.52 | 21.94 | 11.01 | 11.28 | n/a (no `--tls`) | identical (87 rows) |
+| lab, `--tls --ipv6` | 23.11 | 23.22 | 12.58 | 12.59 | 3/3 / 3/3 | identical (87 rows) |
+| farm, `--tls --ipv6 -t 10` | 94.39 | 94.90 | 84.09 | 84.19 | 3/3 / 3/3 | identical (50 rows) |
+
+Within run-to-run spread on all three. `compare --exact` lists the 17 new columns as "only in B (new, not
+compared)". `response_ms` is now treated as volatile by `--exact`, like `cert_not_after`.
+
+### Cost of `--extras` (v1.19.0, same flags with and without)
+
+| Scenario | without wall s | with wall s | without CPU s | with CPU s | `--exact` |
+|---|---:|---:|---:|---:|---|
+| farm (50 single-host seeds), `--tls --ipv6 -t 10` | 92.99 | 132.69 | 83.15 | 170.93 | only `robots` (50), `security_txt` (50), `favicon_*` (12 Jenkins vhosts) differ |
+
+`--extras` sends 4 GETs per live root plus the favicon fetch, and starts two httpx processes per seed. Each
+httpx run costs about 0.85 s of CPU however few requests it makes (measured: 0.84 s for one host), so the
+cost follows the number of **seeds**, not hosts: the farm, with one host per seed, is the worst case (+40 s
+wall, about 2x CPU on 2 vCPUs). Merging the favicon fetch into the paths pass was measured and rejected:
+httpx then fetches the favicon once per path (4x the favicon requests). A single pass with `/favicon.ico`
+hashed locally is listed in `PLAN.md` (F10).
+
+### Lab fixture checks (real tools)
+
+`bench-run-recon.sh checks` → **PASS** on all four (takeover, zone, origin, http). The new `http` check:
+
+| Fixture | Result |
+|---|---|
+| nginx.test (nginx defaults) | all four security headers missing; body SHA-256, response time, Alt-Svc h3 recorded |
+| spa.test (full headers) | nothing missing (CSP `frame-ancestors` covers X-Frame-Options), HSTS max-age 31536000 |
+| vpn-legacy.walk.test | `Basic realm="Legacy VPN"` over HTTP → `CleartextAuth` |
+| nginx.test robots.txt → `/private/` | URL row with source `robots`, 401 Basic over HTTPS, not flagged cleartext |
+| security.txt | nginx.test expired → `security-txt-expired [low]`; spa.test present |
+| www.walk.test | `catch-all-200` from the 404 probe |
+| ci.test | Jenkins favicon mmh3 `81586312`; session cookie Secure + HttpOnly (no issue) |
+| wp.test | `wordpress_test_cookie` without HttpOnly (and without Secure on HTTP) |
+| reverse zone | `ptr=ingress.lab.test` for 127.0.0.1 via the lab resolver |
+
+### Found while building this
+
+- **The suite's own mocks produced invalid JSON.** printf turned `\n` and `\"` inside the mock's JSON strings
+  into raw characters, so every enriched record was dropped; 17 tests failed until the mock escaped them.
+  The aggregator unit test, which writes its input with Python, passed throughout.
+- **dockerd started with `nohup … &` does not survive the end of a turn in this environment**, which looked
+  like the lab "breaking" between sessions. Started as a tracked background process it stays up. The new
+  run-integrity checks reported it correctly: "no resolver answered", per-seed "none resolved", exit 3.

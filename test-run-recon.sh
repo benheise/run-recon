@@ -124,8 +124,8 @@ mk httpx <<'EOF'
 printf '%s ' "$@" >> "$MOCKLOG/httpx.args"; echo >> "$MOCKLOG/httpx.args"
 # Reject unknown flags the way ProjectDiscovery httpx (goflags) does -- this is
 # what catches an invalid flag like -a that silently blanks all enrichment.
-__vf=" -timeout -rl -rate-limit -r -resolvers -l -list -o -output -srd -store-response-dir -mc -match-code -t -threads -retries -H -header -p -ports -delay -proxy -http-proxy -ho -headless-options -hash -st -screenshot-timeout "
-__bf=" -silent -json -sc -status-code -cl -content-length -ct -content-type -title -td -tech-detect -server -web-server -ip -cname -asn -cdn -probe -ss -screenshot -system-chrome -nc -no-color -version -h -help -fr -follow-redirects -favicon -location -jarm -method -websocket -nfs -no-fallback-scheme -nf -no-fallback -esb -exclude-screenshot-bytes -ehb -exclude-headless-body -irh -include-response-header "
+__vf=" -timeout -rl -rate-limit -r -resolvers -l -list -o -output -srd -store-response-dir -mc -match-code -t -threads -retries -H -header -p -ports -delay -proxy -http-proxy -ho -headless-options -hash -st -screenshot-timeout -path "
+__bf=" -silent -json -sc -status-code -cl -content-length -ct -content-type -title -td -tech-detect -server -web-server -ip -cname -asn -cdn -probe -ss -screenshot -system-chrome -nc -no-color -version -h -help -fr -follow-redirects -favicon -location -jarm -method -websocket -nfs -no-fallback-scheme -nf -no-fallback -esb -exclude-screenshot-bytes -ehb -exclude-headless-body -irh -include-response-header -irr -include-response "
 __A=("$@"); __i=0
 while [ $__i -lt ${#__A[@]} ]; do
   case "${__A[$__i]}" in
@@ -168,8 +168,36 @@ if [ -n "$list" ] && [ -f "$list" ]; then exec < "$list"; fi
 if [ "$mode" = probe ] && [ -n "${MOCK_HTTPX_NOLIVE:-}" ]; then cat >/dev/null; exit 0; fi
 # --origin reference fetch (-irh): a Cloudflare edge in front of nginx; the body hash is
 # that of "ORIGIN-BODY", which the curl mock returns for the leaked origin address
-irh=0; for a in "$@"; do case "$a" in -irh|-include-response-header) irh=1;; esac; done
-if [ "$mode" = json ] && [ "$irh" = 1 ]; then
+irh=0; fav=0; paths=""; pa=("$@"); pi=0
+while [ $pi -lt ${#pa[@]} ]; do case "${pa[$pi]}" in
+  -irh|-include-response-header) irh=1;; -favicon) fav=1;;
+  -path) pi=$((pi+1)); paths="${pa[$pi]:-}";; esac; pi=$((pi+1)); done
+# --extras: robots.txt (a hidden path + a wildcard rule + a sitemap), an EXPIRED security.txt,
+# and a catch-all 200 for the random 404-probe path. MOCK_EXTRAS_NOSEC=1: no security.txt.
+if [ "$mode" = json ] && [ -n "$paths" ]; then
+  while IFS= read -r u; do [ -z "$u" ] && continue; u="${u%/}"
+    IFS=',' read -ra PL <<< "$paths"
+    for pth in "${PL[@]}"; do
+      case "$pth" in
+        /robots.txt) printf '{"input":"%s","url":"%s%s","path":"%s","status_code":200,"content_type":"text/plain","body":"User-agent: *\\nDisallow: /hidden-admin/\\nDisallow: /*.bak$\\nSitemap: https://example.com/sitemap.xml\\n"}\n' "$u" "$u" "$pth" "$pth";;
+        /.well-known/security.txt) if [ -z "${MOCK_EXTRAS_NOSEC:-}" ]; then
+            printf '{"input":"%s","url":"%s%s","path":"%s","status_code":200,"content_type":"text/plain","body":"Contact: mailto:security@example.com\\nExpires: 2021-01-01T00:00:00Z\\n"}\n' "$u" "$u" "$pth" "$pth"
+          else printf '{"input":"%s","url":"%s%s","path":"%s","status_code":404,"content_type":"text/html","body":"<html>nf</html>"}\n' "$u" "$u" "$pth" "$pth"; fi;;
+        /security.txt) printf '{"input":"%s","url":"%s%s","path":"%s","status_code":404,"content_type":"text/html","body":"<html>nf</html>"}\n' "$u" "$u" "$pth" "$pth";;
+        *) printf '{"input":"%s","url":"%s%s","path":"%s","status_code":200,"content_type":"text/html","webserver":"nginx","title":"Home","content_length":5,"body":"<html><address>Apache/2.4.41 (Ubuntu) Server</address></html>"}\n' "$u" "$u" "$pth" "$pth";;
+      esac
+    done
+  done
+  exit 0
+fi
+# favicon pass (-favicon without -irh): one favicon for every host
+if [ "$mode" = json ] && [ "$fav" = 1 ] && [ "$irh" = 0 ]; then
+  while IFS= read -r u; do [ -z "$u" ] && continue
+    printf '{"input":"%s","url":"%s","status_code":200,"favicon":"-123456","favicon_md5":"0123456789abcdef0123456789abcdef","favicon_path":"/favicon.ico"}\n' "$u" "$u"
+  done
+  exit 0
+fi
+if [ "$mode" = json ] && [ "$irh" = 1 ] && [ "$fav" = 1 ]; then
   sha="$(printf '%s' 'ORIGIN-BODY' | sha256sum | cut -d' ' -f1)"
   while IFS= read -r u; do [ -z "$u" ] && continue
     printf '{"input":"%s","url":"%s","status_code":200,"content_length":11,"title":"Origin Test","host_ip":"104.16.1.1","favicon":"-123","hash":{"body_sha256":"%s"},"header":{"server":"cloudflare, nginx/1.25.3","cf_ray":"8a1b2c3d"}}\n' "$u" "$u" "$sha"
@@ -186,7 +214,11 @@ if [ "$mode" = json ]; then
       : > "$MOCKLOG/httpx.flaky"; continue
     fi
     [ -n "${MOCK_HTTPX_DEAD:-}" ] && [ "$u" = "$MOCK_HTTPX_DEAD" ] && continue
-    printf '{"input":"%s","url":"%s","status_code":200,"content_length":100,"webserver":"nginx","title":"Home, %sMain%s","tech":["nginx","PHP"],"host":"93.184.216.34"}\n' "$u" "$u" "$esc" "$esc"
+    if [ "$irh" = 1 ]; then   # 1.19 enrichment: the same request's headers, body hash and time
+      printf '{"input":"%s","url":"%s","status_code":200,"content_length":100,"webserver":"nginx","title":"Home, %sMain%s","tech":["nginx","PHP"],"host":"93.184.216.34","time":"12.5ms","content_type":"text/html","hash":{"body_sha256":"%064d"},"header":{"server":"nginx","content_type":"text/html; charset=utf-8","x_frame_options":"DENY","set_cookie":"sessionid=abc; Path=/; HttpOnly, theme=dark; Expires=Thu, 01 Jan 2030 00:00:00 GMT; Secure; HttpOnly","alt_svc":"h3=\\\":443\\\"; ma=86400","x_powered_by":"PHP/8.1.2"}}\n' "$u" "$u" "$esc" "$esc" 7
+    else
+      printf '{"input":"%s","url":"%s","status_code":200,"content_length":100,"webserver":"nginx","title":"Home, %sMain%s","tech":["nginx","PHP"],"host":"93.184.216.34"}\n' "$u" "$u" "$esc" "$esc"
+    fi
   done
 else
   while IFS= read -r h; do [ -z "$h" ] && continue; printf '%s\n' "$h" >> "$MOCKLOG/httpx.stdin"; printf 'https://%s\n' "$h"; done
@@ -239,6 +271,8 @@ for a in "$@"; do
     *) [ -z "$q" ] && case "$a" in *.*) q="$a";; esac;;
   esac
 done
+# reverse DNS (-x IP): public addresses and the 10.0.0.0/8 test address have a PTR
+_px=0; for a in "$@"; do if [ "$_px" = 1 ]; then case "$a" in 93.184.216.34) echo "edge-93-184-216-34.example.net.";; 10.0.0.9) echo "db01.corp.example.";; esac; exit 0; fi; [ "$a" = "-x" ] && _px=1; done
 # resolver preflight (+noall +comments): MOCK_DIG_STATUS sets the reply status
 [ "$comments" = 1 ] && echo ";; ->>HEADER<<- opcode: QUERY, status: ${MOCK_DIG_STATUS:-NOERROR}, id: 4242"
 # --zone-exposure fixtures for example.com (MOCK_ZONE=axfr|nsec|nsec3|none)
@@ -351,6 +385,7 @@ printf 'cert-sibling.example.com\nassets.example.com\nsneaky.otherdomain.com\n'
 case "$(basename "${list:-}")" in
   live_bare.txt)    printf 'feedback-host.example.com\n';;
   favicon_ips.txt)  printf 'favicon-host.example.com\n';;
+  favicon_hits_hp.txt) printf 'favicon-pivot.example.com\n';;
 esac
 EOF
 
@@ -490,7 +525,7 @@ EOF
 mk uncover <<'EOF'
 #!/usr/bin/env bash
 printf '%s ' "$@" >> "$MOCKLOG/uncover.args"; echo >> "$MOCKLOG/uncover.args"
-printf '192.0.2.77:443\n'
+case " $* " in *http.favicon.hash:*) printf '198.51.100.20:8443\n';; *) printf '192.0.2.77:443\n';; esac
 EOF
 mk nuclei <<'EOF'
 #!/usr/bin/env bash
@@ -623,8 +658,8 @@ EOF
 mk httpx-toolkit <<'EOF'
 #!/usr/bin/env bash
 printf '%s ' "$@" >> "$MOCKLOG/httpx-toolkit.args"; echo >> "$MOCKLOG/httpx-toolkit.args"
-__vf=" -timeout -rl -rate-limit -r -resolvers -l -list -o -output -srd -store-response-dir -mc -match-code -t -threads -retries -H -header -p -ports -delay -proxy -http-proxy -ho -headless-options -hash -st -screenshot-timeout "
-__bf=" -silent -json -sc -status-code -cl -content-length -ct -content-type -title -td -tech-detect -server -web-server -ip -cname -asn -cdn -probe -ss -screenshot -system-chrome -nc -no-color -version -h -help -fr -follow-redirects -favicon -location -jarm -method -websocket -nfs -no-fallback-scheme -nf -no-fallback -esb -exclude-screenshot-bytes -ehb -exclude-headless-body -irh -include-response-header "
+__vf=" -timeout -rl -rate-limit -r -resolvers -l -list -o -output -srd -store-response-dir -mc -match-code -t -threads -retries -H -header -p -ports -delay -proxy -http-proxy -ho -headless-options -hash -st -screenshot-timeout -path "
+__bf=" -silent -json -sc -status-code -cl -content-length -ct -content-type -title -td -tech-detect -server -web-server -ip -cname -asn -cdn -probe -ss -screenshot -system-chrome -nc -no-color -version -h -help -fr -follow-redirects -favicon -location -jarm -method -websocket -nfs -no-fallback-scheme -nf -no-fallback -esb -exclude-screenshot-bytes -ehb -exclude-headless-body -irh -include-response-header -irr -include-response "
 __A=("$@"); __i=0
 while [ $__i -lt ${#__A[@]} ]; do
   case "${__A[$__i]}" in
@@ -1929,9 +1964,9 @@ PSQLEOF
 chmod +x "$MOCKBIN/psql"
 export MOCK_HTTPX_DEAD="https://example.com/katana-path"
 run_case noneg_db --db
-assert_grep   "$MOCKLOG/psql.args" "'httpx_json','https://example\.com/" "--db: enrichment records that came back are cached"
+assert_grep   "$MOCKLOG/psql.args" "'httpx_json_v2','https://example\.com/" "--db: enrichment records that came back are cached (key httpx_json_v2: records cached before 1.19 have no headers)"
 assert_grep   "$MOCKLOG/psql.args" "'live_probe!neg'|'live_probe','"      "--db: the live probe keeps its cache entries (dead hosts may be negative-cached)"
-refute_grep   "$MOCKLOG/psql.args" "\\('httpx_json!neg','"                  "--db: a URL with no record is NOT negative-cached (retried next run, not blank for NEG_TTL)"
+refute_grep   "$MOCKLOG/psql.args" "\\('httpx_json_v2!neg','"                  "--db: a URL with no record is NOT negative-cached (retried next run, not blank for NEG_TTL)"
 unset MOCK_HTTPX_DEAD
 
 
@@ -1949,6 +1984,103 @@ section "--proxy routes stages through an HTTP(S) proxy (D2)"
 run_case proxy --proxy http://127.0.0.1:8080
 assert_grep   "$MOCKLOG/httpx.args" -- '-proxy http://127.0.0.1:8080'  "httpx receives the -proxy flag"
 assert_grep   "$MOCKLOG/katana.args" -- '-proxy http://127.0.0.1:8080' "katana's crawl goes through the proxy too (v1.16 connected directly)"
+
+# --- v1.19 (Batch 2): HTTP columns, --extras, favicon pivot, reverse DNS -------------
+section "Batch 2: HTTP columns from the enrichment request (no extra traffic)"
+run_case http_cols
+assert_grep  "$MOCKLOG/httpx.args" -- '-tech-detect -web-server -irh -hash sha256 -nfs' "enrichment asks for headers and the body hash in the same request"
+assert_grep  "$CSV" '^seed_domain,url,host,.*,cpe,redirect_location,response_ms,body_sha256,content_type,powered_by,auth,cookies,cookie_issues,missing_sec_headers,hsts_max_age,alt_svc,http_flags,favicon_mmh3,favicon_md5,ptr,robots,security_txt.?$' "17 HTTP columns appended after cpe (existing positions unchanged)"
+assert_grep  "$CSV" ',https://example\.com/katana-path,.*,12,0{63}7,text/html,PHP/8\.1\.2,,sessionid;theme,sessionid:no-Secure,Content-Security-Policy;X-Content-Type-Options;Strict-Transport-Security,,"h3="":443""; ma=86400",,' "response time, body hash, content type, X-Powered-By, cookies and their flag gaps, missing headers, Alt-Svc"
+refute_grep  "$MOCKLOG/httpx.args" -- '-path |-favicon' "default run sends no favicon or well-known requests"
+
+section "Batch 2: aggregator derives the HTTP columns correctly (auth, cleartext, HSTS, redirects, PTR)"
+HD="$TMP/httpcols"; rm -rf "$HD"; mkdir -p "$HD"
+awk "/python3 - .*map.tsv.*<<'PY'/{f=1;next} f&&/^PY\$/{f=0} f" "$RUN_RECON" > "$HD/agg.py"
+printf 'ex.com\thttp://vpn.ex.com/\tgau\nex.com\thttps://www.ex.com/\tgau\nex.com\thttps://www.ex.com/old\tgau\nex.com\thttp://www.ex.com/\tgau\nex.com\thttps://db.ex.com/\tgau\nex.com\thttps://www.ex.com/app.js\tgau\n' > "$HD/map.tsv"
+python3 - > "$HD/httpx.jsonl" <<'PYGEN'
+import json
+recs = [
+ {"url": "http://vpn.ex.com/", "status_code": 401, "content_type": "text/html", "time": "1.2s", "host_ip": "93.184.216.34",
+  "header": {"www_authenticate": 'Basic realm="Legacy VPN", charset="UTF-8"'}},
+ {"url": "https://www.ex.com/", "status_code": 200, "content_type": "text/html", "time": "850µs", "host_ip": "93.184.216.34",
+  "header": {"strict_transport_security": "max-age=63072000; includeSubDomains; preload",
+             "content_security_policy": "default-src 'self'; frame-ancestors 'none'", "x_content_type_options": "nosniff"}},
+ {"url": "https://www.ex.com/old", "status_code": 301, "content_type": "text/html", "time": "3ms", "host_ip": "93.184.216.34",
+  "header": {"location": "https://www.ex.com/new"}},
+ {"url": "http://www.ex.com/", "status_code": 200, "content_type": "text/html", "time": "4ms", "host_ip": "93.184.216.34", "header": {}},
+ {"url": "https://db.ex.com/", "status_code": 200, "content_type": "text/html", "time": "4ms", "host_ip": "10.0.0.9", "header": {}},
+ {"url": "https://www.ex.com/app.js", "status_code": 200, "content_type": "application/javascript", "time": "2ms", "host_ip": "93.184.216.34", "header": {}},
+]
+for r in recs:
+    r["input"] = r["url"]; print(json.dumps(r))
+PYGEN
+printf 'www.ex.com\t-1293291\taabbccddeeff00112233445566778899\t/favicon.ico\n' > "$HD/fav.tsv"
+printf 'www.ex.com\t200 disallow=3 allow=0 sitemap=1\tpresent contact=mailto:s@ex.com expires=2030-01-01\n' > "$HD/hi.tsv"
+: > "$HD/tlsx.jsonl"
+( cd "$HD" && env PATH="$TESTPATH" ENRICH=1 FAVHASH_FILE="$HD/fav.tsv" HOSTINFO_FILE="$HD/hi.tsv" RECON_CLOUD_CACHE="$HD/c.tsv" python3 agg.py map.tsv httpx.jsonl out.csv 0 2000 tlsx.jsonl >/dev/null 2>/dev/null )
+( cd "$HD" && env PATH="$TESTPATH" ENRICH=1 PTR_PRIVATE=1 PTR_RESOLVER=10.0.0.53 RECON_CLOUD_CACHE="$HD/c.tsv" python3 agg.py map.tsv httpx.jsonl out2.csv 0 2000 tlsx.jsonl >/dev/null 2>/dev/null )
+assert_grep  "$HD/out.csv" ',http://vpn\.ex\.com/,.*,1200,,text/html,,"Basic realm=""Legacy VPN""",,,Content-Security-Policy;X-Frame-Options;X-Content-Type-Options,,,CleartextAuth,' "Basic auth over HTTP -> auth realm + CleartextAuth; 1.2s -> 1200 ms; HSTS not expected on http"
+assert_grep  "$HD/out.csv" ',https://www\.ex\.com/,.*,1,,text/html,,,,,,63072000,,,-1293291,aabbccddeeff00112233445566778899,edge-93-184-216-34\.example\.net,200 disallow=3 allow=0 sitemap=1,present contact=' "all headers present (CSP frame-ancestors covers X-Frame-Options), HSTS max-age, favicon, PTR, robots, security.txt"
+assert_grep  "$HD/out.csv" ',https://www\.ex\.com/old,.*,https://www\.ex\.com/new,3,' "redirect target recorded; no header verdict on a redirect"
+assert_grep  "$HD/out.csv" ',http://www\.ex\.com/,.*,PlainHttp,' "HTML served on plain HTTP -> PlainHttp"
+assert_grep  "$HD/out.csv" ',https://www\.ex\.com/app\.js,.*,application/javascript,,,,,,,' "no security-header verdict on non-HTML responses"
+refute_grep  "$HD/out.csv" 'db01\.corp\.example'                       "PTR of a non-public address is not asked of public resolvers"
+assert_grep  "$HD/out2.csv" ',https://db\.ex\.com/,.*,db01\.corp\.example,' "PTR of a non-public address via YOUR resolver (--resolvers)"
+assert_grep  "$MOCKLOG/dig.args" '@10\.0\.0\.53 \+time=2 \+tries=1 -x 10\.0\.0\.9' "private PTR goes to the --resolvers address"
+
+section "Batch 2: --extras (robots.txt, security.txt, 404 probe, favicon hashes)"
+run_case extras --extras
+assert_grep  "$MOCKLOG/httpx.args" -- '-path /robots\.txt,/\.well-known/security\.txt,/security\.txt,/rr-[0-9a-f]+\.html -silent -json -irr' "one httpx pass for the well-known paths and a random 404 probe"
+assert_grep  "$MOCKLOG/httpx.args" -- '-json -favicon -nfs'                  "favicon hashes fetched for live roots"
+assert_grep  "$CSV" ',https://example\.com/hidden-admin/,example\.com,robots,' "robots.txt Disallow path becomes a URL row (source robots)"
+refute_grep  "$CSV" 'bak\$|\*\.bak'                                         "wildcard robots rules are not turned into URLs"
+assert_grep  "$CSV.extras.txt" '^\[example\.com\] security-txt-expired \[low\] host=example\.com path=/\.well-known/security\.txt expires=2021-01-01T00:00:00Z' "expired security.txt -> security-txt-expired [low]"
+assert_grep  "$CSV.extras.txt" 'catch-all-200 \[info\] host=example\.com path=/rr-'  "random path answered 200 -> catch-all-200 [info]"
+assert_grep  "$CSV.extras.txt" 'error-page \[info\] host=example\.com status=200 server="nginx" title="Home" reveals="Apache/2\.4\.41 \(Ubuntu\)"' "error page reveals a version the Server header does not"
+assert_grep  "$CSV" ',-123456,0123456789abcdef0123456789abcdef,,200 disallow=2 allow=0 sitemap=1,expired contact=mailto:security@example\.com expires=2021-01-01T00:00:00Z.?$' "favicon, robots and security.txt columns on the host's rows"
+MOCK_EXTRAS_NOSEC=1 run_case extras_nosec --extras
+assert_grep  "$CSV" ',missing.?$'                                           "no security.txt -> security_txt=missing"
+refute_grep  "$CSV.extras.txt" 'security-txt'                             "a missing security.txt is a column value, not a finding"
+
+section "Batch 2: --favicon pivots on the favicon hash (uncover), hits feed --origin"
+run_case favpivot --favicon --origin
+assert_grep  "$MOCKLOG/uncover.args" -- '-shodan http\.favicon\.hash:-123456 -fofa icon_hash="-123456" -censys services\.http\.response\.favicons\.md5_hash: "0123456789abcdef0123456789abcdef" -silent -duc -l 100' "favicon hash searched on Shodan/Fofa (mmh3) and Censys (MD5), no update check, capped"
+assert_grep  "$MOCKLOG/uncover.args" -- '-q ssl:"example\.com" -silent -duc' "certificate-name search kept, without uncover's update check"
+assert_grep  "$CSV.favicon.txt" '^\[example\.com\] favicon-pivot host=[^ ]*example\.com mmh3=-123456 md5=0123456789abcdef0123456789abcdef hits=1$' "favicon pivot recorded with its hit count"
+assert_grep  "$CSV" ',https://favicon-pivot\.example\.com,favicon-pivot\.example\.com,favicon,' "in-scope name from a host sharing the favicon (cert scan of the hit)"
+assert_fgrep "$MOCKLOG/curl.args" '--resolve example.com:443:198.51.100.20' "favicon hit tried as an origin candidate"
+mk curl <<'EOF'
+#!/usr/bin/env bash
+printf '%s ' "$@" >> "$MOCKLOG/curl.args"; echo >> "$MOCKLOG/curl.args"
+exit 0
+EOF
+
+section "Batch 2: report surfaces HTTP posture and findings"
+R9="$TMP/rpt19"; rm -rf "$R9"; mkdir -p "$R9"
+{
+  printf 'seed_domain,url,host,sources,status_code,content_length,webserver,title,technologies,ip,asn,asn_org,tls_version,tls_cipher,cert_not_after,cert_issuer,tls_flags,ipv6,cloud,rdap_org,geo,cpe,redirect_location,response_ms,body_sha256,content_type,powered_by,auth,cookies,cookie_issues,missing_sec_headers,hsts_max_age,alt_svc,http_flags,favicon_mmh3,favicon_md5,ptr,robots,security_txt\n'
+  printf 'ex.com,https://www.ex.com/,www.ex.com,gau,200,10,nginx,Home,,93.184.216.34,,,,,,,,,,,,,,12,,text/html,PHP/8.1,,sid,sid:no-Secure,Content-Security-Policy;Strict-Transport-Security,,h3=":443",,-1293291,aabbccddeeff00112233445566778899,edge.example.net,200 disallow=3 allow=0 sitemap=1,expired contact=mailto:s@ex.com expires=2021-01-01\n'
+  printf 'ex.com,http://www.ex.com/,www.ex.com,gau,200,10,nginx,Home,,93.184.216.34,,,,,,,,,,,,,,12,,text/html,,,,,Content-Security-Policy,,,PlainHttp,-1293291,,,,\n'
+  printf 'ex.com,http://vpn.ex.com/,vpn.ex.com,gau,401,0,nginx,,,93.184.216.34,,,,,,,,,,,,,,9,,text/html,,"Basic realm=""Legacy VPN""",,,,,,CleartextAuth,,,,,missing\n'
+} > "$R9/r.csv"
+printf '[ex.com] security-txt-expired [low] host=www.ex.com path=/.well-known/security.txt expires=2021-01-01 note=x\n[ex.com] catch-all-200 [info] host=www.ex.com path=/rr-1.html length=5 note=x\n' > "$R9/r.csv.extras.txt"
+env PATH="$TESTPATH" bash "$REPORT_SH" -o "$R9/out.html" "$R9/r.csv" >/dev/null 2>"$R9/e.log"
+python3 - "$R9/out.html" > "$R9/text.txt" <<'PYTXT'
+import sys, re, html
+s = open(sys.argv[1], encoding="utf-8").read()
+print(html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", s))))
+PYTXT
+assert_grep  "$R9/text.txt" 'MEDIUM HTTP vpn\.ex\.com credentials sent in cleartext: Basic realm="Legacy VPN" on http://vpn\.ex\.com/' "CleartextAuth -> MEDIUM finding"
+assert_grep  "$R9/text.txt" 'LOW HTTP www\.ex\.com served over plain HTTP without a redirect to HTTPS: http://www\.ex\.com/' "PlainHttp -> LOW finding, once per host"
+assert_grep  "$R9/text.txt" 'LOW security\.txt www\.ex\.com security-txt-expired' "expired security.txt -> LOW finding"
+refute_grep  "$R9/text.txt" 'INFO Web server note'                        "catch-all-200 is a note, not a finding"
+assert_grep  "$R9/text.txt" 'Security headers missing CSP, HSTS'           "host card: missing headers of the root page (https preferred)"
+assert_grep  "$R9/text.txt" 'Favicon mmh3 -1293291 md5 aabbccddeeff00112233445566778899' "host card: favicon hashes"
+assert_grep  "$R9/text.txt" 'PTR edge\.example\.net'                       "host card: reverse DNS"
+assert_grep  "$R9/text.txt" 'robots\.txt 200 disallow=3'                   "host card: robots.txt"
+assert_grep  "$R9/text.txt" 'security\.txt expired contact=mailto:s@ex\.com' "host card: security.txt"
+assert_grep  "$R9/text.txt" 'Cookie flags sid:no-Secure'                   "host card: cookie flag gaps"
+assert_grep  "$R9/text.txt" 'X-Powered-By PHP/8\.1'                        "host card: X-Powered-By"
 
 # --- v1.18: DNS zone exposure (AXFR, NSEC walk, NSEC3) ------------------------------
 section "--zone-exposure: open AXFR, walkable NSEC chain, NSEC3, and the negative case"

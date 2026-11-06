@@ -24,7 +24,7 @@
 #   -h, --help         this help
 #
 # Reads (when present, derived from <csv>): <csv>.nuclei.txt, .activescan.txt,
-#   .secrets.txt, .takeover.txt, .zone.txt, .origin.txt, .buckets.txt, .cms.txt,
+#   .secrets.txt, .takeover.txt, .zone.txt, .origin.txt, .extras.txt, .favicon.txt, .buckets.txt, .cms.txt,
 #   .params.txt, .osint.txt, .virustotal.txt, .urlscan.txt, .social.txt,
 #   .new-assets.txt, .edge.tsv, .cname.tsv, .zone-names.txt, .screenshots.tsv,
 #   .run.json, and the vuln join <csv>.vulns.csv (recon-db.sh vulns).
@@ -133,7 +133,7 @@ SEV_TAG   = re.compile(r'\[(critical|high|medium|low|info)\]', re.I)
 # default severity per artifact kind when a line carries no [severity] tag
 KIND_SEV = {
     "takeover": "high", "secrets": "high", "buckets": "medium",
-    "origin": "info", "zone": "info", "params": "info", "cms": "info",
+    "origin": "info", "zone": "info", "extras": "info", "favicon": "info", "params": "info", "cms": "info",
     "osint": "info", "virustotal": "info", "urlscan": "info", "social": "info",
 }
 KIND_LABEL = {
@@ -141,13 +141,14 @@ KIND_LABEL = {
     "takeover": "Subdomain takeover", "secrets": "Exposed secret",
     "buckets": "Exposed cloud bucket", "origin": "Exposed origin",
     "zone": "DNS zone exposure", "zonecheck": "DNS zone check", "edgehint": "Edge fingerprint",
+    "http": "HTTP", "extras": "security.txt", "extrasinfo": "Web server note", "favicon": "Favicon pivot",
     "tls": "TLS / certificate",
     "params": "Parameterized URL", "cms": "CMS / tech", "osint": "OSINT",
     "virustotal": "VirusTotal", "urlscan": "urlscan.io", "social": "Social account",
     "vuln": "Known CVE (NVD/KEV)",
 }
 # evidence of a check that ran, not a finding: kept out of the severity counts
-EVIDENCE_KINDS = {"zonecheck", "edgehint"}
+EVIDENCE_KINDS = {"zonecheck", "edgehint", "extrasinfo"}
 
 def sev_from_nuclei(text):
     m = re.search(r'\[(critical|high|medium|low|info|unknown)\]', text, re.I)
@@ -172,7 +173,11 @@ def new_host(seed=""):
     return {"ip": "", "asn": "", "asn_org": "", "status": set(), "tech": set(), "urls": set(),
             "tls_flags": set(), "tls_version": "", "tls_cipher": "", "seed": seed, "findings": [],
             "title": "", "_tlen": 10 ** 9, "webserver": "", "ipv6": set(), "cert_not_after": "",
-            "cert_issuer": "", "cpe": set(), "cloud": "", "rdap_org": "", "geo": "", "in_csv": True}
+            "cert_issuer": "", "cpe": set(), "cloud": "", "rdap_org": "", "geo": "", "in_csv": True,
+            "http_root": {}, "_hrk": (9, 9, 10 ** 9), "hflags": {}, "cookie_issues": set(), "auths": set()}
+# 1.19 HTTP columns that describe the site: taken from its root row (https preferred)
+HTTP_HOST_COLS = ("content_type", "missing_sec_headers", "hsts_max_age", "alt_svc", "powered_by",
+                  "favicon_mmh3", "favicon_md5", "ptr", "robots", "security_txt")
 try:
     with open(csv_path, newline="", encoding="utf-8", errors="replace") as fh:
         r = csv.DictReader(fh)
@@ -208,6 +213,17 @@ try:
                 if v6.strip(): d["ipv6"].add(v6.strip())
             for c in (row.get("cpe") or "").split(";"):
                 if c.strip(): d["cpe"].add(c.strip())
+            # HTTP detail (run-recon 1.19+; absent in older CSVs)
+            for fl in (row.get("http_flags") or "").split(";"):
+                if fl: d["hflags"].setdefault(fl, set()).add(u)
+            for ci in (row.get("cookie_issues") or "").split(";"):
+                if ci: d["cookie_issues"].add(ci)
+            if row.get("auth"):
+                d["auths"].add((u, row["auth"]))
+            _path = re.sub(r"^[a-z]+://[^/]+", "", u, flags=re.I)
+            _rk = (0 if _path in ("", "/") else 1, 0 if u.lower().startswith("https") else 1, len(u))
+            if any(row.get(k) for k in HTTP_HOST_COLS) and _rk < d["_hrk"]:
+                d["http_root"], d["_hrk"] = {k: row.get(k, "") or "" for k in HTTP_HOST_COLS}, _rk
 except Exception as e:
     sys.stderr.write(f"[report] warning: could not fully read CSV: {e}\n")
 
@@ -228,7 +244,7 @@ kind_counts = {}
 extra_names = {}   # names with findings but no CSV row (not live): host -> dict
 ORIGIN_FINDINGS = ("origin-exposed", "origin-alternate", "origin-candidate")
 
-for kind in ["nuclei", "activescan", "takeover", "secrets", "buckets", "zone", "origin",
+for kind in ["nuclei", "activescan", "takeover", "secrets", "buckets", "zone", "origin", "extras", "favicon",
              "params", "cms", "osint", "virustotal", "urlscan", "social"]:
     path = f"{csv_path}.{kind}.txt"
     if not os.path.isfile(path):
@@ -264,6 +280,8 @@ for kind in ["nuclei", "activescan", "takeover", "secrets", "buckets", "zone", "
                     kind_eff, sev = "edgehint", "info"
                 elif kind == "zone" and tok0 == "zone-checked":
                     kind_eff, sev = "zonecheck", "info"
+                elif kind == "extras" and not (tagged and tagged.group(1).lower() in ("low", "medium", "high", "critical")):
+                    kind_eff, sev = "extrasinfo", "info"   # catch-all 200, error-page notes
                 elif tagged:
                     sev = tagged.group(1).lower()   # "<check> [severity] key=value ..."
                 elif kind == "takeover" and SEV_TAG.search(line):
@@ -276,7 +294,7 @@ for kind in ["nuclei", "activescan", "takeover", "secrets", "buckets", "zone", "
                 # host attribution: for findings whose URL IS the affected target,
                 # use the URL's host; for OSINT/reference findings (social account
                 # links, VT/passive-DNS, etc.) tie to the seed domain/brand instead.
-                TARGET_URL_KINDS = {"nuclei", "activescan", "secrets", "takeover", "zone",
+                TARGET_URL_KINDS = {"nuclei", "activescan", "secrets", "takeover", "zone", "extras", "favicon",
                                     "buckets", "origin", "params", "cms", "urlscan"}
                 uh = host_of(line)
                 if not uh:   # DNS findings name the affected host as host=<name>
@@ -345,6 +363,21 @@ for _h, _d in hosts.items():
         findings.append(_f); _d["findings"].append(_f)
         sev_counts[_sev] = sev_counts.get(_sev, 0) + 1
         kind_counts["tls"] = kind_counts.get("tls", 0) + 1
+
+# --- HTTP findings (1.19 columns): credentials over cleartext, sites served on plain HTTP --
+def _add(kind, sev, h, d, text):
+    f = {"kind": kind, "sev": sev, "host": h, "seed": d.get("seed", ""), "text": text}
+    findings.append(f); d["findings"].append(f)
+    sev_counts[sev] = sev_counts.get(sev, 0) + 1
+    kind_counts[kind] = kind_counts.get(kind, 0) + 1
+for _h, _d in hosts.items():
+    for _u in sorted(_d["hflags"].get("CleartextAuth", ())):
+        _realm = next((a for (uu, a) in sorted(_d["auths"]) if uu == _u), "basic auth")
+        _add("http", "medium", _h, _d, "credentials sent in cleartext: %s on %s (use HTTPS)" % (_realm, _u))
+    _pl = sorted(_d["hflags"].get("PlainHttp", ()))
+    if _pl:
+        _add("http", "low", _h, _d, "served over plain HTTP without a redirect to HTTPS: %s%s"
+             % (_pl[0], (" and %d more URL(s)" % (len(_pl) - 1)) if len(_pl) > 1 else ""))
 
 # --- known-CVE findings from the offline vuln join (recon-db.sh vulns) -------
 # One finding per (host, CVE). KEV -> critical; otherwise CVSS severity/score,
@@ -509,7 +542,7 @@ elif shots_dir and os.path.isdir(shots_dir):
 now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 sev_color = {"critical": "#8b0000", "high": "#d7301f", "medium": "#ef8a00",
              "low": "#c9a400", "info": "#4a7fb5"}
-highlight_kinds = {"nuclei", "takeover", "secrets", "buckets", "origin", "zone", "tls", "vuln"}
+highlight_kinds = {"nuclei", "takeover", "secrets", "buckets", "origin", "zone", "http", "extras", "tls", "vuln"}
 total_findings = sum(1 for f in findings if f["kind"] not in EVIDENCE_KINDS)
 top_asns = {}
 for h in hosts.values():
@@ -651,7 +684,7 @@ if zrows:
 out.append('<h2 id="findings">Findings</h2>')
 hi = [f for f in findings if f["kind"] in highlight_kinds]
 # within a severity: exposure findings first, certificate hygiene last
-KIND_ORDER = {k: i for i, k in enumerate(["vuln", "nuclei", "secrets", "origin", "zone", "takeover", "buckets", "tls"])}
+KIND_ORDER = {k: i for i, k in enumerate(["vuln", "nuclei", "secrets", "origin", "zone", "takeover", "http", "buckets", "extras", "tls"])}
 hi.sort(key=lambda f: (SEV_RANK.get(f["sev"], 9), KIND_ORDER.get(f["kind"], 99), f["host"]))
 if hi:
     out.append('<p class="mut">Vulnerabilities, weaknesses and misconfigurations, most severe first.</p>')
@@ -786,6 +819,38 @@ for h in card_names:
         meta2.append('<span>Aliases <b>' + ", ".join(hlink(a) for a in sorted(aliases[h])) + '</b></span>')
     if meta2:
         out.append('<div class="meta">' + "".join(meta2) + '</div>')
+    # HTTP posture (1.19 columns): headers of the root page, cookies, auth, favicon, PTR, well-known files
+    meta3 = []
+    hr = (d or {}).get("http_root") or {}
+    if hr:
+        if "html" in hr.get("content_type", ""):
+            ms = [x for x in hr.get("missing_sec_headers", "").split(";") if x]
+            short = {"Content-Security-Policy": "CSP", "X-Frame-Options": "X-Frame-Options",
+                     "X-Content-Type-Options": "X-Content-Type-Options", "Strict-Transport-Security": "HSTS"}
+            meta3.append('<span>Security headers <b>' + (('missing ' + esc(", ".join(short.get(x, x) for x in ms)))
+                         if ms else 'all present') + '</b></span>')
+        if hr.get("hsts_max_age"):
+            meta3.append(f'<span>HSTS max-age <b>{esc(hr["hsts_max_age"])}</b></span>')
+        if hr.get("alt_svc"):
+            meta3.append(f'<span>Alt-Svc <b>{esc(hr["alt_svc"][:60])}</b></span>')
+        if hr.get("powered_by"):
+            meta3.append(f'<span>X-Powered-By <b>{esc(hr["powered_by"])}</b></span>')
+        if hr.get("favicon_mmh3"):
+            meta3.append(f'<span>Favicon <b>mmh3 {esc(hr["favicon_mmh3"])}</b>'
+                         + (f' <span class="mut">md5 {esc(hr["favicon_md5"])}</span>' if hr.get("favicon_md5") else "") + '</span>')
+        if hr.get("ptr"):
+            meta3.append(f'<span>PTR <b>{esc(hr["ptr"])}</b></span>')
+        if hr.get("robots"):
+            meta3.append(f'<span>robots.txt <b>{esc(hr["robots"])}</b></span>')
+        if hr.get("security_txt"):
+            st = hr["security_txt"]
+            meta3.append(f'<span>security.txt <b class="{"pill bad" if st.startswith(("expired", "missing")) else ""}">{esc(st[:90])}</b></span>')
+    if d and d["cookie_issues"]:
+        meta3.append('<span>Cookie flags <b>' + esc("; ".join(sorted(d["cookie_issues"]))[:200]) + '</b></span>')
+    if d and d["auths"]:
+        meta3.append('<span>Auth <b>' + esc("; ".join(sorted(set(a for _, a in d["auths"])))[:160]) + '</b></span>')
+    if meta3:
+        out.append('<div class="meta">' + "".join(meta3) + '</div>')
     if d and d["tech"]:
         out.append('<div>' + "".join(f'<span class="pill">{esc(t)}</span>' for t in sorted(d["tech"])) + '</div>')
     if d and d["cpe"]:
@@ -813,7 +878,7 @@ for h in card_names:
 
 # ---- footer: raw artifact links --------------------------------------------
 arts = []
-for kind in ["nuclei", "activescan", "takeover", "secrets", "buckets", "zone", "origin",
+for kind in ["nuclei", "activescan", "takeover", "secrets", "buckets", "zone", "origin", "extras", "favicon",
              "params", "cms", "osint", "virustotal", "urlscan", "social", "new-assets"]:
     p = f"{csv_path}.{kind}.txt"
     if os.path.isfile(p):

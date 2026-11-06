@@ -18,3 +18,4 @@ screenshots-*/
 bench-out.csv*
 *.report.html
 *.tar.gz
+lab/targets-http.txt

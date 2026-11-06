@@ -14,6 +14,8 @@
 #     test. itself is unsigned and refuses zone transfers (--zone-exposure negative case)
 #   db.walk.test.signed walk.test signed with NSEC (ldnsutils): the chain can be walked
 #   db.xfr.test         xfr.test, unsigned, zone transfers allowed to anyone
+#   db.127              reverse zone for 127.0.0.0/8: PTR fixtures for --enrich
+#                       (127.0.0.1 -> ingress.lab.test, LAB_ORIGIN_IP -> origin-nginx.lab.test)
 # No NSEC3 zone: CoreDNS's file plugin cannot serve one (the suite covers NSEC3 with mocks).
 # The file plugin reloads a zone when its serial changes; the reload plugin picks
 # up edits to this Corefile, so neither needs a DNS restart.
@@ -29,6 +31,12 @@ xfr.test:53 {
     }
     transfer {
         to *
+    }
+    errors
+}
+127.in-addr.arpa:53 {
+    file /lab/db.127 {
+        reload 2s
     }
     errors
 }

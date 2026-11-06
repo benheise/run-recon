@@ -32,7 +32,9 @@
 #                          walk.test: walkable NSEC chain, test.: neither) -- needs ldnsutils
 #   origin                 --origin against the forgotten-origin fixture (nginx.test must be
 #                          origin-exposed at LAB_ORIGIN_IP; spa.test and wp.test must not)
-#   checks                 takeover + zone + origin; non-zero if any fails
+#   http                   HTTP detail (1.19): security headers, HSTS, cookies, cleartext auth,
+#                          robots.txt / security.txt / 404 probe (--extras), favicon, PTR (--enrich)
+#   checks                 takeover + zone + origin + http; non-zero if any fails
 #   help
 #
 # Needs docker (+compose) and the run-recon toolchain for up/run/bench; compare
@@ -153,7 +155,17 @@ gen_lab(){ # <farm_n>
   printf 'walk.test\nxfr.test\nnginx.test\n' > "$LAB/targets-zone.txt"
   printf 'nginx.test\nalias.test\norphan.test\n' > "$LAB/targets-takeover.txt"
   printf 'nginx.test\nspa.test\nwp.test\n' > "$LAB/targets-origin.txt"
-  log "generated: SPA (120 KB), farm of $n vhosts, zones db.test db.walk.test db.xfr.test, targets and ground truth"
+  # reverse zone for 127.0.0.0/8: the PTR fixtures for --enrich's ptr column
+  {
+    printf '$ORIGIN 127.in-addr.arpa.\n$TTL 60\n'
+    printf '@ IN SOA ns.test. hostmaster.test. %s 7200 3600 1209600 60\n@ IN NS ns.test.\n' "$serial"
+    printf '1.0.0 IN PTR ingress.lab.test.\n'
+    printf '%s IN PTR origin-nginx.lab.test.\n' "$(printf '%s' "$LAB_ORIGIN_IP" | awk -F. '{print $4"."$3"."$2}')"
+  } > "$LAB/db.127"
+  # HTTP-detail check (bench-run-recon.sh http): the four sites, the cleartext-auth VPN and a
+  # catch-all name from the walk.test zone
+  printf 'nginx.test\nspa.test\nwp.test\nci.test\nvpn-legacy.walk.test\nwww.walk.test\n' > "$LAB/targets-http.txt"
+  log "generated: SPA (120 KB), farm of $n vhosts, zones db.test db.walk.test db.xfr.test db.127, targets and ground truth"
 }
 
 # sign_zone ZONE NSEC3(0|1): DNSSEC-sign lab/db.ZONE into lab/db.ZONE.signed with
@@ -289,7 +301,7 @@ import sys, os, csv, re
 a_path, b_path = sys.argv[1], sys.argv[2]
 EXACT = os.environ.get("BENCH_EXACT", "0") == "1"
 # columns that legitimately differ run-to-run and are excluded from --exact
-VOLATILE = {"cert_not_after"}
+VOLATILE = {"cert_not_after", "response_ms"}
 
 def rows(path):
     with open(path, newline="", encoding="utf-8", errors="replace") as fh:
@@ -397,7 +409,7 @@ cmd_bench(){
       --baseline-script) base_script="${2:-}"; shift 2 || shift;;
       --ab)              ab="${2:-}"; shift 2 || shift;;
       --results)         results="${2:-}"; shift 2 || shift;;
-      -h|--help) sed -n '2,41p' "$0" | sed 's/^# \{0,1\}//'; return 0;;
+      -h|--help) sed -n '2,43p' "$0" | sed 's/^# \{0,1\}//'; return 0;;
       -*) die "bench: unknown option: $1";;
       *) shift;;
     esac
@@ -528,12 +540,65 @@ cmd_origin(){
   return "$fail"
 }
 
+# http: the HTTP-detail fixtures in lab/Caddyfile and lab/db.127 (run-recon 1.19)
+cmd_http(){
+  lab_env
+  [ -f "$RUN_RECON" ] || die "run-recon not found at $RUN_RECON"
+  [ -s "$LAB/targets-http.txt" ] || die "no lab/targets-http.txt (run: $0 up)"
+  local t; t="$(mktemp -d /tmp/bench-http.XXXXXX)"
+  log "HTTP detail check against lab/targets-http.txt -> $t"
+  ( cd "$t" && bash "$RUN_RECON" -i "$LAB/targets-http.txt" -o "$t/h.csv" \
+      --resolvers "$RESOLVERS_FILE" --extras --enrich --resolve --no-report >"$t/run.out" 2>"$t/run.err" ) || true
+  python3 -I - "$t/h.csv" "$t/h.csv.extras.txt" <<'PYHTTP'
+import sys, csv, re
+csv_f, ex_f = sys.argv[1:3]
+try:
+    rows = list(csv.DictReader(open(csv_f, newline="", encoding="utf-8")))
+except OSError:
+    rows = []
+try:
+    extras = open(ex_f, encoding="utf-8").read()
+except OSError:
+    extras = ""
+def row(url):
+    return next((r for r in rows if r["url"].rstrip("/") == url.rstrip("/")), {})
+fails = 0
+def ck(ok, msg):
+    global fails
+    print("[bench]   %s %s" % ("ok  " if ok else "FAIL", msg))
+    fails += 0 if ok else 1
+n, s_, v, pv = row("https://nginx.test"), row("https://spa.test"), row("http://vpn-legacy.walk.test"), row("https://nginx.test/private/")
+ck(n.get("missing_sec_headers") == "Content-Security-Policy;X-Frame-Options;X-Content-Type-Options;Strict-Transport-Security",
+   "nginx.test: all four security headers missing (nginx defaults)")
+ck(re.fullmatch(r"[0-9a-f]{64}", n.get("body_sha256", "")) is not None and n.get("response_ms", "").isdigit()
+   and "h3=" in n.get("alt_svc", ""), "nginx.test: body SHA-256, response time, Alt-Svc h3")
+ck(s_.get("missing_sec_headers", "x") == "" and s_.get("hsts_max_age") == "31536000",
+   "spa.test: no header missing (CSP frame-ancestors covers X-Frame-Options), HSTS max-age 31536000")
+ck("CleartextAuth" in v.get("http_flags", "") and v.get("auth") == 'Basic realm="Legacy VPN"',
+   "vpn-legacy.walk.test: Basic auth over HTTP -> CleartextAuth")
+ck(pv.get("sources") == "robots" and pv.get("status_code") == "401" and pv.get("auth") == 'Basic realm="Lab Private"'
+   and "CleartextAuth" not in pv.get("http_flags", ""), "nginx.test/private/: found via robots.txt, 401 Basic over HTTPS (not cleartext)")
+ck(n.get("robots", "").startswith("200 disallow=2") and n.get("security_txt", "").startswith("expired")
+   and s_.get("security_txt", "").startswith("present"), "robots.txt and security.txt columns (nginx expired, spa valid)")
+ck(re.search(r"security-txt-expired \[low\] host=nginx\.test", extras) is not None, "nginx.test: security-txt-expired [low]")
+ck(re.search(r"catch-all-200 \[info\] host=www\.walk\.test", extras) is not None, "www.walk.test: catch-all 200 detected by the 404 probe")
+ck(row("https://ci.test").get("favicon_mmh3") == "81586312", "ci.test: Jenkins favicon mmh3 81586312")
+ck(any("wordpress_test_cookie" in r.get("cookie_issues", "") for r in rows), "wp.test: wordpress_test_cookie flag gaps")
+ck(n.get("ptr") == "ingress.lab.test", "PTR of 127.0.0.1 from the lab's reverse zone (--enrich, your resolver)")
+sys.exit(1 if fails else 0)
+PYHTTP
+  local rc=$?
+  [ "$rc" = 0 ] && log "http check: PASS" || log "http check: FAIL (see $t/run.err)"
+  return "$rc"
+}
+
 cmd_checks(){
   local rc=0
   cmd_takeover || rc=1
   cmd_zone || rc=1
   cmd_origin || rc=1
-  [ "$rc" = 0 ] && log "lab checks: PASS (takeover, zone, origin)" || log "lab checks: FAIL"
+  cmd_http || rc=1
+  [ "$rc" = 0 ] && log "lab checks: PASS (takeover, zone, origin, http)" || log "lab checks: FAIL"
   return "$rc"
 }
 
@@ -542,12 +607,13 @@ case "${1:-help}" in
   takeover) cmd_takeover;;
   zone)     cmd_zone;;
   origin)   cmd_origin;;
+  http)     cmd_http;;
   checks)   cmd_checks;;
   down)     cmd_down;;
   hosts)    cmd_hosts;;
   run)      shift; cmd_run "$@";;
   compare)  shift; cmd_compare "$@";;
   bench)    shift; cmd_bench "$@";;
-  help|-h|--help) sed -n '2,41p' "$0" | sed 's/^# \{0,1\}//';;
-  *) die "unknown command: ${1:-} (try: up|down|hosts|run|compare|bench|takeover|zone|origin|checks)";;
+  help|-h|--help) sed -n '2,43p' "$0" | sed 's/^# \{0,1\}//';;
+  *) die "unknown command: ${1:-} (try: up|down|hosts|run|compare|bench|takeover|zone|origin|http|checks)";;
 esac

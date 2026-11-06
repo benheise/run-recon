@@ -16,7 +16,7 @@ control; never point the scanner anywhere else.
 | file | what it is |
 |---|---|
 | `docker-compose.yml` | the range: `dns` (CoreDNS), `ingress` (Caddy TLS vhost router), `nginx`, `wordpress` + `db`, `spa`, `jenkins` — all pinned. `nginx` is also published directly on `LAB_ORIGIN_IP:80` (default `127.0.0.5`): the "forgotten origin" fixture |
-| `Caddyfile` | vhost routing; serves every name on both `http://` and `https://` with certificates from Caddy's local CA |
+| `Caddyfile` | vhost routing; serves every name on both `http://` and `https://` with certificates from Caddy's local CA, plus the HTTP-detail fixtures below |
 | `Corefile` | CoreDNS: authoritative for `test.`, `walk.test.` and `xfr.test.` from the generated zone files |
 | `resolvers.txt` | the lab DNS server, passed to run-recon as `--resolvers` (dnsx/tlsx/httpx use it) |
 | `targets.txt` | lab seeds: `nginx.test wp.test spa.test ci.test` |
@@ -28,9 +28,11 @@ control; never point the scanner anywhere else.
 | `db.test` | the `test.` zone: every A/AAAA record plus the takeover and origin fixtures below. Zone files use BIND's `db.<zone>` naming: files ending in `.zone` did not survive some synced folders |
 | `db.walk.test`, `db.walk.test.signed` | `walk.test.`, DNSSEC-signed with NSEC by `ldns-signzone` (throwaway keys in `dnssec/`) |
 | `db.xfr.test` | `xfr.test.`, unsigned, zone transfers allowed to anyone |
+| `db.127` | reverse zone for `127.0.0.0/8`: PTR fixtures for `--enrich` |
 | `targets-takeover.txt` | seeds for the takeover check: `nginx.test alias.test orphan.test` |
 | `targets-zone.txt` | seeds for the zone check: `walk.test xfr.test nginx.test` |
 | `targets-origin.txt` | seeds for the origin check: `nginx.test spa.test wp.test` |
+| `targets-http.txt` | seeds for the HTTP-detail check: the four sites, `vpn-legacy.walk.test`, `www.walk.test` |
 | `targets-farm.txt`, `expected-farm.csv` | farm seeds and their ground truth |
 
 ## Pinned services and what run-recon must report
@@ -61,7 +63,8 @@ sudo sh -c './bench-run-recon.sh hosts >> /etc/hosts'   # once: names for tools 
 ./bench-run-recon.sh takeover                                                  # CNAME fixtures, real dnsx/subzy
 ./bench-run-recon.sh zone                                                      # AXFR / NSEC fixtures, real dig
 ./bench-run-recon.sh origin                                                    # forgotten-origin fixture
-./bench-run-recon.sh checks                                                    # all three; non-zero if any fails
+./bench-run-recon.sh http                                                      # headers, cookies, auth, robots/security.txt, favicon, PTR
+./bench-run-recon.sh checks                                                    # all four; non-zero if any fails
 
 ./bench-run-recon.sh down                # tear down and remove volumes
 ```
@@ -133,6 +136,21 @@ records leak that address: `direct.nginx.test A 127.0.0.5` and nginx.test's SPF 
 `origin-exposed [high] host=nginx.test origin=127.0.0.5 port=80 match=body-sha256`, that
 `spa.test` and `wp.test` (origins only on the container network) are not reported, and that
 `<out>.edge.tsv` names the edge and the origin software.
+
+## HTTP-detail fixtures (run-recon 1.19)
+
+| name | what the lab serves | run-recon must report |
+|---|---|---|
+| `nginx.test` | nginx defaults: no security headers. Caddy adds a robots.txt (`Disallow: /private/`, a wildcard rule, a sitemap) and an **expired** security.txt; `/private/` asks for basic auth | `missing_sec_headers` = all four; robots `200 disallow=2 allow=0 sitemap=1`; `security-txt-expired [low]`; a `https://nginx.test/private/` row from robots.txt with status 401 and `auth=Basic realm="Lab Private"`, not `CleartextAuth` (it is HTTPS) |
+| `spa.test` | CSP with `frame-ancestors`, HSTS one year, nosniff; a valid security.txt | nothing missing (CSP covers X-Frame-Options); `hsts_max_age=31536000`; security.txt present |
+| `wp.test` | WordPress sets `wordpress_test_cookie` without HttpOnly on `wp-login.php` | `cookie_issues` names it |
+| `ci.test` | Jenkins: favicon, a `Secure; HttpOnly` session cookie, a robots.txt that disallows `/` | `favicon_mmh3=81586312`; no cookie issue |
+| `vpn-legacy.walk.test` | HTTP only, basic auth (realm "Legacy VPN") | `http_flags=CleartextAuth` |
+| `www.walk.test` | Caddy's default site: an empty 200 for every path | `catch-all-200 [info]` from the 404 probe |
+| reverse zone | `127.0.0.1` → `ingress.lab.test`, `LAB_ORIGIN_IP` → `origin-nginx.lab.test` | `ptr=ingress.lab.test` with `--enrich` (non-public addresses are asked only of the resolver passed with `--resolvers`) |
+
+The basic-auth password in the Caddyfile is a throwaway lab value. katana reads robots.txt too, so
+`/private/` and the sitemap URL also appear in default runs of the lab, for every version alike.
 
 ## Accuracy notes
 

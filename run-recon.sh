@@ -23,7 +23,7 @@
 #
 set -euo pipefail
 
-VERSION="1.18.0"
+VERSION="1.19.0"
 
 # Resolve our own directory early (BEFORE the worker-dispatch block below) so we
 # can locate sibling helper scripts (recon-db.sh, generate-report.sh) in both the
@@ -89,7 +89,10 @@ RECON_DIR="$(dirname "$RECON_SELF")"
 : "${CLOUD_TTL:=604800}"   # cloud IP-range feed cache freshness in seconds (default 7 days)
 : "${RECON_CLOUD_CACHE:=${XDG_CACHE_HOME:-$HOME/.cache}/run-recon/cloud_ranges.tsv}"  # cloud-feed cache file
 : "${CPE_MAP_FILE:=}"      # optional TSV extending the built-in product->CPE table (--cpe-map)
-: "${FAVICON:=0}"          # 1 = favicon/internet-scan pivot (uncover; needs Shodan/Censys keys)
+: "${FAVICON:=0}"          # 1 = internet-scan pivot: cert-name search + favicon-hash search (uncover; API keys)
+: "${FAVICON_LIMIT:=100}"   # uncover results per favicon hash
+: "${FAVICON_MAX_HASHES:=10}" # distinct favicon hashes searched per seed (API credits)
+: "${EXTRAS:=0}"           # 1 = robots.txt, security.txt and one 404 probe per live host (+ favicon hashes)
 : "${ROUNDS:=1}"           # host-discovery rounds (>1 = recursive: re-enumerate newly found hosts)
 : "${VHOST:=0}"            # 1 = virtual-host bruteforce (ffuf Host header) -> side artifact
 : "${NUCLEI:=0}"           # 1 = nuclei templated scan on live URLs -> side artifact (opt-in; off)
@@ -885,7 +888,7 @@ PYTK
 #      With --proxy, verification goes through the proxy with httpx and a Host header
 #      (no custom SNI: an SNI-routed HTTPS origin may then be missed).
 origin_check() {
-  local domain="$1" raw="$2" out="$3" etsv="$4"
+  local domain="$1" raw="$2" out="$3" etsv="$4" favhash="${5:-}"
   local live="$raw/live_hosts.txt" ref="$raw/origin_ref.jsonl" jarm="$raw/origin_jarm.txt" cdn="$raw/origin_cdn.txt"
   local names="$raw/origin_names.txt" res="$raw/origin_res.jsonl" txt="$raw/origin_dns.txt" cand="$raw/origin_pairs.tsv"
   local rr=() rr2=(); [ -n "$RESOLVERS" ] && { rr=(-r "$RESOLVERS"); rr2=(-r "$RESOLVERS"); }
@@ -896,6 +899,8 @@ origin_check() {
   [ -s "$raw/origin_roots.txt" ] || return 0
   _to "$STAGE_TIMEOUT" "$HTTPX_BIN" -l "$raw/origin_roots.txt" -silent -json -irh -title -hash sha256 -favicon \
       -nfs -nc -timeout 10 -retries "$HTTP_RETRIES" -rl "$RATE" "${rr[@]}" 2>>"$raw/httpx.err" > "$ref" || true
+  # the reference fetch already has the favicon hashes: record them (no second request)
+  if [ -n "$favhash" ] && [ ! -s "$favhash" ]; then favhash_from_json "$ref" >> "$favhash"; fi
   : > "$jarm"; : > "$cdn"
   if have tlsx; then
     awk '/^[Hh][Tt][Tt][Pp][Ss]:\/\//{u=$0; sub(/^[^:]*:\/\//,"",u); sub(/\/.*$/,"",u); if(u!~/:/)u=u":443"; print tolower(u)}' \
@@ -954,9 +959,10 @@ PYON
     done >> "$txt" || true
   fi
   # 3. pair hosts with candidates and verify
-  python3 - "$domain" "$ref" "$jarm" "$cdn" "$res" "$txt" "$etsv" "$cand" "$ORIGIN_MAX_CHECKS" <<'PYOC' || true
+  python3 - "$domain" "$ref" "$jarm" "$cdn" "$res" "$txt" "$etsv" "$cand" "$ORIGIN_MAX_CHECKS" "$raw/favicon_hits.txt" <<'PYOC' || true
 import sys, json, re, ipaddress
 seed, ref, jarm_f, cdn_f, res_f, txt_f, etsv, cand_f, maxc = sys.argv[1:10]
+fav_f = sys.argv[10] if len(sys.argv) > 10 else ""
 EDGE_HEADERS = [("cf-ray", "Cloudflare"), ("cf_ray", "Cloudflare"), ("x_amz_cf_id", "CloudFront"), ("x_amz_cf_pop", "CloudFront"),
                 ("x_served_by", "Fastly"), ("x_fastly_request_id", "Fastly"), ("akamai_grn", "Akamai"), ("x_akamai_transformed", "Akamai"),
                 ("x_azure_ref", "Azure Front Door"), ("x_msedge_ref", "Azure Front Door"), ("x_sucuri_id", "Sucuri"),
@@ -1029,6 +1035,12 @@ for l in open(txt_f, encoding="utf-8", errors="replace"):
     elif l.startswith("MXA "):
         f = l.split()
         if len(f) >= 3: add(f[2], "mx:" + f[1])
+# hosts elsewhere serving the same favicon (--favicon pivot)
+try:
+    for l in open(fav_f, encoding="utf-8", errors="replace"):
+        add(l.strip().split(":")[0], "favicon")
+except (OSError, TypeError):
+    pass
 pairs, n = [], 0
 for host, rs in sorted(refs.items()):
     edge_ips = {x["ip"] for x in rs if x["ip"]}
@@ -1088,6 +1100,211 @@ print("\t".join([str((j.get("hash") or {}).get("body_sha256","")), str(j.get("co
   return 0
 }
 
+# favhash_from_json FILE: "host<TAB>mmh3<TAB>md5<TAB>path" for every httpx record in FILE
+# (JSON lines from -favicon) that carries a favicon. mmh3 is Shodan's favicon hash.
+favhash_from_json() {
+  [ -s "$1" ] || return 0
+  python3 - "$1" <<'PYFAV' 2>/dev/null || true
+import sys, json, re
+seen = set()
+for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    try:
+        j = json.loads(line)
+    except Exception:
+        continue
+    if not isinstance(j, dict):
+        continue
+    u = str(j.get("url") or j.get("input") or "")
+    h = u.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0].lower()
+    mm, md5 = str(j.get("favicon") or ""), str(j.get("favicon_md5") or "").lower()
+    if not h or h in seen or not re.fullmatch(r"-?\d{1,11}", mm):
+        continue
+    seen.add(h)
+    md5 = md5 if re.fullmatch(r"[0-9a-f]{32}", md5) else ""
+    path = str(j.get("favicon_path") or j.get("favicon_url") or "").replace("\t", " ")[:200]
+    print("\t".join([h, mm, md5, path]))
+PYFAV
+  return 0
+}
+
+# host_favicons SEED RAW OUT: favicon hashes of the live hosts (root URLs), one request per
+# host plus the icon itself (httpx follows <link rel=icon>, then /favicon.ico).
+host_favicons() {
+  local domain="$1" raw="$2" out="$3" roots="$2/fav_roots.txt" js="$2/fav.jsonl"
+  [ -s "$out" ] && return 0
+  grep -E '^https?://[^/]+/?$' "$raw/live_hosts.txt" 2>/dev/null | sort -u > "$roots" || true
+  [ -s "$roots" ] || return 0
+  local rr=(); [ -n "$RESOLVERS" ] && rr=(-r "$RESOLVERS"); [ -n "$PROXY" ] && rr+=(-proxy "$PROXY")
+  _to "$STAGE_TIMEOUT" "$HTTPX_BIN" -l "$roots" -silent -json -favicon -nfs -nc -timeout 10 \
+      -retries "$HTTP_RETRIES" -rl "$RATE" "${rr[@]}" 2>>"$raw/httpx.err" > "$js" || true
+  favhash_from_json "$js" >> "$out"
+  return 0
+}
+
+# favicon_pivot SEED RAW FAVHASH OUT: search every distinct favicon of the seed's live hosts
+# on the internet-scan engines uncover is configured for (Shodan and Fofa by mmh3, Censys by
+# MD5), cert-scan the hits for in-scope names (-> host_faviconpivot.txt, source favicon),
+# and keep the hits for --origin (favicon_hits.txt). Results are capped per hash and the
+# number of hashes is capped per seed: a framework's default icon matches thousands of hosts.
+favicon_pivot() {
+  local domain="$1" raw="$2" fav="$3" out="$4" hits="$2/favicon_hits.txt"
+  : > "$hits"
+  { [ -s "$fav" ] && have uncover; } || return 0
+  local ucp=(); [ -n "$PROXY" ] && ucp=(-proxy "$PROXY")
+  local mm md5 n=0 f hosts uq
+  while IFS="$(printf '\t')" read -r mm md5; do
+    [ -n "$mm" ] || continue
+    n=$((n+1)); [ "$n" -le "$FAVICON_MAX_HASHES" ] || break
+    uq=(-shodan "http.favicon.hash:$mm" -fofa "icon_hash=\"$mm\"")
+    [ -n "$md5" ] && uq+=(-censys "services.http.response.favicons.md5_hash: \"$md5\"")
+    f="$raw/fav_hits.$n.txt"
+    _to "$STAGE_TIMEOUT" uncover "${uq[@]}" -silent -duc -l "$FAVICON_LIMIT" "${ucp[@]}" 2>/dev/null \
+      | grep -oE '^([0-9]{1,3}\.){3}[0-9]{1,3}(:[0-9]{1,5})?' | sort -u > "$f" || : > "$f"
+    hosts="$(awk -F'\t' -v m="$mm" '$2 == m { print $1 }' "$fav" | sort -u | paste -sd, -)"
+    printf '[%s] favicon-pivot host=%s mmh3=%s md5=%s hits=%s\n' "$domain" "$hosts" "$mm" "${md5:--}" \
+      "$(grep -c . "$f" || true)" >> "$out"
+    cat "$f" >> "$hits"
+  done < <(cut -f2,3 "$fav" | sort -u)
+  sort -u "$hits" -o "$hits"
+  [ -s "$hits" ] && have tlsx || return 0
+  awk -F: '{ print $1 ":" ($2 == "" ? 443 : $2) }' "$hits" | sort -u > "$raw/favicon_hits_hp.txt"
+  local ftl=(-l "$raw/favicon_hits_hp.txt" -san -cn -resp-only -silent -timeout 10)
+  { [ -n "$RESOLVERS" ] && [ -s "$RESOLVERS" ]; } && ftl+=(-r "$RESOLVERS")
+  _to "$STAGE_TIMEOUT" tlsx "${ftl[@]}" < /dev/null 2>/dev/null | scope_filter "$domain" | sort -u > "$raw/favpivot.raw" || : > "$raw/favpivot.raw"
+  comm -13 <(sort -u "$raw/hosts.txt" 2>/dev/null) "$raw/favpivot.raw" > "$raw/favpivot.new" 2>/dev/null || cp "$raw/favpivot.raw" "$raw/favpivot.new"
+  if [ "$RESOLVE" = "1" ] && [ -s "$raw/favpivot.new" ]; then
+    resolve_hosts "$raw/favpivot.new" "$raw/host_faviconpivot.txt" "$domain"
+  else
+    cp "$raw/favpivot.new" "$raw/host_faviconpivot.txt" 2>/dev/null || : > "$raw/host_faviconpivot.txt"
+  fi
+  [ -s "$raw/host_faviconpivot.txt" ] && log "[$domain] favicon pivot: $(wc -l < "$raw/host_faviconpivot.txt" | tr -d ' ') new in-scope name(s) from hosts sharing a favicon"
+  return 0
+}
+
+# extras_check SEED RAW OUT HOSTINFO URLS: WebInventory's "safe extras" for every live root:
+# GET /robots.txt, /.well-known/security.txt (then /security.txt) and one random path (the
+# 404 probe, after nmap's FourOhFourRequest). Writes findings to OUT, "host<TAB>robots<TAB>
+# security_txt" to HOSTINFO, and robots.txt's paths and sitemaps (as URLs) to URLS.
+extras_check() {
+  local domain="$1" raw="$2" out="$3" hinfo="$4" urls="$5" roots="$2/extras_roots.txt" js="$2/extras.jsonl" probe
+  : > "$urls"
+  grep -E '^https?://[^/]+/?$' "$raw/live_hosts.txt" 2>/dev/null | sed -E 's#/$##' | sort -u > "$roots" || true
+  [ -s "$roots" ] || return 0
+  probe="/rr-$(od -An -N6 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+  [ "$probe" != "/rr-" ] || probe="/rr-$$-$RANDOM"
+  probe="$probe.html"
+  local rr=(); [ -n "$RESOLVERS" ] && rr=(-r "$RESOLVERS"); [ -n "$PROXY" ] && rr+=(-proxy "$PROXY")
+  _to "$STAGE_TIMEOUT" "$HTTPX_BIN" -l "$roots" -path "/robots.txt,/.well-known/security.txt,/security.txt,$probe" \
+      -silent -json -irr -nfs -nc -timeout 10 -retries "$HTTP_RETRIES" -rl "$RATE" "${rr[@]}" 2>>"$raw/httpx.err" > "$js" || true
+  python3 - "$js" "$domain" "$probe" "$out" "$hinfo" "$urls" <<'PYEX' 2>>"$raw/extras.err" || true
+import sys, json, re, datetime
+js, seed, probe, out_f, hinfo_f, urls_f = sys.argv[1:7]
+now = datetime.datetime.now(datetime.timezone.utc)
+def clean(v, n=120):
+    return re.sub(r"[\s\x00-\x1f]+", " ", str(v or "")).strip().replace('"', "'")[:n]
+def is_html(j, body):
+    return "html" in str(j.get("content_type") or "").lower() or body.lstrip()[:20].lower().startswith(("<!doctype", "<html"))
+def parse_dt(v):
+    v = (v or "").strip()
+    for cand in (v.replace("Z", "+00:00"), v[:10]):
+        try:
+            d = datetime.datetime.fromisoformat(cand)
+            return d if d.tzinfo else d.replace(tzinfo=datetime.timezone.utc)
+        except Exception:
+            pass
+    return None
+VERSION_RE = re.compile(r"\b(Apache/\d[\w.]*(?: \([^)<]{1,40}\))?|nginx/\d[\w.]*|Microsoft-IIS/\d[\w.]*|"
+                        r"Apache Tomcat/\d[\w.]*|Jetty\(\d[\w.]*\)|lighttpd/\d[\w.]*|openresty/\d[\w.]*|"
+                        r"LiteSpeed/\d[\w.]*|Werkzeug/\d[\w.]*)")
+by = {}
+try:
+    lines = open(js, encoding="utf-8", errors="replace").read().splitlines()
+except OSError:
+    lines = []
+for line in lines:
+    try:
+        j = json.loads(line)
+    except Exception:
+        continue
+    if not isinstance(j, dict):
+        continue
+    u = str(j.get("url") or "")
+    if "://" not in u:
+        continue
+    scheme, rest = u.split("://", 1)
+    netloc = rest.split("/", 1)[0].lower()
+    path = str(j.get("path") or ("/" + rest.split("/", 1)[1] if "/" in rest else "/"))
+    by.setdefault(scheme.lower() + "://" + netloc, {})[path] = j
+out, hinfo, urls, done = [], [], [], set()
+for root in sorted(by, key=lambda r: (not r.startswith("https"), r)):
+    d = by[root]
+    host = root.split("://", 1)[1].split(":", 1)[0]
+    # robots.txt
+    rob, robs = d.get("/robots.txt"), "none"
+    if rob is not None:
+        sc, body = int(rob.get("status_code") or 0), str(rob.get("body") or "")
+        if sc == 200 and not is_html(rob, body) and re.search(r"(?im)^\s*(user-agent|disallow|allow|sitemap)\s*:", body):
+            dis = re.findall(r"(?im)^\s*disallow\s*:\s*(\S+)", body)
+            alw = re.findall(r"(?im)^\s*allow\s*:\s*(\S+)", body)
+            smp = re.findall(r"(?im)^\s*sitemap\s*:\s*(\S+)", body)
+            robs = "200 disallow=%d allow=%d sitemap=%d" % (len(dis), len(alw), len(smp))
+            for pth in dis + alw:
+                if pth.startswith("/") and pth != "/" and "*" not in pth and "$" not in pth:
+                    urls.append(root + pth)
+            urls.extend(x for x in smp if x.startswith(("http://", "https://")))
+        elif sc == 200:
+            robs = "200 empty" if not body.strip() else "200 not robots.txt (%s)" % clean(rob.get("content_type") or "no content type", 40)
+        else:
+            robs = str(sc or "no response")
+    # security.txt (RFC 9116): Contact and Expires are required
+    sec, sj, sp = "missing", None, ""
+    for pth in ("/.well-known/security.txt", "/security.txt"):
+        x = d.get(pth)
+        if x is not None and int(x.get("status_code") or 0) == 200 and not is_html(x, str(x.get("body") or "")) \
+                and re.search(r"(?im)^\s*contact\s*:", str(x.get("body") or "")):
+            sj, sp = x, pth
+            break
+    if sj is not None:
+        body = str(sj.get("body") or "")
+        contact = (re.findall(r"(?im)^\s*contact\s*:\s*(\S+)", body) or [""])[0]
+        expires = (re.findall(r"(?im)^\s*expires\s*:\s*(\S+)", body) or [""])[0]
+        exp = parse_dt(expires)
+        if not expires or exp is None:
+            sec = "present contact=%s no-expires" % clean(contact, 80)
+            out.append("[%s] security-txt-invalid [low] host=%s path=%s contact=%s note=RFC 9116 requires an Expires field"
+                       % (seed, host, sp, clean(contact, 80)))
+        elif exp < now:
+            sec = "expired contact=%s expires=%s" % (clean(contact, 80), clean(expires, 40))
+            out.append("[%s] security-txt-expired [low] host=%s path=%s expires=%s note=researchers are told to treat an expired security.txt as stale; renew Expires"
+                       % (seed, host, sp, clean(expires, 40)))
+        else:
+            sec = "present contact=%s expires=%s" % (clean(contact, 80), clean(expires, 40))
+    # the 404 probe: a catch-all 200 makes every crawled path look real; error pages leak versions
+    x = d.get(probe)
+    if x is not None:
+        sc, body = int(x.get("status_code") or 0), str(x.get("body") or "")
+        server = clean(x.get("webserver"), 80)
+        if sc == 200:
+            out.append("[%s] catch-all-200 [info] host=%s path=%s length=%s note=every path answers 200 (soft 404), so crawled and fuzzed paths on this host over-report"
+                       % (seed, host, probe, clean(x.get("content_length"), 12)))
+        rev = sorted(set(m.group(1) for m in VERSION_RE.finditer(body[:20000])))
+        rev = [v for v in rev if v.lower() not in server.lower()]
+        out.append("[%s] error-page [info] host=%s status=%s server=\"%s\" title=\"%s\"%s"
+                   % (seed, host, sc, server, clean(x.get("title"), 80), (' reveals="%s"' % clean("; ".join(rev), 120)) if rev else ""))
+    if host not in done:
+        done.add(host)
+        hinfo.append("\t".join([host, robs, sec]))
+with open(out_f, "a", encoding="utf-8") as f:
+    f.write("".join(x + "\n" for x in out))
+with open(hinfo_f, "a", encoding="utf-8") as f:
+    f.write("".join(x + "\n" for x in hinfo))
+with open(urls_f, "w", encoding="utf-8") as f:
+    f.write("".join(x + "\n" for x in sorted(set(urls))))
+PYEX
+  [ -s "$urls" ] && log "[$domain] extras: $(wc -l < "$urls" | tr -d ' ') URL(s) from robots.txt"
+  return 0
+}
+
 analyze_hosts() {
   local domain="$1" raw="$2" safe
   safe="$(printf '%s' "$domain" | tr -c 'A-Za-z0-9.-' '_')"
@@ -1100,14 +1317,31 @@ analyze_hosts() {
     takeover_check "$domain" "$raw" "$P/takeover.$safe.txt" "$P/cname.$safe.tsv"
   fi
   [ -s "$live" ] || return 0
-  if [ "$SCREENSHOTS$ORIGIN$NUCLEI$PARAMS$SECRETS" != "00000" ]; then
-    stage "$domain" "post-probe analysis (screenshots/origin/nuclei/params/secrets)"
+  if [ "$SCREENSHOTS$ORIGIN$NUCLEI$PARAMS$SECRETS$EXTRAS$FAVICON" != "0000000" ]; then
+    stage "$domain" "post-probe analysis (screenshots/origin/extras/nuclei/params/secrets)"
+  fi
+
+  # favicon hashes per live host (--extras / --favicon; --origin records them from its
+  # own reference fetch), then the favicon-hash pivot, whose hits --origin also tries
+  if [ "$EXTRAS" = "1" ] || [ "$FAVICON" = "1" ]; then
+    stage "$domain" "favicon hashes"
+    host_favicons "$domain" "$raw" "$P/favhash.$safe.tsv"
+  fi
+  if [ "$FAVICON" = "1" ]; then
+    stage "$domain" "favicon pivot (uncover)"
+    favicon_pivot "$domain" "$raw" "$P/favhash.$safe.tsv" "$P/favicon.$safe.txt"
   fi
 
   # edge detection + origin identification (see origin_check)
   if [ "$ORIGIN" = "1" ] && [ -s "$live" ]; then
     stage "$domain" "edge detection + origin search"
-    origin_check "$domain" "$raw" "$P/origin.$safe.txt" "$P/edge.$safe.tsv"
+    origin_check "$domain" "$raw" "$P/origin.$safe.txt" "$P/edge.$safe.tsv" "$P/favhash.$safe.tsv"
+  fi
+
+  # robots.txt, security.txt and the 404 probe (--extras)
+  if [ "$EXTRAS" = "1" ]; then
+    stage "$domain" "robots.txt, security.txt, 404 probe"
+    extras_check "$domain" "$raw" "$P/extras.$safe.txt" "$P/hostinfo.$safe.tsv" "$raw/robots_urls.txt"
   fi
 
   # TLS posture (tlsx): negotiated version/cipher, cert expiry, self-signed / name-mismatch
@@ -1776,11 +2010,13 @@ process_one() {
     fi
   fi
 
-  # favicon / internet-scan pivot: uncover returns IP:port, so cert-scan those
-  # IPs with tlsx to recover in-scope hostnames. Needs uncover API keys.
+  # internet-scan pivot, part 1 (certificates naming the seed): uncover returns IP:port,
+  # so cert-scan those IPs with tlsx to recover in-scope hostnames. Part 2, the favicon
+  # hash search, needs live hosts and runs in analyze_hosts (favicon_pivot).
   if [ "$FAVICON" = "1" ] && have uncover; then
     local favips="$raw/favicon_ips.txt"; : > "$favips"
-    _to "$STAGE_TIMEOUT" uncover -q "ssl:\"$domain\"" -silent 2>/dev/null \
+    local _ucp=(); [ -n "$PROXY" ] && _ucp=(-proxy "$PROXY")
+    _to "$STAGE_TIMEOUT" uncover -q "ssl:\"$domain\"" -silent -duc "${_ucp[@]}" 2>/dev/null \
       | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u > "$favips" || : > "$favips"
     if [ -s "$favips" ] && have tlsx; then
       local ftl=(-l "$favips" -san -cn -resp-only -silent -timeout 10)
@@ -2096,6 +2332,7 @@ process_one() {
   prep_file "$hk" "$raw/hk.s.txt"   "$domain"
   prep_file "$js" "$raw/js.s.txt"   "$domain"
   prep_file "$ge" "$raw/ge.s.txt"   "$domain"
+  prep_file "$raw/robots_urls.txt" "$raw/robots.s.txt" "$domain"
 
   local combined="$raw/combined.tsv"
   : > "$combined"
@@ -2103,7 +2340,7 @@ process_one() {
   for pair in "$raw/gau.s.txt:gau" "$raw/wb.s.txt:wayback" "$raw/wm.s.txt:waymore" \
               "$raw/kat.s.txt:katana" "$raw/uf.s.txt:urlfinder" \
               "$raw/gs.s.txt:gospider" "$raw/hk.s.txt:hakrawler" "$raw/js.s.txt:js" \
-              "$raw/ge.s.txt:github"; do
+              "$raw/ge.s.txt:github" "$raw/robots.s.txt:robots"; do
     f="${pair%%:*}"; s="${pair##*:}"
     [ -s "$f" ] && awk -v s="$s" '{print $0"\t"s}' "$f" >> "$combined"
   done
@@ -2130,7 +2367,7 @@ process_one() {
       | grep -vxF "$domain" | sed 's#^#https://#' \
       | awk -v s="$hs" 'NF{print $0"\t"s}' >> "$combined" || true
   done
-  for hpair in "$raw/host_tlsxlive.txt:tlsx-live" "$raw/host_vhost.txt:vhost"; do
+  for hpair in "$raw/host_tlsxlive.txt:tlsx-live" "$raw/host_vhost.txt:vhost" "$raw/host_faviconpivot.txt:favicon"; do
     hf="${hpair%%:*}"; hs="${hpair##*:}"
     [ -s "$hf" ] || continue
     grep -vxF "$domain" "$hf" 2>/dev/null | sed 's#^#https://#' \
@@ -2178,7 +2415,7 @@ process_one() {
     local _hxout="$WORKDIR/parts/httpx.$safe.jsonl"; : > "$_hxout"
     local _enrkeys="$raw/enrich_keys.txt" _enrhit="$raw/enrich_hit.jsonl" _enrmiss="$raw/enrich_miss.txt"
     cut -f1 "$mapurls" | head -n "$capped" > "$_enrkeys"
-    cache_split httpx_json "$_enrkeys" "$_enrhit" "$_enrmiss"   # reuse cached per-URL JSON
+    cache_split httpx_json_v2 "$_enrkeys" "$_enrhit" "$_enrmiss"   # reuse cached per-URL JSON
     cat "$_enrhit" >> "$_hxout" 2>/dev/null || true
     if [ -s "$_enrmiss" ]; then
       local _enrfresh="$raw/enrich_fresh.jsonl" _enrrc=0
@@ -2186,13 +2423,17 @@ process_one() {
       # ("use of closed network connection") silently blanked that row; measured
       # in the lab at 10/100 requests under concurrency without retries, 0/100
       # with 2. Retries only fire on failure, so healthy targets see no extra load.
+      # -irh -hash sha256: the response headers and body hash of the SAME request feed the
+      # HTTP columns (redirect target, security headers, cookies, HSTS, Alt-Svc, auth, body
+      # SHA-256); no extra request. The cache key moved to httpx_json_v2 so records cached
+      # before 1.19 (no headers) are fetched again instead of leaving those columns blank.
       # -nfs (-no-fallback-scheme): probe each URL with ITS OWN scheme. Without it
       # httpx tries HTTPS first even for an http:// input, so http:// rows were
       # silently enriched with the HTTPS response (wrong status/title for plain-HTTP
       # services, redirects, or hosts that serve different content per scheme).
       cat "$_enrmiss" \
         | _to "$STAGE_TIMEOUT" "$HTTPX_BIN" -silent -json -status-code -content-length -title -tech-detect -web-server \
-                -nfs -timeout 10 -retries "$HTTP_RETRIES" -rl "$RATE" "${rr[@]}" 2>>"$raw/httpx.err" > "$_enrfresh" || _enrrc=$?
+                -irh -hash sha256 -nfs -timeout 10 -retries "$HTTP_RETRIES" -rl "$RATE" "${rr[@]}" 2>>"$raw/httpx.err" > "$_enrfresh" || _enrrc=$?
       # late retry: httpx's own retries fire back to back, so a URL that failed
       # during a load spike usually fails all of them (the farm at -t 20 on 2 vCPU
       # blanked 1-3 hosts per run). URLs with no record get one more pass after a
@@ -2205,14 +2446,14 @@ process_one() {
           late_pause
           cat "$_enrlate" \
             | _to "$STAGE_TIMEOUT" "$HTTPX_BIN" -silent -json -status-code -content-length -title -tech-detect -web-server \
-                    -nfs -timeout 10 -retries "$HTTP_RETRIES" -t 5 -rl "$RATE" "${rr[@]}" 2>>"$raw/httpx.err" >> "$_enrfresh" || true
+                    -irh -hash sha256 -nfs -timeout 10 -retries "$HTTP_RETRIES" -t 5 -rl "$RATE" "${rr[@]}" 2>>"$raw/httpx.err" >> "$_enrfresh" || true
         fi
       fi
       cat "$_enrfresh" >> "$_hxout" 2>/dev/null || true
       # cache each fresh record by its input URL. No negative entries: these URLs
       # belong to hosts the live probe just confirmed, so a missing record is a
       # failed request, not an absent page (see cache_store).
-      [ "$_enrrc" -eq 0 ] && cache_store httpx_json "$_enrmiss" "$_enrfresh" httpxjson noneg
+      [ "$_enrrc" -eq 0 ] && cache_store httpx_json_v2 "$_enrmiss" "$_enrfresh" httpxjson noneg
     fi
     # surface a clear hint if nothing (cached or fresh) came back at all
     if [ ! -s "$_hxout" ] && [ -s "$mapurls" ]; then
@@ -2291,7 +2532,15 @@ DISCOVERY (host expansion; active techniques -- assets you are authorized to ass
       --port-spec SPEC    naabu ports (default: web-ports preset; e.g. top-1000 or 80,443,8080).
   -p  SPEC                Alias for --port-spec.
       --rounds N          Recursive host-discovery rounds; re-enumerate new subs (default: $ROUNDS).
-      --favicon           Favicon / internet-scan pivot (uncover; needs Shodan/Censys API keys).
+      --favicon           Internet-scan pivot through uncover (needs Shodan/Fofa/Censys API keys):
+                          before the probe, certificates naming the seed; after it, every host
+                          serving the same favicon as a live host (mmh3 on Shodan/Fofa, MD5 on
+                          Censys). Hits are cert-scanned for in-scope names (source favicon) and,
+                          with --origin, become origin candidates -> <out>.favicon.txt
+      --extras            Per live host: robots.txt (its paths become URL rows, source robots),
+                          security.txt (RFC 9116 Contact/Expires) and one random-path 404 probe
+                          (catch-all 200, error-page versions), plus favicon hashes. 3-5 extra
+                          requests per host -> robots, security_txt, favicon_* columns, <out>.extras.txt
       --resolvers FILE    Custom resolver list (else a built-in dedicated set is used;
                           both bypass a local Pi-hole and its rate limits). Resolvers are
                           health-checked at startup; a dead set is warned about, not silently
@@ -2329,7 +2578,8 @@ ANALYSIS / TRIAGE (side artifacts written next to the CSV; not URL rows):
       --tls-full          ...also enumerate TLS versions + ciphers (adds WeakTLS/WeakCipher; noisier).
       --ipv6              Resolve AAAA records (dnsx) -> ipv6 CSV column.
       --enrich            Per-IP cloud provider (AWS/Azure/GCP/Cloudflare/Oracle/DO IP-range feeds) +
-                          RDAP network org -> cloud, rdap_org CSV columns.
+                          RDAP network org + reverse DNS -> cloud, rdap_org, ptr CSV columns. PTR
+                          lookups of non-public addresses go only to resolvers you pass with --resolvers.
       --geodb FILE        MaxMind GeoLite2 .mmdb -> geo column (country ISO). Implies --enrich; needs
                           mmdblookup (libmaxminddb). You supply the DB (MaxMind account/EULA).
       --cpe-map FILE      Extend/override the built-in product->CPE table (TSV: name<TAB>cpe:2.3:a:vendor:product).
@@ -2396,7 +2646,8 @@ REPORT & CACHE:
 UMBRELLA:
       --all               Enable the full discovery + defensive set: --subs --resolve --certs
                           --permute --brute --ports --js --crawlers-all --takeover
-                          --screenshots --origin. (Scanning stages nuclei/params/secrets and
+                          --zone-exposure --screenshots --origin --extras --active --activescan
+                          --osint --tls --ipv6 --enrich. (Scanning stages nuclei/params/secrets and
                           favicon/vhost/monitor stay opt-in.)
 
 INPUT MODES:
@@ -2433,10 +2684,14 @@ INPUT MODES:
 
 CSV columns:
   seed_domain, url, host, sources, status_code, content_length, webserver, title, technologies, ip, asn,
-  asn_org, tls_version, tls_cipher, cert_not_after, cert_issuer, tls_flags, ipv6, cloud, rdap_org, geo, cpe
+  asn_org, tls_version, tls_cipher, cert_not_after, cert_issuer, tls_flags, ipv6, cloud, rdap_org, geo, cpe,
+  redirect_location, response_ms, body_sha256, content_type, powered_by, auth, cookies, cookie_issues,
+  missing_sec_headers, hsts_max_age, alt_svc, http_flags, favicon_mmh3, favicon_md5, ptr, robots,
+  security_txt   (the HTTP columns come from the enrichment request itself: no extra traffic)
 
 Side-artifact files (when the matching flag is set): <out>.takeover.txt, <out>.cname.tsv, <out>.zone.txt,
-<out>.zone-names.txt, <out>.origin.txt, <out>.edge.tsv, <out>.screenshots.tsv, screenshots-<ts>/,
+<out>.zone-names.txt, <out>.origin.txt, <out>.edge.tsv, <out>.extras.txt, <out>.favicon.txt,
+<out>.screenshots.tsv, screenshots-<ts>/,
 <out>.nuclei.txt, <out>.params.txt, <out>.secrets.txt, <out>.buckets.txt, <out>.cms.txt,
 <out>.activescan.txt, <out>.osint.txt, <out>.virustotal.txt, <out>.urlscan.txt, <out>.social.txt,
 <out>.new-assets.txt. Always: <out>.run.json (version, command line, tool versions, per-seed counts,
@@ -2488,6 +2743,7 @@ while [ $# -gt 0 ]; do
     --origin)          ORIGIN=1; shift;;
     --zone-exposure)   ZONE_EXPOSURE=1; shift;;
     --favicon)         FAVICON=1; shift;;
+    --extras)          EXTRAS=1; shift;;
     --rounds)          ROUNDS="${2:?}"; shift 2;;
     --vhost)           VHOST=1; shift;;
     --nuclei)          NUCLEI=1; shift;;
@@ -2512,7 +2768,7 @@ while [ $# -gt 0 ]; do
     --social-user)     SOCIAL_USER="${2:?}"; SOCIAL=1; shift 2;;
     --all)             DO_SUBS=1; RESOLVE=1; CERTS=1; PERMUTE=1; BRUTE=1; PORTS=1; \
                        JS=1; CRAWLERS_ALL=1; TAKEOVER=1; SCREENSHOTS=1; ORIGIN=1; ACTIVE=1; \
-                       ACTIVESCAN=1; OSINT=1; TLS_POSTURE=1; IPV6=1; ENRICH=1; ZONE_EXPOSURE=1; shift;;
+                       ACTIVESCAN=1; OSINT=1; TLS_POSTURE=1; IPV6=1; ENRICH=1; ZONE_EXPOSURE=1; EXTRAS=1; shift;;
     --fuzz)            FUZZ=1; shift;;
     --wordlist)        WORDLIST="${2:?}"; shift 2;;
     --fuzz-threads)    FUZZ_THREADS="${2:?}"; shift 2;;
@@ -2975,7 +3231,7 @@ log " Subdomains    : $(onoff $DO_SUBS)    Deep(waymore): $(onoff $DEEP)    Roun
 log " Discovery     : resolve=$(onoff $RESOLVE)  certs=$(onoff $CERTS)  permute=$(onoff $PERMUTE)  brute=$(onoff $BRUTE)  ports=$(onoff $PORTS)  favicon=$(onoff $FAVICON)$([ -n "$RESOLVERS" ] && echo "  (dedicated resolvers)" || echo "")"
 log " Sources+      : crawlers-all=$(onoff $CRAWLERS_ALL)  js=$(onoff $JS)"
 log " DNS zones     : zone-exposure=$(onoff $ZONE_EXPOSURE)"
-log " Analysis      : takeover=$(onoff $TAKEOVER)  screenshots=$(onoff $SCREENSHOTS)  origin=$(onoff $ORIGIN)  vhost=$(onoff $VHOST)  nuclei=$(onoff $NUCLEI)  params=$(onoff $PARAMS)  secrets=$(onoff $SECRETS)  active-cms=$(onoff $ACTIVE)  activescan=$(onoff $ACTIVESCAN)"
+log " Analysis      : takeover=$(onoff $TAKEOVER)  screenshots=$(onoff $SCREENSHOTS)  origin=$(onoff $ORIGIN)  extras=$(onoff $EXTRAS)  vhost=$(onoff $VHOST)  nuclei=$(onoff $NUCLEI)  params=$(onoff $PARAMS)  secrets=$(onoff $SECRETS)  active-cms=$(onoff $ACTIVE)  activescan=$(onoff $ACTIVESCAN)"
 if [ "$NUCLEI$ACTIVE$ACTIVESCAN" != "000" ] && have nuclei; then
   case "$NUCLEI_OAST" in
     off)    log " nuclei OAST   : off (-ni; no callbacks to public interactsh servers)";;
@@ -3102,7 +3358,7 @@ export SOCIAL SOCIAL_USER
 export RDAP_TIMEOUT RDAP_DELAY INTERNETDB_TIMEOUT INTERNETDB_DELAY VT_TIMEOUT VT_DELAY URLSCAN_TIMEOUT URLSCAN_DELAY
 export USE_DB CACHE_TTL RECON_DB_NAME RECON_DB_DSN PGDATABASE PGUSER PGHOST PGPORT PGPASSWORD
 export NEG_TTL CB_THRESHOLD CB_SERIALIZE PROXY HTTP_RETRIES LATE_RETRY SKIP_SPECIAL_USE NUCLEI_OAST NUCLEI_ISERVER ZONE_EXPOSURE
-export CERT_WARN_DAYS TLS_CHAIN_CHECK
+export CERT_WARN_DAYS TLS_CHAIN_CHECK EXTRAS FAVICON_LIMIT FAVICON_MAX_HASHES
 # route GET-heavy stages (curl/whatweb/gau/wget/python) through the proxy if set;
 # ProjectDiscovery tools additionally get an explicit -proxy flag at their call sites.
 if [ -n "$PROXY" ]; then
@@ -3338,6 +3594,17 @@ PYCLOUD
 }
 
 AAAA_FILE="$WORKDIR/aaaa.tsv"; export AAAA_FILE ENRICH GEO_DB
+# host-level inputs for the HTTP columns: favicon hashes and robots/security.txt summaries
+FAVHASH_FILE="$WORKDIR/favhash.tsv"; HOSTINFO_FILE="$WORKDIR/hostinfo.tsv"
+cat "$WORKDIR"/parts/favhash.*.tsv 2>/dev/null > "$FAVHASH_FILE" || : > "$FAVHASH_FILE"
+cat "$WORKDIR"/parts/hostinfo.*.tsv 2>/dev/null > "$HOSTINFO_FILE" || : > "$HOSTINFO_FILE"
+# reverse DNS (--enrich): non-public addresses are only asked of resolvers YOU passed with
+# --resolvers (an internal or lab resolver), never of the built-in public set
+PTR_RESOLVER=""; PTR_PRIVATE=0
+if [ -n "${RESOLVERS_FILE:-}" ] && [ -s "$RESOLVERS_FILE" ]; then
+  PTR_RESOLVER="$(grep -vE '^\s*(#|$)' "$RESOLVERS_FILE" | head -n 1 | sed -E 's/:[0-9]+$//' | tr -d '[:space:]')"; PTR_PRIVATE=1
+fi
+export FAVHASH_FILE HOSTINFO_FILE PTR_RESOLVER PTR_PRIVATE
 
 # cloud IP-range feeds: refresh the on-disk cache if missing/stale, then hand its
 # path to the aggregator for longest-prefix matching (blank column if unavailable).
@@ -3609,6 +3876,119 @@ def lookup_rdap(ip):
     _rdap_cache[ip] = org
     return org
 
+
+# --- HTTP columns (1.19): from the enrichment request's own headers (-irh) and body hash --
+# WebInventory's A4 group. Nothing here sends a request.
+SEC_HEADERS = (("content_security_policy", "Content-Security-Policy"),
+               ("x_frame_options", "X-Frame-Options"),
+               ("x_content_type_options", "X-Content-Type-Options"),
+               ("strict_transport_security", "Strict-Transport-Security"))
+_COOKIE_SPLIT = re.compile(r",\s*(?=[^;,=\s]+=)")   # Set-Cookie values joined by ", " (Expires has commas too)
+def _hdrs(j):
+    h = j.get("header")
+    if not isinstance(h, dict):
+        return {}
+    out = {}
+    for k, v in h.items():
+        if isinstance(v, list):
+            v = ", ".join(str(x) for x in v)
+        out[str(k).lower().replace("-", "_")] = re.sub(r"[\r\n\t]+", " ", str(v))
+    return out
+def _ms(t):
+    m = re.fullmatch(r"\s*([\d.]+)\s*(ns|µs|us|ms|s|m)?\s*", str(t or ""))
+    if not m:
+        return ""
+    v = float(m.group(1)); u = m.group(2) or "s"
+    f = {"ns": 1e-6, "µs": 1e-3, "us": 1e-3, "ms": 1.0, "s": 1000.0, "m": 60000.0}[u]
+    return str(int(round(v * f)))
+def http_fields(j, url):
+    h = _hdrs(j)
+    scheme = url.split("://", 1)[0].lower() if "://" in url else ""
+    try:
+        status = int(j.get("status_code") or 0)
+    except Exception:
+        status = 0
+    ct = str(j.get("content_type") or h.get("content_type", "")).split(";")[0].strip().lower()
+    hsh = j.get("hash") if isinstance(j.get("hash"), dict) else {}
+    sha = str(hsh.get("body_sha256") or "")
+    sha = sha if re.fullmatch(r"[0-9a-f]{64}", sha) else ""
+    auth, flags = "", []
+    wa = h.get("www_authenticate", "")
+    if wa:
+        sch = (re.match(r"\s*([A-Za-z-]+)", wa) or [None, ""])[1]
+        realm = re.search(r'realm="([^"]*)"', wa, re.I)
+        auth = (sch + (' realm="%s"' % realm.group(1)[:80] if realm else ""))[:120]
+        if scheme == "http" and sch.lower() in ("basic", "digest"):
+            flags.append("CleartextAuth")
+    if scheme == "http" and 200 <= status < 300 and "html" in ct:
+        flags.append("PlainHttp")
+    names, issues = [], []
+    sc = h.get("set_cookie", "")
+    for ck in (_COOKIE_SPLIT.split(sc) if sc else []):
+        nm = ck.split("=", 1)[0].strip()
+        if not nm or not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,80}", nm):
+            continue
+        attrs = [a.strip().lower() for a in ck.split(";")[1:]]
+        gaps = [g for g, a in (("no-Secure", "secure"), ("no-HttpOnly", "httponly")) if a not in attrs]
+        if nm not in names:
+            names.append(nm)
+            if gaps:
+                issues.append(nm + ":" + ",".join(gaps))
+    missing = []
+    if "html" in ct and not (300 <= status < 400):
+        csp = h.get("content_security_policy", "")
+        for k, label in SEC_HEADERS:
+            if k == "strict_transport_security" and scheme != "https":
+                continue
+            if k == "x_frame_options" and "frame-ancestors" in csp.lower():
+                continue          # CSP frame-ancestors replaces X-Frame-Options
+            if not h.get(k):
+                missing.append(label)
+    hsts = ""
+    if scheme == "https" and h.get("strict_transport_security"):
+        m = re.search(r"max-age\s*=\s*\"?(\d+)", h["strict_transport_security"], re.I)
+        hsts = m.group(1) if m else "0"
+    return {
+        "redirect_location": h.get("location", "") or str(j.get("location") or ""),
+        "response_ms": _ms(j.get("time")),
+        "body_sha256": sha,
+        "content_type": ct[:80],
+        "powered_by": h.get("x_powered_by", "")[:120],
+        "auth": auth,
+        "cookies": ";".join(names)[:300],
+        "cookie_issues": ";".join(issues)[:300],
+        "missing_sec_headers": ";".join(missing),
+        "hsts_max_age": hsts,
+        "alt_svc": h.get("alt_svc", "")[:200],
+        "http_flags": ";".join(flags),
+    }
+
+# --- host-level: favicon hashes (--extras/--favicon/--origin), robots/security.txt (--extras)
+_favhash, _hostinfo = {}, {}
+for _path, _dst, _n in ((os.environ.get("FAVHASH_FILE", ""), _favhash, 3), (os.environ.get("HOSTINFO_FILE", ""), _hostinfo, 2)):
+    try:
+        for _ln in open(_path, encoding="utf-8", errors="replace"):
+            _p = _ln.rstrip("\n").split("\t")
+            if _p and _p[0] and _p[0].lower() not in _dst:
+                _dst[_p[0].lower()] = (_p[1:] + [""] * _n)[:_n]
+    except (OSError, TypeError):
+        pass
+
+# --- reverse DNS (--enrich): PTR of each IP; non-public IPs only via your own resolver ----
+PTR_RES = os.environ.get("PTR_RESOLVER", "")
+PTR_PRIVATE = os.environ.get("PTR_PRIVATE", "0") == "1"
+_ptr_cache = {}
+def _ptr_query(ip):
+    args = (["@" + PTR_RES] if PTR_RES else []) + ["+time=2", "+tries=1", "-x", ip]
+    names = [l.strip().rstrip(".") for l in _dig(args).splitlines() if l.strip() and not l.startswith(";")]
+    return ";".join(sorted(set(n for n in names if re.fullmatch(r"[A-Za-z0-9_.-]{1,253}", n))))[:200]
+def lookup_ptr(ip):
+    if not (ENRICH and ip and is_ipv4(ip)) or (not is_public_ip(ip) and not PTR_PRIVATE):
+        return ""
+    if ip not in _ptr_cache:
+        _ptr_cache[ip] = _ptr_query(ip)
+    return _ptr_cache[ip]
+
 # --- CPE 2.3 emission (FPV-06) ------------------------------------------------
 # Rule-based, ported from WebInventory's approach: a curated product -> CPE 2.3
 # vendor:product table, with the detected version substituted into the version
@@ -3795,6 +4175,7 @@ try:
                 "title":          first(j, "title"),
                 "technologies":   ";".join(str(t) for t in tech) if tech else "",
             }
+            rec.update(http_fields(j, str(j.get("url") or j.get("input") or "")))
             _in = j.get("input") or ""
             _ur = j.get("url") or ""
             _hx_recs.append((str(_in), str(_ur), rec))
@@ -3915,6 +4296,15 @@ if tlsx_path:
     except FileNotFoundError:
         pass
 
+if ENRICH:
+    _ips = sorted(set(r[2].get("ip", "") for r in _hx_recs if r[2].get("ip")))
+    _ips = [i for i in _ips if is_ipv4(i) and (is_public_ip(i) or PTR_PRIVATE)][:ASN_MAX]
+    if _ips:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=16) as _ex:
+            for _i, _v in zip(_ips, _ex.map(_ptr_query, _ips)):
+                _ptr_cache[_i] = _v
+
 rows, seen = [], set()
 n_enriched = 0
 try:
@@ -3971,6 +4361,14 @@ try:
                 lookup_rdap(ip),               # RDAP network org
                 lookup_geo(ip),                # geo (country ISO)
                 build_cpes(m.get("technologies", ""), m.get("webserver", "")),  # cpe (FPV-06)
+                # HTTP columns (1.19), appended so existing consumers keep their positions
+                m.get("redirect_location", ""), m.get("response_ms", ""), m.get("body_sha256", ""),
+                m.get("content_type", ""), m.get("powered_by", ""), m.get("auth", ""),
+                m.get("cookies", ""), m.get("cookie_issues", ""), m.get("missing_sec_headers", ""),
+                m.get("hsts_max_age", ""), m.get("alt_svc", ""), m.get("http_flags", ""),
+                _favhash.get(host.lower(), ["", "", ""])[0], _favhash.get(host.lower(), ["", "", ""])[1],
+                lookup_ptr(ip),
+                _hostinfo.get(host.lower(), ["", ""])[0], _hostinfo.get(host.lower(), ["", ""])[1],
             ])
 except FileNotFoundError:
     pass
@@ -3980,7 +4378,8 @@ rows.sort(key=lambda r: (r[0], r[1]))
 # or third parties; a cell starting with = + - @ (or tab/CR) is a live formula in Excel.
 # Those text cells get a leading apostrophe; generate-report.sh and recon-db.sh import
 # strip it again. Numeric and fixed-format columns are left alone.
-_GUARD_COLS = {0, 1, 2, 3, 6, 7, 8, 11, 13, 15, 18, 19, 20, 21}
+_GUARD_COLS = {0, 1, 2, 3, 6, 7, 8, 11, 13, 15, 18, 19, 20, 21,
+               22, 25, 26, 27, 28, 29, 30, 32, 33, 36, 37, 38}   # 1.19 text columns (not the numbers/hashes)
 def _csv_safe(v):
     v = "" if v is None else str(v)
     return ("'" + v) if v[:1] in ("=", "+", "-", "@", "\t", "\r") else v
@@ -3991,7 +4390,10 @@ with open(out_path, "w", newline="", encoding="utf-8") as fo:
                 "status_code", "content_length", "webserver", "title", "technologies",
                 "ip", "asn", "asn_org",
                 "tls_version", "tls_cipher", "cert_not_after", "cert_issuer", "tls_flags",
-                "ipv6", "cloud", "rdap_org", "geo", "cpe"])
+                "ipv6", "cloud", "rdap_org", "geo", "cpe",
+                "redirect_location", "response_ms", "body_sha256", "content_type", "powered_by",
+                "auth", "cookies", "cookie_issues", "missing_sec_headers", "hsts_max_age",
+                "alt_svc", "http_flags", "favicon_mmh3", "favicon_md5", "ptr", "robots", "security_txt"])
     w.writerows(rows)
 
 live = sum(1 for r in rows if str(r[4]).startswith(("2", "3", "401", "403")))
@@ -4067,7 +4469,7 @@ ok " CSV               : $OUTPUT"
 ok "=============================================================="
 
 # --- aggregate opt-in side artifacts (takeover/origin/nuclei/params/secrets) -
-for kind in takeover origin nuclei params secrets buckets cms activescan osint virustotal urlscan social; do
+for kind in takeover origin extras favicon nuclei params secrets buckets cms activescan osint virustotal urlscan social; do
   if ls "$WORKDIR"/parts/"$kind".*.txt >/dev/null 2>&1; then
     cat "$WORKDIR"/parts/"$kind".*.txt 2>/dev/null | sort -u > "$OUTPUT.$kind.txt" || : > "$OUTPUT.$kind.txt"
     if [ -s "$OUTPUT.$kind.txt" ]; then
@@ -4241,7 +4643,7 @@ for line in open(os.path.join(wd, "seedstat.tsv"), encoding="utf-8", errors="rep
     if len(f) >= 4:
         seeds.append({"seed": f[0], "candidates": num(f[1]), "resolved": num(f[2]), "live_hosts": num(f[3])})
 arts = {}
-for k in ("takeover", "origin", "zone", "nuclei", "params", "secrets", "buckets", "cms", "activescan",
+for k in ("takeover", "origin", "zone", "extras", "favicon", "nuclei", "params", "secrets", "buckets", "cms", "activescan",
           "osint", "virustotal", "urlscan", "social"):
     p = "%s.%s.txt" % (out, k)
     if os.path.isfile(p):
