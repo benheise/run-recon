@@ -26,3 +26,5 @@ lab/brute-wordlist.txt
 lab/targets-discovery.txt
 lab/tls/
 lab/targets-tls.txt
+*.tideline.tar
+*.ship-state.json

@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tideline:schema:run-recon.seed/1",
+  "title": "run-recon seed",
+  "description": "One seed domain and its counts: candidate names, names after the resolve gate, live hosts (null when the stage did not run).",
+  "x-tideline-schema": "run-recon.seed/1",
+  "x-minor": 0,
+  "type": "object",
+  "properties": {
+    "seed": {
+      "type": "string"
+    },
+    "candidates": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "resolved": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "live_hosts": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    }
+  },
+  "required": [
+    "seed",
+    "candidates",
+    "resolved",
+    "live_hosts"
+  ],
+  "additionalProperties": false
+}

@@ -53,8 +53,11 @@
 #   resume                 SIGTERM after two seeds, then --resume: the CSV must equal an uninterrupted run
 #   history                --monitor's field-by-field delta and recon-db.sh history/changes across two runs
 #                          with the spa backend stopped in between (the store too, with RECON_DB_DSN)
-#   checks                 takeover + zone + origin + http + tls + posture + discovery + scope + resume + history;
-#                          non-zero if any fails
+#   ship                   --ship to lab/mock-tideline.py (mutual TLS on loopback, a throwaway step-ca-shaped
+#                          PKI): the shipped records equal the local CSV row for row, screenshots travel
+#                          as artifacts, a second delivery sends nothing, a 503 then a retry resumes
+#   checks                 takeover + zone + origin + http + tls + posture + discovery + scope + resume + history
+#                          + ship; non-zero if any fails
 #   help
 #
 # Needs docker (+compose) and the run-recon toolchain for up/run/bench; compare
@@ -1028,6 +1031,104 @@ PYTLS
   return "$fail"
 }
 
+cmd_ship(){
+  lab_env
+  [ -f "$RUN_RECON" ] || die "run-recon not found at $RUN_RECON"
+  local t rc mp port i fail=0 ship
+  ship="$(dirname "$RUN_RECON")/ship-recon.sh"
+  t="$(mktemp -d /tmp/bench-ship.XXXXXX)"
+  log "Tideline shipping check (--ship to lab/mock-tideline.py on loopback) -> $t"
+  bash "$LAB/gen-ship-certs.sh" "$t/pki" >/dev/null 2>&1 || die "could not make the test PKI (openssl)"
+  mkdir -p "$t/store"
+  python3 -I "$LAB/mock-tideline.py" --cert "$t/pki/server.pem" --key "$t/pki/server.key" --client-ca "$t/pki/root.pem" \
+    --store "$t/store" --schemas "$(dirname "$RUN_RECON")/schemas" --port 0 > "$t/mock.log" 2>&1 &
+  mp=$!
+  for i in $(seq 1 100); do [ -s "$t/store/port" ] && break; sleep 0.1; done
+  port="$(cat "$t/store/port" 2>/dev/null || true)"
+  [ -n "$port" ] || { kill "$mp" 2>/dev/null; die "the mock ingest did not start (see $t/mock.log)"; }
+  local sargs=(--ship "https://127.0.0.1:$port" --ship-cert "$t/pki/rr-test01.pem" --ship-key "$t/pki/rr-test01.key" --ship-ca "$t/pki/root.pem")
+  rc=0; ( cd "$t" && bash "$RUN_RECON" -i "$LAB/targets.txt" -o "$t/s.csv" --resolvers "$RESOLVERS_FILE" --tls --ipv6 \
+      --takeover --dns-posture --screenshots --engagement lab-ship "${sargs[@]}" >"$t/run.out" 2>"$t/run.err" ) || rc=$?
+  echo "$rc" > "$t/run.rc"
+  # a second delivery of the same run: Tideline already has it
+  : > "$t/store/requests.ship1"; cp "$t/store/requests.jsonl" "$t/store/requests.ship1"; : > "$t/store/requests.jsonl"
+  rc=0; bash "$ship" ship "$t/s.csv" > "$t/reship.out" 2> "$t/reship.err" || rc=$?; echo "$rc" > "$t/reship.rc"
+  cp "$t/store/requests.jsonl" "$t/store/requests.ship2"; : > "$t/store/requests.jsonl"
+  # the same files as another run (new run_id), Tideline busy on part 2, then a retry
+  mkdir -p "$t/copy"; cp "$t"/s.csv "$t"/s.csv.* "$t/copy/" 2>/dev/null; rm -f "$t/copy/s.csv.ship-state.json"
+  cp -r "$t"/screenshots-* "$t/copy/" 2>/dev/null || true
+  python3 -I - "$t/copy" <<'PYNEW'
+import json, hashlib, uuid, sys, os
+d = sys.argv[1]; p = os.path.join(d, "s.csv.run.json")
+j = json.load(open(p)); j["run_id"] = str(uuid.uuid4()); json.dump(j, open(p, "w"), indent=2)
+h = hashlib.sha256(open(p, "rb").read()).hexdigest(); m = os.path.join(d, "s.csv.manifest.sha256")
+lines = open(m).readlines()
+open(m, "w").write("".join((h + "  s.csv.run.json\n") if l.endswith("  s.csv.run.json\n") else l for l in lines))
+PYNEW
+  printf '[{"method":"PUT","part":2,"status":503,"times":20}]' > "$t/store/faults.json"
+  rc=0; SHIP_RETRIES=0 bash "$ship" ship "$t/copy/s.csv" --url "https://127.0.0.1:$port" --cert "$t/pki/rr-test01.pem" \
+    --key "$t/pki/rr-test01.key" --ca "$t/pki/root.pem" > /dev/null 2> "$t/busy.err" || rc=$?; echo "$rc" > "$t/busy.rc"
+  printf '[]' > "$t/store/faults.json"; : > "$t/store/requests.jsonl"
+  rc=0; bash "$ship" ship "$t/copy/s.csv" > /dev/null 2> "$t/retry.err" || rc=$?; echo "$rc" > "$t/retry.rc"
+  cp "$t/store/requests.jsonl" "$t/store/requests.retry"
+  kill "$mp" 2>/dev/null; wait "$mp" 2>/dev/null || true
+  python3 -I - "$t" <<'PYSHIP' || fail=1
+import csv, json, os, sys
+t = sys.argv[1]
+fails = 0
+def ck(ok, msg):
+    global fails
+    print("[bench]   %s %s" % ("ok  " if ok else "FAIL", msg))
+    fails += 0 if ok else 1
+def rd(p):
+    try:
+        return open(os.path.join(t, p), encoding="utf-8").read().strip()
+    except OSError:
+        return ""
+def reqs(p):
+    try:
+        return [(j["method"], j["path"].rsplit("/", 1)[-1], j["status"]) for j in map(json.loads, open(os.path.join(t, "store", p)))]
+    except OSError:
+        return []
+ck(rd("run.rc") == "0", "the lab run with --ship exits 0")
+st = json.loads(rd("s.csv.ship-state.json") or "{}")
+ck(st.get("state") == "complete" and st.get("server_state") == "verified", "ship-state.json: complete, Tideline verified the run")
+rid = st.get("run_id", "")
+rdir = os.path.join(t, "store", "runs", rid)
+try:
+    man = json.load(open(os.path.join(rdir, "manifest.json")))
+except (OSError, ValueError):
+    man = {"parts": []}
+same = bool(man["parts"]) and all(
+    open(os.path.join(rdir, "parts", str(p["n"])), "rb").read() == open(os.path.join(t, p["name"]), "rb").read()
+    for p in man["parts"])
+ck(same, "every part Tideline stored equals the local file (%d parts)" % len(man["parts"]))
+def ung(v):
+    return v[1:] if v[:1] == "'" and v[1:2] in ("=", "+", "-", "@", "\t", "\r") else v
+rows = list(csv.reader(open(os.path.join(t, "s.csv"), newline="", encoding="utf-8")))
+up = next((p for p in man["parts"] if p["kind"] == "urls"), None)
+js = [json.loads(l) for l in open(os.path.join(rdir, "parts", str(up["n"])), encoding="utf-8")] if up else []
+ck(len(js) == len(rows) - 1 and all([ung(c) for c in r] == [j[k] for k in rows[0]] for r, j in zip(rows[1:], js)),
+   "the shipped URL records equal the local CSV, row for row and field for field (%d rows)" % len(js))
+shots = [p for p in man["parts"] if p.get("media") == "image/png"]
+nshots = sum(1 for l in open(os.path.join(t, "s.csv.manifest.sha256")) if "  screenshots-" in l and l.rstrip().endswith(".png"))
+ck(nshots > 0 and len(shots) == nshots, "the screenshots travel as image/png artifacts (%d of %d)" % (len(shots), nshots))
+ck(man.get("engagement") == "lab-ship" and man.get("sensor") == "rr-test01", "the manifest carries the engagement and the certificate's sensor")
+r1 = reqs("requests.ship1")
+ck(r1[:1] == [("POST", "runs", 201)] and r1[-1:] == [("POST", "complete", 202)]
+   and sum(1 for r in r1 if r[0] == "PUT" and r[2] == 204) == len(man["parts"]) and len(r1) == len(man["parts"]) + 2,
+   "one open (201), one PUT per part (204: hash and schema checks passed), one complete (202)")
+ck(rd("reship.rc") == "0" and reqs("requests.ship2") == [("POST", "runs", 200)], "shipping it again: Tideline answers 200 and nothing is re-sent")
+ck(rd("busy.rc") == "4" and "HTTP 503" in rd("busy.err"), "Tideline busy on part 2: exit 4, the run kept for a retry")
+rr = reqs("requests.retry")
+ck(rd("retry.rc") == "0" and rr[:1] == [("POST", "runs", 200)] and not any(r[0] == "PUT" and r[1] == "1" for r in rr)
+   and rr[-1:] == [("POST", "complete", 202)], "the retry re-opens the run and sends only what Tideline lacks")
+sys.exit(1 if fails else 0)
+PYSHIP
+  [ "$fail" = 0 ] && log "ship check: PASS" || log "ship check: FAIL (see $t)"
+  return "$fail"
+}
+
 cmd_checks(){
   local rc=0
   cmd_takeover || rc=1
@@ -1040,7 +1141,8 @@ cmd_checks(){
   cmd_scope || rc=1
   cmd_resume || rc=1
   cmd_history || rc=1
-  [ "$rc" = 0 ] && log "lab checks: PASS (takeover, zone, origin, http, tls, posture, discovery, scope, resume, history)" || log "lab checks: FAIL"
+  cmd_ship || rc=1
+  [ "$rc" = 0 ] && log "lab checks: PASS (takeover, zone, origin, http, tls, posture, discovery, scope, resume, history, ship)" || log "lab checks: FAIL"
   return "$rc"
 }
 
@@ -1056,6 +1158,7 @@ case "${1:-help}" in
   origin)   cmd_origin;;
   http)     cmd_http;;
   tls)      cmd_tls;;
+  ship)     cmd_ship;;
   checks)   cmd_checks;;
   down)     cmd_down;;
   hosts)    cmd_hosts;;
@@ -1063,5 +1166,5 @@ case "${1:-help}" in
   compare)  shift; cmd_compare "$@";;
   bench)    shift; cmd_bench "$@";;
   help|-h|--help) awk 'NR > 1 && !/^#/ { exit } NR > 1 && !/^# ?=+$/' "$0" | sed 's/^# \{0,1\}//';;
-  *) die "unknown command: ${1:-} (try: up|down|hosts|run|compare|bench|takeover|zone|origin|http|tls|posture|discovery|scope|resume|history|checks)";;
+  *) die "unknown command: ${1:-} (try: up|down|hosts|run|compare|bench|takeover|zone|origin|http|tls|posture|discovery|scope|resume|history|ship|checks)";;
 esac

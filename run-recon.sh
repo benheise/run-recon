@@ -170,6 +170,14 @@ RECON_DIR="$(dirname "$RECON_SELF")"
 : "${PROXY:=}"             # optional HTTP(S) proxy URL for GET-heavy stages (--proxy); e.g. a caching squid
 : "${REPORT:=1}"           # 1 = build an HTML report at the end (default on; --no-report to skip)
 
+# --- JSON output and result shipping to Tideline (the recon results platform) -----
+: "${JSON_OUT:=0}"         # 1 = also write <out>.<kind>.jsonl, one JSON record per line (--json)
+: "${SHIP_URL:=}"          # Tideline ingest base URL, https only (--ship URL); implies --json
+: "${SHIP_CERT:=}"         # this sensor's client certificate (PEM, chain), from step-ca (--ship-cert)
+: "${SHIP_KEY:=}"          # its ECDSA P-256 key (PEM, unencrypted, readable only by this user) (--ship-key)
+: "${SHIP_CA:=}"           # the Tideline root CA the ingest server is checked against, pinned (--ship-ca)
+: "${SHIP_PROXY:=}"        # proxy for shipping only (--ship-proxy); default: direct (the scan's --proxy is never used)
+
 # --- IP + ASN attribution (adds ip/asn/asn_org columns to the CSV) -----------
 # Surface each host's resolved IP and the IP's origin ASN (number + org, via the
 # free Team Cymru DNS service) so you can validate that hostname<->IP<->ASN are
@@ -3565,6 +3573,27 @@ REPORT & CACHE:
                           (.test/.internal/.local/...). Default 1 skips them: they cannot exist
                           on the internet, so the queries only cost time.
 
+JSON OUTPUT & TIDELINE (the recon results platform; see SHIPPING.md):
+      --json              Also write each record kind as JSON lines, same field names as the CSV and
+                          TSV files: <out>.urls.jsonl, .services.jsonl, .findings.jsonl, .warnings.jsonl,
+                          .seeds.jsonl, plus .dnsposture/.edges/.cnames/.zone-names/.screenshots/
+                          .cloud-assets/.vulnx/.delta.jsonl when those stages ran. Schemas: schemas/.
+      --ship URL          After the run, send it to Tideline's ingest (https only; implies --json):
+                          a signed manifest (ES256) and gzip parts over mutual TLS. Resumable; state in
+                          <out>.ship-state.json. The settings are checked before the scan starts; a
+                          failed delivery leaves the run complete locally and exits 4.
+      --ship-cert FILE    This sensor's client certificate from step-ca (PEM; its URI SAN
+                          urn:tideline:sensor:<id> names the sensor).          (env SHIP_CERT)
+      --ship-key FILE     Its ECDSA P-256 key (PEM, unencrypted, mode 0600 or tighter). (env SHIP_KEY)
+      --ship-ca FILE      Tideline's root CA: the ingest server must chain to it, and to nothing
+                          else (the system trust store is not used).           (env SHIP_CA)
+      --ship-proxy URL    Proxy for shipping only (default: a direct connection; the scan's
+                          --proxy and the HTTP(S)_PROXY environment are not used). (env SHIP_PROXY)
+      --engagement ID     Engagement ID, written to <out>.run.json and the Tideline manifest.
+      --job-id ID         Tideline job ID (set by the Tideline runner), likewise.
+      Every run records a run_id (UUID v4, kept by --resume) in <out>.run.json.
+      ship-recon.sh ship|status|export|check re-sends, inspects or bundles a finished run.
+
 UMBRELLA:
       --all               Enable the full discovery + defensive set: --subs --resolve --certs
                           --permute --brute --ports --js --crawlers-all --takeover
@@ -3614,7 +3643,9 @@ CSV columns:
   asn_org, tls_version, tls_cipher, cert_not_after, cert_issuer, tls_flags, ipv6, cloud, rdap_org, geo, cpe,
   redirect_location, response_ms, body_sha256, content_type, powered_by, auth, cookies, cookie_issues,
   missing_sec_headers, hsts_max_age, alt_svc, http_flags, favicon_mmh3, favicon_md5, ptr, robots,
-  security_txt   (the HTTP columns come from the enrichment request itself: no extra traffic)
+  security_txt, final_url, redirect_chain, login_form, tls_supported, tls_ciphers, tls_weak_cipher,
+  cert_key, cert_sig_alg, cert_not_before   (the HTTP columns come from the enrichment request itself:
+  no extra traffic)
 
 Side-artifact files (when the matching flag is set): <out>.takeover.txt, <out>.cname.tsv, <out>.zone.txt,
 <out>.zone-names.txt, <out>.dnsposture.txt, <out>.dnsposture.tsv, <out>.cloud.txt, <out>.cloud-assets.tsv,
@@ -3623,12 +3654,14 @@ Side-artifact files (when the matching flag is set): <out>.takeover.txt, <out>.c
 <out>.screenshots.tsv, screenshots-<ts>/,
 <out>.nuclei.txt, <out>.params.txt, <out>.secrets.txt, <out>.buckets.txt, <out>.cms.txt,
 <out>.activescan.txt, <out>.osint.txt, <out>.virustotal.txt, <out>.urlscan.txt, <out>.social.txt,
-<out>.new-assets.txt, <out>.delta.tsv (--monitor), <out>.scope.txt (--scope). Always: <out>.run.json (version, command line, tool versions, per-seed counts,
+<out>.new-assets.txt, <out>.delta.tsv (--monitor), <out>.scope.txt (--scope), <out>.<kind>.jsonl (--json),
+<out>.ship-state.json (--ship; written after the manifest, not listed in it). Always: <out>.run.json (version, command line, tool versions, per-seed counts,
 warnings, exit status), <out>.report.html (unless --no-report) and <out>.manifest.sha256 (SHA-256 of
 every file the run wrote; check with sha256sum -c).
 
-Exit status: 0 finished with results; 2 bad arguments or input (or refused by --scope); 3 finished with
-NO results (0 URL rows); 130/143 interrupted by SIGINT/SIGTERM (resumable with --resume).
+Exit status: 0 finished with results; 2 bad arguments or input (or refused by --scope, or unusable --ship
+settings); 3 finished with NO results (0 URL rows); 4 finished with results, but --ship could not deliver
+them (retry with ship-recon.sh ship <csv>); 130/143 interrupted by SIGINT/SIGTERM (resumable with --resume).
 EOF
 }
 
@@ -3639,6 +3672,7 @@ KEEP_WORK=0
 RESOLVERS_FILE=""
 RUN_ARGS=("$@"); RUN_T0="$(date +%s 2>/dev/null || echo 0)"; RUN_STARTED="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
 RUN_DNS_CHECK="not run"; RUN_EXIT=0
+ENGAGEMENT=""; JOB_ID=""; RUN_ID=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -3723,6 +3757,14 @@ while [ $# -gt 0 ]; do
     --db)              USE_DB=1; shift;;
     --proxy)           PROXY="${2:?}"; shift 2;;
     --no-report)       REPORT=0; shift;;
+    --json)            JSON_OUT=1; shift;;
+    --ship)            SHIP_URL="${2:?}"; shift 2;;
+    --ship-cert)       SHIP_CERT="${2:?}"; shift 2;;
+    --ship-key)        SHIP_KEY="${2:?}"; shift 2;;
+    --ship-ca)         SHIP_CA="${2:?}"; shift 2;;
+    --ship-proxy)      SHIP_PROXY="${2:?}"; shift 2;;
+    --engagement)      ENGAGEMENT="${2:?}"; shift 2;;
+    --job-id)          JOB_ID="${2:?}"; shift 2;;
     --limits)          LIMITS_FILE="${2:?}"; shift 2;;
     -h|--help)         usage; exit 0;;
     --version)         echo "run-recon.sh v$VERSION"; exit 0;;
@@ -4193,6 +4235,28 @@ if [ "$PARAMS" = "1" ] && ! have arjun; then
 fi
 case "$ROUNDS" in ''|*[!0-9]*) ROUNDS=1;; esac
 [ "$ROUNDS" -lt 1 ] && ROUNDS=1
+# --engagement / --job-id: identifiers for Tideline, written to run.json and the envelope
+for _idv in "engagement:$ENGAGEMENT" "job-id:$JOB_ID"; do
+  _idn="${_idv%%:*}"; _idv="${_idv#*:}"
+  [ -z "$_idv" ] || printf '%s' "$_idv" | grep -qE '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$' \
+    || { err "--$_idn must be 1-128 characters of A-Z a-z 0-9 . _ : - (got: $_idv)"; exit 2; }
+done
+# --ship: checked here, before anything is sent to a target (certificate, key, CA, URL; no
+# connection is made). A run whose shipping fails later still completes locally and exits 4.
+SHIP_SH=""
+if [ -n "$SHIP_URL" ]; then
+  JSON_OUT=1
+  SHIP_SH="$RECON_DIR/ship-recon.sh"
+  [ -f "$SHIP_SH" ] || SHIP_SH="$(command -v ship-recon.sh 2>/dev/null || true)"
+  if [ -z "$SHIP_SH" ] || [ ! -f "$SHIP_SH" ]; then
+    err "--ship needs ship-recon.sh next to run-recon (not found). Nothing was sent."; exit 2
+  fi
+  _shargs=(--url "$SHIP_URL" --cert "$SHIP_CERT" --key "$SHIP_KEY" --ca "$SHIP_CA")
+  [ -n "$SHIP_PROXY" ] && _shargs+=(--proxy "$SHIP_PROXY")
+  if ! bash "$SHIP_SH" check "${_shargs[@]}"; then
+    err "--ship: the shipping settings above are not usable. Nothing was sent."; exit 2
+  fi
+fi
 if [ "$ROUNDS" -gt 1 ] && [ "$DO_SUBS" != "1" ]; then
   warn "--rounds $ROUNDS has no effect without --subs; forcing 1 round."; ROUNDS=1
 fi
@@ -4382,9 +4446,21 @@ else
   case "$OUTPUT" in /*) :;; *) OUTPUT="$(pwd)/$OUTPUT";; esac
   mkdir -p "$(dirname "$OUTPUT")"
 fi
+# run_id: a UUID v4 per run, kept across --resume (Tideline's key for the run; also in run.json)
+_uuid4() {
+  local u=""
+  [ -r /proc/sys/kernel/random/uuid ] && u="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)"
+  printf '%s' "$u" | grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' \
+    || u="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+  printf '%s' "$u"
+}
 if [ "$RESUMED" = 0 ]; then
-  printf 'version=%s\nts=%s\noutput=%s\nargs_sha256=%s\ninput_sha256=%s\nscope_sha256=%s\nstatus=running\nsession=%s\n' \
-    "$VERSION" "$TS" "$OUTPUT" "$RUN_ARGS_SHA" "$RUN_INPUT_SHA" "$RUN_SCOPE_SHA" "$RUN_STARTED" > "$WORKDIR/state"
+  RUN_ID="$(_uuid4)"
+  printf 'version=%s\nts=%s\noutput=%s\nargs_sha256=%s\ninput_sha256=%s\nscope_sha256=%s\nrun_id=%s\nstatus=running\nsession=%s\n' \
+    "$VERSION" "$TS" "$OUTPUT" "$RUN_ARGS_SHA" "$RUN_INPUT_SHA" "$RUN_SCOPE_SHA" "$RUN_ID" "$RUN_STARTED" > "$WORKDIR/state"
+else
+  RUN_ID="$(sed -n 's/^run_id=//p' "$WORKDIR/state" | head -n 1)"
+  if [ -z "$RUN_ID" ]; then RUN_ID="$(_uuid4)"; printf 'run_id=%s\n' "$RUN_ID" >> "$WORKDIR/state"; fi
 fi
 # Ctrl-C / SIGTERM: stop every stage this run started, keep the work dir, say how to resume.
 # The whole tree is frozen first (a stopped process cannot start the next stage), listed
@@ -5559,7 +5635,8 @@ ASN_CACHE_FILE="$WORKDIR/asn_cache.tsv"; : > "$ASN_CACHE_FILE"
 if [ "$USE_DB" = "1" ] && [ "$ASN" = "1" ]; then
   _psql -c "SELECT key || E'\t' || value FROM recon_cache WHERE source='asn'" > "$ASN_CACHE_FILE" 2>/dev/null || : > "$ASN_CACHE_FILE"
 fi
-export ASN_CACHE_FILE CPE_MAP_FILE
+RR_JSON="$JSON_OUT"   # --json: the CSV builder also writes <out>.urls.jsonl and <out>.services.jsonl
+export ASN_CACHE_FILE CPE_MAP_FILE RR_JSON
 python3 - "$WORKDIR/map.tsv" "$WORKDIR/httpx.jsonl" "$OUTPUT" "$ASN" "$ASN_MAX" "$WORKDIR/tlsx.jsonl" <<'PY'
 import sys, os, csv, json, subprocess, datetime, ipaddress, re
 from urllib.parse import urlparse
@@ -6542,6 +6619,70 @@ except FileNotFoundError:
     pass
 
 rows.sort(key=lambda r: (r[0], r[1]))
+CSV_HEADER = ["seed_domain", "url", "host", "sources",
+              "status_code", "content_length", "webserver", "title", "technologies",
+              "ip", "asn", "asn_org",
+              "tls_version", "tls_cipher", "cert_not_after", "cert_issuer", "tls_flags",
+              "ipv6", "cloud", "rdap_org", "geo", "cpe",
+              "redirect_location", "response_ms", "body_sha256", "content_type", "powered_by",
+              "auth", "cookies", "cookie_issues", "missing_sec_headers", "hsts_max_age",
+              "alt_svc", "http_flags", "favicon_mmh3", "favicon_md5", "ptr", "robots", "security_txt",
+              "final_url", "redirect_chain", "login_form",
+              "tls_supported", "tls_ciphers", "tls_weak_cipher", "cert_key", "cert_sig_alg", "cert_not_before"]
+# --json: the same rows as JSON lines (<out>.urls.jsonl), before the formula guard below,
+# plus one record per service (<out>.services.jsonl): scheme://host[:port] under a seed,
+# with its root URL's values (else its smallest URL's), the rule recon-db.sh diff uses.
+if os.environ.get("RR_JSON") == "1":
+    def _cell(v):
+        return "" if v is None else (v if isinstance(v, str) else str(v))
+    def _svc(u):
+        m = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*)://([^/?#]*)(.*)$", (u or "").strip())
+        if not m:
+            return None
+        sch, au, rest = m.group(1).lower(), m.group(2).rsplit("@", 1)[-1].lower(), m.group(3)
+        h, pt = au, ""
+        if au.startswith("["):
+            h, _, pp = au.partition("]")
+            h, pt = h + "]", pp.lstrip(":")
+        elif au.count(":") == 1:
+            h, pt = au.split(":")
+        dflt = {"https": 443, "http": 80}.get(sch)
+        if pt and not pt.isdigit():
+            return None
+        port = int(pt) if pt else dflt
+        if port is None or not 0 <= port <= 65535:
+            return None
+        name = "%s://%s%s" % (sch, h, "" if port == dflt else ":%d" % port)
+        return name, sch, h.strip("[]"), port, (re.split(r"[?#]", rest, maxsplit=1)[0] or "/")
+    _svcs = {}
+    def _jl(path, recs):
+        with open(path + ".tmp", "w", encoding="utf-8", errors="replace") as fj:
+            for o in recs:
+                fj.write(json.dumps(o, ensure_ascii=False, separators=(",", ":")) + "\n")
+        os.replace(path + ".tmp", path)
+    _urecs = []
+    for r in rows:
+        o = dict(zip(CSV_HEADER, (_cell(c) for c in r)))
+        _urecs.append(o)
+        sv = _svc(o["url"])
+        if sv:
+            key, rank = ((o["seed_domain"] or "").strip().lower(), sv[0]), (0 if sv[4] == "/" else 1, o["url"])
+            b = _svcs.get(key)
+            if b is None:
+                _svcs[key] = [rank, o, sv, 1]
+            else:
+                b[3] += 1
+                if rank < b[0]:
+                    b[0], b[1], b[2] = rank, o, sv
+    _jl(out_path + ".urls.jsonl", _urecs)
+    _srecs = []
+    for key in sorted(_svcs):
+        rank, o, sv, n = _svcs[key]
+        rec = {"seed_domain": o["seed_domain"], "service": sv[0], "scheme": sv[1], "host": o["host"],
+               "port": sv[3], "url_count": n}
+        rec.update((k, v) for k, v in o.items() if k not in rec)
+        _srecs.append(rec)
+    _jl(out_path + ".services.jsonl", _srecs)
 # FPV-01: titles, headers, org names and certificate issuers come from the scanned site
 # or third parties; a cell starting with = + - @ (or tab/CR) is a live formula in Excel.
 # Those text cells get a leading apostrophe; generate-report.sh and recon-db.sh import
@@ -6555,16 +6696,7 @@ def _csv_safe(v):
 rows = [[(_csv_safe(c) if i in _GUARD_COLS else c) for i, c in enumerate(r)] for r in rows]
 with open(out_path, "w", newline="", encoding="utf-8") as fo:
     w = csv.writer(fo)
-    w.writerow(["seed_domain", "url", "host", "sources",
-                "status_code", "content_length", "webserver", "title", "technologies",
-                "ip", "asn", "asn_org",
-                "tls_version", "tls_cipher", "cert_not_after", "cert_issuer", "tls_flags",
-                "ipv6", "cloud", "rdap_org", "geo", "cpe",
-                "redirect_location", "response_ms", "body_sha256", "content_type", "powered_by",
-                "auth", "cookies", "cookie_issues", "missing_sec_headers", "hsts_max_age",
-                "alt_svc", "http_flags", "favicon_mmh3", "favicon_md5", "ptr", "robots", "security_txt",
-                "final_url", "redirect_chain", "login_form",
-                "tls_supported", "tls_ciphers", "tls_weak_cipher", "cert_key", "cert_sig_alg", "cert_not_before"])
+    w.writerow(CSV_HEADER)
     w.writerows(rows)
 
 live = sum(1 for r in rows if str(r[4]).startswith(("2", "3", "401", "403")))
@@ -7013,6 +7145,7 @@ RR_VERSION="$VERSION" RR_STARTED="$RUN_STARTED" RR_DURATION="$(( RUN_T1 - RUN_T0
 RR_NDOM="${NDOM:-0}" RR_TOOLVERS="${_tvline:-}" RR_LABVER="${LAB_VERIFIED:-}" RR_RESOLVERS="$RESOLVERS" \
 RR_RESOLVERS_N="$RUN_RESOLVERS_N" RR_DNS_CHECK="$RUN_DNS_CHECK" RR_PROXY="$PROXY" RR_SS_CHROME="$SS_CHROME" \
 RR_SS_PROXY="$SS_PROXY_SERVER" RR_SS_BYPASS="$SS_PROXY_BYPASS" RR_ROWS="$RES_ROWS" RR_EXIT="$RUN_EXIT" \
+RR_RUN_ID="$RUN_ID" RR_ENGAGEMENT="$ENGAGEMENT" RR_JOB_ID="$JOB_ID" \
 python3 - "$OUTPUT" "$WORKDIR" <<'PYRUN' 2>/dev/null || warn " could not write $OUTPUT.run.json"
 import sys, json, os, re
 out, wd = sys.argv[1:3]
@@ -7054,6 +7187,7 @@ for part in (E("RR_TOOLVERS") or "").split(","):
         tv[f[0]] = f[1]
 rec = {
     "tool": "run-recon", "version": E("RR_VERSION", ""),
+    "run_id": E("RR_RUN_ID", ""), "engagement": E("RR_ENGAGEMENT") or None, "job_id": E("RR_JOB_ID") or None,
     "args": args,
     "started": E("RR_STARTED", ""), "duration_s": max(0, num(E("RR_DURATION")) or 0),
     "input": E("RR_INPUT", ""), "seeds": len(seeds) or (num(E("RR_NDOM")) or 0), "per_seed": seeds,
@@ -7098,6 +7232,118 @@ if [ "$REPORT" = "1" ]; then
     fi
   else
     warn " generate-report.sh not found next to run-recon; skipping the HTML report (--no-report to silence)."
+  fi
+fi
+
+# --- --json: the side files as JSON lines (<out>.<kind>.jsonl) ---------------------
+# urls and services come from the CSV builder itself; these are read back from the files
+# this run just wrote, with the same field names: findings (every <out>.<kind>.txt line),
+# the TSV inventories, the warnings (all of them, in order) and the per-seed counts.
+# Written before the manifest, so each one has its SHA-256 there.
+if [ "$JSON_OUT" = "1" ]; then
+  cat "$WORKDIR"/parts/seedstat.*.tsv 2>/dev/null > "$WORKDIR/seedstat.tsv" || : > "$WORKDIR/seedstat.tsv"
+  if _jsum="$(python3 - "$OUTPUT" "$WORKDIR" <<'PYJSONL' 2>"$WORKDIR/jsonl.err"
+# JSONL-EXPORT
+import sys, os, re, json
+out, wd = sys.argv[1:3]
+FINDING_KINDS = ["scope", "takeover", "origin", "zone", "dnsposture", "cloud", "tld-variants", "vulnx", "extras",
+                 "favicon", "nuclei", "params", "secrets", "buckets", "cms", "activescan", "osint", "virustotal",
+                 "urlscan", "social"]
+# the report's default severity for a line without a [severity] tag (generate-report.sh KIND_SEV)
+KIND_SEV = {"takeover": "high", "secrets": "high", "buckets": "medium"}
+TSV_KINDS = [("dnsposture", ".dnsposture.tsv"), ("edges", ".edge.tsv"), ("cnames", ".cname.tsv"),
+             ("zone-names", ".zone-names.txt"), ("screenshots", ".screenshots.tsv"),
+             ("cloud-assets", ".cloud-assets.tsv"), ("vulnx", ".vulnx.tsv"), ("delta", ".delta.tsv")]
+SEV = re.compile(r"\[(critical|high|medium|low|info|unknown)\]", re.I)
+KV = re.compile(r'(?:^|\s)([A-Za-z_][A-Za-z0-9_.-]*)=("[^"]*"|\S*)')
+URLRE = re.compile(r"https?://\[?([A-Za-z0-9_.:-]+?)\]?(?::\d+)?(?:[/?#\s\"'<>]|$)")
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+summary = []
+def write(kind, recs):
+    p = "%s.%s.jsonl" % (out, kind)
+    with open(p + ".tmp", "w", encoding="utf-8", errors="replace") as f:
+        for o in recs:
+            f.write(json.dumps(o, ensure_ascii=False, separators=(",", ":")) + "\n")
+    os.replace(p + ".tmp", p)
+    summary.append("%s=%d" % (kind, len(recs)))
+def finding(src, line):
+    m = re.match(r"^\[([^\]]*)\]\s+(.*)$", line)
+    seed, detail = (m.group(1), m.group(2)) if m else ("", line)
+    toks = detail.split(maxsplit=2)
+    check = toks[0] if toks else ""
+    rest = detail[len(check):].lstrip()
+    sev, fields, note = "", {}, ""
+    t = SEV.match(rest)
+    if t:   # structured: "<check> [severity] key=value ... note=free text"
+        sev = t.group(1).lower()
+        body = rest[t.end():]
+        i = re.search(r"(?:^|\s)note=", body)
+        if i:
+            note, body = body[i.end():], body[:i.start()]
+        for k, v in KV.findall(body):
+            fields[k] = v[1:-1] if len(v) > 1 and v[0] == v[-1] == '"' else v
+    else:   # tool output: the first [severity] tag anywhere (nuclei), else the kind's default
+        t = SEV.search(line)
+        sev = t.group(1).lower() if t else KIND_SEV.get(src, "info")
+    host = fields.get("host", "")
+    if not host:
+        u = URLRE.search(line)
+        host = u.group(1).lower() if u else ""
+    return {"source": src, "seed": seed, "check": check, "severity": sev, "host": host, "fields": fields,
+            "note": note, "text": detail}
+recs = []
+for k in FINDING_KINDS:
+    p = "%s.%s.txt" % (out, k)
+    if os.path.isfile(p):
+        for l in open(p, encoding="utf-8", errors="replace"):
+            l = ANSI.sub("", l.rstrip("\r\n"))
+            if l.strip():
+                recs.append(finding(k, l))
+write("findings", recs)
+bad = 0
+for kind, suf in TSV_KINDS:
+    p = out + suf
+    if not os.path.isfile(p):
+        continue
+    with open(p, encoding="utf-8", errors="replace") as f:
+        hdr = f.readline().rstrip("\r\n").split("\t")
+        recs = []
+        for l in f:
+            l = l.rstrip("\r\n")
+            if not l:
+                continue
+            v = l.split("\t")
+            if len(v) != len(hdr):
+                bad += 1
+                v = (v + [""] * len(hdr))[:len(hdr)] if len(v) < len(hdr) else v[:len(hdr) - 1] + ["\t".join(v[len(hdr) - 1:])]
+            recs.append(dict(zip(hdr, v)))
+    write(kind, recs)
+warns = []
+wf = os.path.join(wd, "warnings.txt")
+if os.path.isfile(wf):
+    for l in open(wf, encoding="utf-8", errors="replace"):
+        l = ANSI.sub("", l).strip()
+        if l and l not in warns:
+            warns.append(l)
+write("warnings", [{"message": w} for w in warns])
+def num(v):
+    return int(v) if (v or "").isdigit() else None
+seeds = []
+sp = os.path.join(wd, "seedstat.tsv")
+for l in (open(sp, encoding="utf-8", errors="replace") if os.path.isfile(sp) else ()):
+    f = l.rstrip("\n").split("\t")
+    if len(f) >= 4:
+        seeds.append({"seed": f[0], "candidates": num(f[1]), "resolved": num(f[2]), "live_hosts": num(f[3])})
+write("seeds", seeds)
+if bad:
+    sys.stderr.write("%d TSV row(s) had the wrong number of fields\n" % bad)
+print(" ".join(summary))
+PYJSONL
+)"; then
+    ok " JSON lines      : $OUTPUT.<kind>.jsonl (urls=$(grep -c '' "$OUTPUT.urls.jsonl" 2>/dev/null || echo 0) services=$(grep -c '' "$OUTPUT.services.jsonl" 2>/dev/null || echo 0) $_jsum)"
+    [ -s "$WORKDIR/jsonl.err" ] && warn " --json: $(head -n 1 "$WORKDIR/jsonl.err")"
+  else
+    warn " --json: the side files could not be written as JSON lines (see $WORKDIR/jsonl.err)"
   fi
 fi
 
@@ -7149,5 +7395,24 @@ if [ "$KEEP_WORK" = "1" ]; then
   log "Intermediate artifacts kept in: $WORKDIR"
 else
   rm -rf "$WORKDIR" 2>/dev/null || true
+fi
+
+# --- --ship: send the finished run to Tideline -------------------------------------
+# An output stage only: it reads the files and the manifest written above and changes none
+# of them; its state goes to <out>.ship-state.json. A failure leaves the run complete
+# locally (exit 4); `ship-recon.sh ship <csv>` retries and sends only what is missing.
+if [ -n "$SHIP_URL" ]; then
+  _ship_int(){ trap - INT TERM; err "shipping interrupted: the run itself is complete. Send it later with: $SHIP_SH ship $OUTPUT"; exit "$1"; }
+  trap '_ship_int 130' INT
+  trap '_ship_int 143' TERM
+  log "Tideline: shipping run $RUN_ID to $SHIP_URL"
+  if bash "$SHIP_SH" ship "$OUTPUT" "${_shargs[@]}"; then
+    ok " Tideline        : run $RUN_ID shipped and verified ($OUTPUT.ship-state.json)"
+  else
+    _shrc=$?
+    err "Tideline: the run was not delivered (ship-recon.sh exit $_shrc; $OUTPUT.ship-state.json). The run is complete locally;"
+    err "  retry with: $SHIP_SH ship $OUTPUT   (sends only the parts Tideline does not have)"
+    [ "$RUN_EXIT" = 0 ] && RUN_EXIT=4
+  fi
 fi
 exit "$RUN_EXIT"

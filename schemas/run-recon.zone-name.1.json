@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tideline:schema:run-recon.zone-name/1",
+  "title": "run-recon zone-name",
+  "description": "One name harvested by --zone-exposure (a row of <out>.zone-names.txt). Values are strings, as in the TSV.",
+  "x-tideline-schema": "run-recon.zone-name/1",
+  "x-minor": 0,
+  "type": "object",
+  "properties": {
+    "zone": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "source": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "zone",
+    "name",
+    "source"
+  ],
+  "additionalProperties": {
+    "type": "string"
+  }
+}

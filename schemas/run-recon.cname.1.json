@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tideline:schema:run-recon.cname/1",
+  "title": "run-recon cname",
+  "description": "One name with a CNAME, dangling or not, from --takeover (a row of <out>.cname.tsv). Values are strings, as in the TSV.",
+  "x-tideline-schema": "run-recon.cname/1",
+  "x-minor": 0,
+  "type": "object",
+  "properties": {
+    "seed_domain": {
+      "type": "string"
+    },
+    "host": {
+      "type": "string"
+    },
+    "cname_chain": {
+      "type": "string"
+    },
+    "dns": {
+      "type": "string"
+    },
+    "provider": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "seed_domain",
+    "host",
+    "cname_chain",
+    "dns",
+    "provider"
+  ],
+  "additionalProperties": {
+    "type": "string"
+  }
+}

@@ -18,6 +18,8 @@ control; never point the scanner anywhere else.
 | `docker-compose.yml` | the range: `dns` (CoreDNS), `bind` (BIND 9.18, for the NSEC3 zone), `ingress` (Caddy TLS vhost router), `nginx`, `wordpress` + `db`, `spa`, `jenkins` — all pinned. `nginx` is also published directly on `LAB_ORIGIN_IP:80` (default `127.0.0.5`): the "forgotten origin" fixture. The ingress also answers `403` to everything on `LAB_PROTECTED_IP:80` (default `127.0.0.6`): the "protected origin". BIND answers as `ns.nsec3.test` on `LAB_NSEC3_IP:53` (default `127.0.0.7`). `tlslab` (nginx 1.21.6) serves the TLS fixtures, each on its own address: `LAB_TLS_LEGACY_IP` … `LAB_TLS_MODERN_IP` (default `127.0.0.9`–`127.0.0.12`) |
 | `tls-nginx.conf` | the TLS fixtures' nginx: one listener per fixture, its own protocols and ciphers (see "TLS fixtures" below) |
 | `gen-tls-certs.py` | makes the TLS fixtures' certificates at `up` (needs `openssl` and `python3-cryptography`) |
+| `mock-tideline.py` | a stand-in for Tideline's ingest service (loopback only): mutual TLS, the sensor from the certificate, ES256 manifest signatures, part hashes and schema validation, fault injection; used by `ship` and the suite |
+| `gen-ship-certs.sh` | a throwaway step-ca-shaped PKI for `mock-tideline.py`: root, intermediate, server and sensor certificates, plus the misfits the tests need (needs `openssl`) |
 | `Caddyfile` | vhost routing; serves every name on both `http://` and `https://` with certificates from Caddy's local CA, plus the HTTP-detail fixtures below |
 | `Corefile` | CoreDNS: authoritative for `test.`, `walk.test.` and `xfr.test.` from the generated zone files; forwards `nsec3.test.` to BIND |
 | `named.conf` | BIND: authoritative only, for `nsec3.test.`, transfers refused; shares the `dns` container's network and listens on `:5353` |
@@ -80,7 +82,8 @@ sudo sh -c './bench-run-recon.sh hosts >> /etc/hosts'   # once: names for tools 
 ./bench-run-recon.sh scope                                                     # --scope / --list-targets; proved at the origin's access log
 ./bench-run-recon.sh resume                                                    # SIGTERM mid-run, --resume, CSV equals an uninterrupted run
 RECON_DB_DSN=postgresql://... ./bench-run-recon.sh history                     # --monitor delta + recon-db history (store with RECON_DB_DSN)
-./bench-run-recon.sh checks                                                    # all ten; non-zero if any fails
+./bench-run-recon.sh ship                                                      # --ship to a mock Tideline ingest: round trip, re-ship, resume
+./bench-run-recon.sh checks                                                    # all eleven; non-zero if any fails
 
 ./bench-run-recon.sh down                # tear down and remove volumes
 ```
@@ -280,6 +283,29 @@ local TLS speaker instead.
 `legacy.tls.test` also shows why the chain check retries: the local OpenSSL refuses its key size
 and protocol before it gets to the chain, so the first handshake fails without a verdict. The
 second try, at security level 0, reaches one (`self-signed certificate` → `CertUntrusted`).
+
+## Tideline shipping check (run-recon 1.20)
+
+`bench-run-recon.sh ship` sends a lab run to `mock-tideline.py`, a stand-in for Tideline's ingest
+service, over mutual TLS on loopback. The run is `--tls --ipv6 --takeover --dns-posture --screenshots
+--engagement lab-ship --ship ...`. The PKI is a throwaway one made by `gen-ship-certs.sh` in the
+check's temporary directory, shaped like step-ca's: a root, an intermediate, ECDSA P-256 keys, and
+the sensor ID as a URI SAN. The mock checks what the real ingest checks: the client certificate and
+its sensor, the manifest's ES256 signature, each part's SHA-256 and size, and every record against
+its schema in `schemas/`.
+
+| Step | Passes when |
+|---|---|
+| the lab run with `--ship` | exit 0; `ship-state.json` complete; Tideline verified the run |
+| what Tideline stored | every part equals the local file byte for byte; the URL records equal the CSV row for row and field for field; the screenshots arrive as `image/png` artifacts; the manifest names the engagement and the certificate's sensor |
+| the exchange | one open (201), one PUT per part (204), one complete (202) |
+| shipping it again | Tideline answers 200 and nothing is re-sent |
+| the same files under a new `run_id`, Tideline answering 503 on part 2 | exit 4 |
+| the retry | the run is re-opened (200) and only the parts Tideline lacks are sent |
+
+The suite covers the refusals: a changed file, a conflicting manifest, another sensor's run, a client
+certificate from another CA, a server from another CA, and a trust store in `SSL_CERT_DIR` that
+must not be used. See [SHIPPING.md](../SHIPPING.md).
 
 ## Accuracy notes
 
