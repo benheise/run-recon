@@ -9,7 +9,7 @@ justified accuracy fix).
 **Status:** Done · In progress · Planned · Blocked (needs something from Ben) · Won't do
 **Last updated:** 2026-11-06, follow-ups F1–F10 done on `followups-v1.18` (PR #3), Batch 3 on
 `batch-3-email-dns` (PR #4), Batch 4 on `batch-4-evidence` (PR #5) and Batch 5 on `batch-5-redirects-tls`
-(stacked on #5). That was the last open batch work (B2.8, T1–T2, plus X1): v1.20.0 can be released once the
+(PR #6, stacked on #5). That was the last open batch work (B2.8, T1–T2, plus X1): v1.20.0 can be released once the
 pull requests are merged. The V-list (section 2) still needs Ben's Kali VM; section 8 is planned for after
 the release.
 
@@ -19,7 +19,7 @@ the release.
 |---|---|---|---|
 | R1 | Git repository, `main` = v1.18.0, generated lab files ignored | Done | `git log` |
 | R2 | Push to GitHub (private `benheise/run-recon`) | Done: `main` pushed; releases v1.18.0 and v1.19.0 published. Tags cannot be pushed from Claude's sessions (HTTP 403), so releases/tags are created in the GitHub UI | tags `v1.18.0`, `v1.19.0` on GitHub |
-| R3 | Each batch on its own branch, merged by pull request | Done for Batch 2 (#1, merged); follow-ups #3; Batch 3 #4; Batch 4 #5; Batch 5 on `batch-5-redirects-tls` (stacked on #5) | PR per batch |
+| R3 | Each batch on its own branch, merged by pull request | Done for Batch 2 (#1, merged); follow-ups #3; Batch 3 #4; Batch 4 #5; Batch 5 #6 (stacked on #5) | PR per batch |
 
 ## 1. Batch 2: HTTP detail (WebInventory A4, A5, A6, A11)
 
