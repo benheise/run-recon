@@ -1284,7 +1284,7 @@ Tracked in `PLAN.md` (B2.1–B2.7). Every item has a suite test and a lab fixtur
 - [x] **Repository:** the toolkit is now a git repository (`benheise/run-recon`, `main` = v1.18.0); Batch 2 is
       on `batch-2-http-fields`.
 
-## v1.20.0 (unreleased) — the v1.18 follow-ups (F1–F10)
+## v1.20.0 — the v1.18 follow-ups (F1–F10)
 
 Tracked in `PLAN.md` (§3). Every item has a suite test; F1, F4, F5, F6 and F10 were also checked against the
 lab with the real tools. Numbers in `BENCHMARK.md` (v1.20 follow-ups section).
@@ -1340,7 +1340,7 @@ lab with the real tools. Numbers in `BENCHMARK.md` (v1.20 follow-ups section).
       zone AAAA/unreachable/walk-on/DS, gowitness, host-resolver-rules, edge list, dangling-CNAME warning, chain
       dedupe, extras single pass with link/data/HTML icons, CPE split, report).
 
-## v1.20.0 (unreleased) — Batch 3: email and DNS posture, cloud inventory, TLD variants, vulnx
+## v1.20.0 — Batch 3: email and DNS posture, cloud inventory, TLD variants, vulnx
 
 Tracked in `PLAN.md` (B3.1–B3.5), on `batch-3-email-dns` (stacked on the follow-ups). Every item has suite
 tests; B3.1, B3.2, B3.3 and B3.5 were checked against the lab with the real tools.
@@ -1386,7 +1386,7 @@ tests; B3.1, B3.2, B3.3 and B3.5 were checked against the lab with the real tool
 - [x] **Checks:** suite 590 → **635/635**; `bench-run-recon.sh checks` **PASS** on all six fixtures; A/B vs the
       follow-ups: lab identical; `--dns-posture` on the farm +0.8 s wall, +2.5 s CPU, CSV identical.
 
-## v1.20.0 (unreleased) — Batch 4: evidence and history (scope, manifest, delta, history, resume)
+## v1.20.0 — Batch 4: evidence and history (scope, manifest, delta, history, resume)
 
 Tracked in `PLAN.md` (B4.1–B4.5), on `batch-4-evidence` (stacked on Batch 3). Every item has suite tests; B4.1,
 B4.3, B4.4 and B4.5 were checked against the lab with the real tools, and B4.4 against a real PostgreSQL 16.
@@ -1444,7 +1444,7 @@ B4.3, B4.4 and B4.5 were checked against the lab with the real tools, and B4.4 a
       new screenshot pipeline, the heartbeat's `sleep` holding the lock, children forked during the kill, a
       resume racing a live run).
 
-## v1.20.0 (unreleased) — Batch 5: redirect chains, login forms, TLS version matrix, certificate strength, CPE aliases
+## v1.20.0 — Batch 5: redirect chains, login forms, TLS version matrix, certificate strength, CPE aliases
 
 Tracked in `PLAN.md` (B2.8, T1, T2, X1), on `batch-5-redirects-tls` (stacked on Batch 4). Every item has suite
 tests and was checked against new lab fixtures with the real tools.
@@ -1495,7 +1495,7 @@ tests and was checked against new lab fixtures with the real tools.
       tlsx cannot offer weak suites, `expired` is false for a not-yet-valid certificate, the chain check's
       missing verdict on weak hosts, tlsx's `auto` mode reading an open stdin).
 
-## v1.20.0 (unreleased) — Batch 6: JSON output and shipping to Tideline
+## v1.20.0 — Batch 6: JSON output and shipping to Tideline
 
 Tracked in `PLAN.md` section 8 (P1–P3), on `batch-6-json-ship` (stacked on Batch 5). The run-recon side of
 recon-platform-plan §11; the protocol, exit codes, schemas and enrollment are in `SHIPPING.md`.

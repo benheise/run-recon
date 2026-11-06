@@ -31,7 +31,7 @@
 # part): fix the cause first. `status`: 0 known, 4 unreachable, 5 unknown or refused.
 #
 set -euo pipefail
-VERSION="1.20.0-dev"
+VERSION="1.20.0"
 exec python3 -I - "$VERSION" "$@" <<'PYSHIP'
 import sys, os, re, json, hashlib, subprocess, tempfile, shutil, gzip, time, datetime, fcntl, tarfile, io, stat
 

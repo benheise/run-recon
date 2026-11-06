@@ -978,7 +978,7 @@ and origin fixtures end to end.
 the default path stays as fast as v1.18.0 and every existing column is identical (lab and farm).
 `./bench-run-recon.sh checks` now also runs the `http` fixtures.
 
-**v1.20.0** (unreleased, the v1.18 follow-ups): the default path is unchanged in speed and output; `--extras`
+**v1.20.0** (the v1.18 follow-ups and Batches 3–6): the default path is unchanged in speed and output; `--extras`
 needs one httpx run per seed instead of two (farm: 1.14x wall, 24% less CPU, output identical). `bench` A/B
 comparisons now ignore fields that differ between runs of the same version (`compare --exact --noise`).
 Batch 3 leaves the default path identical; `--dns-posture` costs under a second on the 50-seed farm, and the
@@ -986,7 +986,10 @@ lab now exercises naabu, alterx, shuffledns, cdncheck, uncover and notify for re
 Batch 4 also leaves the default path's output identical (timing inside the lab's spread); `checks` adds `scope`
 (an address exclusion proved at the origin's own access log), `resume` (a SIGTERM'd run resumed to a CSV
 identical to an uninterrupted one) and `history` (a stopped backend seen field by field, in the delta and in the
-store).
+store). Batch 5 adds the `tls` fixtures, and Batch 6 the `ship` check (`--ship` to a mock Tideline ingest): eleven
+checks in all. Against v1.19.0, interleaved run by run, every existing column is identical on the farm and on the
+lab, except WordPress's plain-HTTP login page (`auth=Form`, `CleartextAuth`: the new login-form detection), and
+the timing is equal.
 
 The v1.16 speed-up is from not querying internet archives for special-use names such as `.test`,
 which cannot exist there. The lab also exposed nine accuracy bugs, all fixed in v1.16 (listed in
