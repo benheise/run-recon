@@ -86,6 +86,37 @@ Opening the same run again is safe: the manifest is rebuilt byte for byte from t
 manifest and is not listed in it, so a shipped run's files are exactly those of an unshipped
 `--json` run, plus that state file.
 
+## Frozen identifiers
+
+Decided on 2026-11-06: the protocol keeps the Tideline names, and they are frozen. Sensor certificates
+carry them, and step-ca's renewal template copies them, so a later change would mean re-enrolling every
+sensor.
+
+| Identifier | Value |
+|---|---|
+| Manifest schema | `tideline-envelope/1` (the `schema` field) |
+| Signature header | `Tideline-Signature: alg=ES256; enc=der; sig=<base64>` (`enc=p1363` from Windows PowerShell) |
+| Sensor identity | the certificate's URI SAN `urn:tideline:sensor:<id>`, with `<id>` 1–64 of `A-Z a-z 0-9 . _ -` |
+| Tenant | a second URI SAN, `urn:tideline:tenant:<label>`. ship-recon does not read it and the manifest does not carry it: ingest takes it from the certificate |
+| Schema ids | `urn:tideline:schema:<id>` in `$id`; `<id>` in `x-tideline-schema` and in each part's `schema`; record schemas `run-recon.<kind>/1` |
+| Endpoints | `POST /v1/runs`, `PUT /v1/runs/{run_id}/parts/{n}`, `POST /v1/runs/{run_id}/complete`, `GET /v1/runs/{run_id}` |
+
+**How they can change:**
+- **A new field** in a record kind is a minor change: the id stays `/1`, `x-minor` goes up, and
+  `schemas/SHA256SUMS` is regenerated.
+- **A renamed or removed field** is a new major version: a new file (`/2`), with ingest accepting the
+  previous major for one release.
+- **Enforced by the suite:**
+  - each identifier above, in `ship-recon.sh` and `lab/mock-tideline.py`;
+  - every schema's `$id` and file name;
+  - the schemas against `schemas/SHA256SUMS`, so a frozen schema cannot change by accident;
+  - a certificate that carries the tenant URI still passes, and a combined
+    `urn:tideline:sensor:<tenant>:<id>` is refused.
+
+**Source of truth.** The `tideline-schemas` repository (project doc `claude/tideline-schemas-v1.md`) holds
+these schemas unchanged. Once it has a tagged release, run-recon vendors its `schemas/` and `SHA256SUMS` from
+that release.
+
 ## Transport
 
 - **TLS.** TLS 1.2 or later, with ECDHE and AES-GCM suites only.

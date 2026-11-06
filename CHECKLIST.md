@@ -1525,6 +1525,10 @@ recon-platform-plan §11; the protocol, exit codes, schemas and enrollment are i
       `faults.json` injects a status or a dropped connection. `lab/gen-ship-certs.sh` makes a
       step-ca-shaped PKI and the misfits (another CA, no sensor URI, RSA, a server from another CA).
 - [x] **Lab**: `bench-run-recon.sh ship` (new; in `checks`).
+- [x] **Frozen identifiers** (decided 2026-11-06): `tideline-envelope/1`, `Tideline-Signature`,
+      `urn:tideline:sensor:<id>` (with `urn:tideline:tenant:<label>` carried but not read), `urn:tideline:schema:<id>`,
+      the `/v1/runs` endpoints. `schemas/SHA256SUMS`; the suite pins each identifier and checks the sums, and that a
+      tenant-carrying certificate passes while a combined `sensor:<tenant>:<id>` is refused (SHIPPING.md).
 - [x] **Checks:** suite 831 → **946/946**; `bench-run-recon.sh checks` **PASS** on all eleven on the final code
       (`history` with the PostgreSQL 16 store, after a fix to the check's baseline run: it read a stale `--db`
       cache). A/B vs Batch 5 on the lab: the default path's CSV

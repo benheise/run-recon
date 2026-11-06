@@ -101,15 +101,16 @@ GitHub UI. The V-list (section 2) still needs Ben's Kali VM.
 
 The run-recon side of the platform plan (`claude/recon-platform-plan-v0.5.md` in the project). Tideline is
 the platform's name (`claude/naming-research.md`); the protocol identifiers use it (`tideline-envelope/1`,
-`Tideline-Signature`, `urn:tideline:sensor:<id>`). Planned for after the release, brought forward at Ben's
-request. Details: SHIPPING.md.
+`Tideline-Signature`, `urn:tideline:sensor:<id>`). **Decided 2026-11-06 (Ben): these names stay and are frozen**
+(SHIPPING.md, "Frozen identifiers"; the suite pins them and checks `schemas/SHA256SUMS`). Planned for after the
+release, brought forward at Ben's request. Details: SHIPPING.md.
 
 | ID | Item | Status | Check |
 |---|---|---|---|
 | P1 | `--json`: JSON lines per record kind with the CSV's and TSVs' field names: urls and services (from the CSV builder itself, unguarded), findings, DNS posture, edges, CNAMEs, zone names, screenshot classes, cloud assets, vulnx, delta, warnings, seeds; JSON Schemas (2020-12) in `schemas/` | Done (`batch-6-json-ship`) | suite: parity with the CSV, the findings parser, the schema contract (field lists read from the source); lab A/B |
 | P2 | `run_id` (UUID v4, kept across `--resume`), `--engagement`, `--job-id` in run.json and the manifest | Done | suite (incl. `--resume`) |
 | P3 | `--ship URL` with `--ship-cert`/`--ship-key`/`--ship-ca`/`--ship-proxy`: mTLS pinned to the Tideline CA (an empty `--capath`: `--cacert` alone still trusts the system store), signed `tideline-envelope/1` (ES256), gzip parts hashed as in the run's manifest, `ship-state.json`, exit 4; preflight before the scan; `ship-recon.sh` ship/status/export/envelope/check | Done | suite against `lab/mock-tideline.py` (delivery, re-ship, resume, refusals, pinning, export); `bench-run-recon.sh ship` (the shipped records equal the local CSV row for row) |
-| P4 | WebInventory's side (`-ShipTo`, `Send-WebInventoryRun.ps1`, `Register-WebInventorySensor.ps1`) against the same envelope, and moving `schemas/` to a `tideline-schemas` repository | Planned (WebInventory, Tideline) | contract test of both tools' lab output |
+| P4 | WebInventory's side (`-ShipTo`, `Send-WebInventoryRun.ps1`, `Register-WebInventorySensor.ps1`) against the same envelope; run-recon vendoring `schemas/` and `SHA256SUMS` from a tagged `tideline-schemas` release (the repository is drafted: `claude/tideline-schemas-v1.md`) | Planned (WebInventory, Tideline) | contract test of both tools' lab output; `sha256sum -c` of the vendored copy |
 
 ## Done (for reference)
 
