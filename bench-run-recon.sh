@@ -298,11 +298,14 @@ cmd_run(){
 
 # ---- compare: accuracy vs expected, or field-by-field A/B ---------------------
 cmd_compare(){
-  local exact=0 a="" b=""
+  local exact=0 a="" b="" noise=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --exact) exact=1; shift;;
-      -h|--help) echo "usage: $0 compare EXPECTED ACTUAL [--exact]" >&2; return 0;;
+      # --noise RUN: another run of A's version; fields that differ between A and it are
+      # run-to-run noise (a page with a per-request nonce), not a difference between versions
+      --noise) [ -f "${2:-}" ] && noise="${noise:+$noise:}$2"; shift 2 || shift;;
+      -h|--help) echo "usage: $0 compare EXPECTED ACTUAL [--exact [--noise OTHER-RUN-OF-EXPECTED]...]" >&2; return 0;;
       -*) die "compare: unknown option: $1";;
       *) if [ -z "$a" ]; then a="$1"; elif [ -z "$b" ]; then b="$1"; fi; shift;;
     esac
@@ -311,7 +314,7 @@ cmd_compare(){
   [ -f "$a" ] || die "compare: not found: $a"
   [ -f "$b" ] || die "compare: not found: $b"
   have python3 || die "compare: python3 required"
-  BENCH_EXACT="$exact" python3 -I - "$a" "$b" <<'PYCMP'
+  BENCH_EXACT="$exact" BENCH_NOISE="$noise" python3 -I - "$a" "$b" <<'PYCMP'
 import sys, os, csv, re
 
 a_path, b_path = sys.argv[1], sys.argv[2]
@@ -334,6 +337,18 @@ if EXACT:
     am = {key(r): r for r in ar}
     bm = {key(r): r for r in br}
     cols = [c for c in (ar[0].keys() if ar else []) if c in (br[0].keys() if br else []) and c not in VOLATILE]
+    # the noise floor: (row, column) pairs that already differ between runs of A's version
+    noisy = set()
+    for npath in [x for x in os.environ.get("BENCH_NOISE", "").split(":") if x]:
+        nm = {key(r): r for r in rows(npath)}
+        for k in set(am) & set(nm):
+            for c in cols:
+                if (am[k].get(c) or "") != (nm[k].get(c) or ""):
+                    noisy.add((k, c))
+    if noisy:
+        from collections import Counter
+        print("noise: %d field(s) differ between runs of A's own version, not compared (%s)"
+              % (len(noisy), ", ".join("%s x%d" % kv for kv in sorted(Counter(c for _, c in noisy).items()))))
     diffs = 0
     only_a = sorted(set(am) - set(bm))
     only_b = sorted(set(bm) - set(am))
@@ -341,7 +356,7 @@ if EXACT:
     for k in only_b: print("only in B: %s %s" % k); diffs += 1
     for k in sorted(set(am) & set(bm)):
         for c in cols:
-            if (am[k].get(c) or "") != (bm[k].get(c) or ""):
+            if (k, c) not in noisy and (am[k].get(c) or "") != (bm[k].get(c) or ""):
                 print("differ %s %s [%s]: %r != %r" % (k[0], k[1], c, am[k].get(c), bm[k].get(c)))
                 diffs += 1
     a_cols = set(ar[0].keys()) if ar else set()
@@ -469,7 +484,9 @@ cmd_bench(){
     [ -f "$bs" ] || die "baseline script not found: $bs"
     log "baseline ($( [ -n "$base_script" ] && echo "script $bs" || echo "flags: $bf"))"
     local w0 c0 r0 a0; read -r w0 c0 r0 a0 < <(_one base "$bs" "$bf")
-    local ident; if cmd_compare "$tdir/base.csv" "$tdir/cand.csv" --exact >"$tdir/ab.log" 2>&1; then ident="identical"
+    # runs 1..N-1 of the baseline give the noise floor (base.csv is run N)
+    local _nz=() _k; for _k in $(seq 1 $((runs - 1))); do _nz+=(--noise "$tdir/base.$_k.csv"); done
+    local ident; if cmd_compare "$tdir/base.csv" "$tdir/cand.csv" --exact "${_nz[@]}" >"$tdir/ab.log" 2>&1; then ident="identical"
       else ident="DIFFERENT ($(grep -c '^differ\|^only' "$tdir/ab.log") field(s); see $tdir/ab.log)"; fi
     local sp csp
     sp="$(awk -v a="$w0" -v b="$w1" 'BEGIN{ if(b>0) printf "%.2fx", a/b; else print "n/a"}')"

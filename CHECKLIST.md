@@ -1283,3 +1283,59 @@ Tracked in `PLAN.md` (B2.1–B2.7). Every item has a suite test and a lab fixtur
       JSON into raw characters, so every enrichment record was invalid JSON.
 - [x] **Repository:** the toolkit is now a git repository (`benheise/run-recon`, `main` = v1.18.0); Batch 2 is
       on `batch-2-http-fields`.
+
+## v1.20.0 (unreleased) — the v1.18 follow-ups (F1–F10)
+
+Tracked in `PLAN.md` (§3). Every item has a suite test; F1, F4, F5, F6 and F10 were also checked against the
+lab with the real tools. Numbers in `BENCHMARK.md` (v1.20 follow-ups section).
+
+- [x] **F1 `origin-protected [info]`**: a `direct.`/`origin.`/`backend.`/`origin-` name whose address does not
+      serve the site is reported with the reason per port (`refused`, `timeout`, `tls-refused`, `empty-reply`,
+      `reset`, `status-N`, `status-N-other-content`), and not when another address of the same site was found.
+      Lab: `origin.spa.test` → `LAB_PROTECTED_IP`, where the ingress answers 403 to everything.
+- [x] **F2 more origin candidates**: AAAA records of origin names; SPF `ip6:` and `include:`/`redirect=`
+      (depth 3, at most 10 lookups); `ORIGIN_PORTS` (default `443 80`, plain HTTP on 80/8080/8000/8008/8888);
+      `range-cert` (in ASN/CIDR mode the range cert scan now records which address presented each name);
+      `history:virustotal` (past A/AAAA) and `history:urlscan` (addresses past scans of the site saw).
+      `osint_scan` now runs before the analysis stage so its history is there for `--origin`.
+- [x] **Bug found on the way:** the origin verifier split its candidate lines on tab with `read`, and tab is
+      IFS whitespace, so an empty field (a page with no title) collapsed into its neighbour and shifted every
+      later field. Lines are now split on `\x1f`. Same for the status code of the verify fetch.
+- [x] **F3 zone check**: every address of every name server, IPv4 and IPv6; an address that never answers is
+      counted apart (`unreachable=N`), not as a refusal; the NSEC/NSEC3 probe moves on to the next name server
+      when one gives nothing; DS lookup: `dnssec-unanchored [low]` for a signed zone without a DS, `ds=yes/no`
+      on `zone-checked`.
+- [x] **F4 NSEC3 lab fixture**: `nsec3.test`, signed with NSEC3 by `ldns-signzone -n`, served by BIND 9.18 in
+      the `dns` container's network (CoreDNS forwards the zone to it); `bench-run-recon.sh zone` checks
+      `nsec3-hashes-exposed [low] params="1 0 5 1A2B3C4D"`, that the names are not walked, and
+      `dnssec-unanchored`.
+- [x] **F5 screenshots resolve like the probe**: with `--resolvers`, httpx's browser gets
+      `--host-resolver-rules` (each host mapped to the address dnsx got from your resolvers). Lab:
+      `secret-admin.walk.test` (known only to the lab DNS) was a 0-byte capture in v1.19.0, now `ok`.
+- [x] **F6 gowitness validated like httpx**: gowitness 3 gets explicit `https://host:443` and `http://host:80`
+      URLs (a bare name was shot four ways), the go-rod driver (chromedp timed out on the screenshot under
+      concurrency in the lab: status and title recorded, no image), `--chrome-path` and `--chrome-proxy`, and
+      its JSON lines feed the same validation; one capture per host, https first. `SCREENSHOT_TOOL=auto|httpx|
+      gowitness` picks the tool.
+- [x] **F7**: a lone `Server` header names an edge only for CDN/WAF/LB products (Caddy, envoy, HAProxy,
+      Varnish, Traefik, ATS, Squid and F5 removed); the report's "Known vulnerabilities: not
+      checked" note counts versioned and versionless CPEs apart; a seed that resolves to nothing and is a CNAME
+      says so ("the seed is a CNAME to X, which does not resolve (dangling; --takeover checks it)").
+- [x] **F8 chain check in one pass**: `tls_chain_check` runs once on the merged `tlsx.jsonl` instead of once
+      per seed, with one handshake per (address, port, name).
+- [x] **F9**: the setup scripts install `ldnsutils` (dnf `ldns-utils`, pacman `ldns`).
+- [x] **F10 `--extras` in one httpx run per seed**: the root page and `/favicon.ico` join the well-known paths
+      (`-irrb`, bodies base64); the favicon is the root page's `<link rel=icon>` (a `data:` icon decoded; another
+      path on the same host fetched in one follow-up run), else `/favicon.ico`, and never an HTML page; mmh3
+      (Shodan's: MurmurHash3 x86_32 of the base64 with newlines) and MD5 are computed in Python. `--favicon`
+      reuses them. Lab: Jenkins's favicon gives 81586312, the value httpx's `-favicon` gave.
+- [x] Validation: `ORIGIN_PORTS` and `SCREENSHOT_TOOL` are checked at start-up.
+- [x] **Report:** `origin-protected` is shown as evidence (Protected origin), not counted as a finding.
+- [x] **Bench:** `compare --exact --noise OTHER-RUN`; `bench` passes the baseline's other runs, so fields that
+      differ between runs of one version (WordPress oEmbed bodies carry a random secret) are not reported as
+      differences between versions. A/B vs v1.19.0: lab identical, farm with `--extras` 1.14x and −24% CPU,
+      identical. `bench-run-recon.sh checks`: **PASS** (takeover, zone with nsec3.test, origin with
+      origin-protected, http).
+- [x] Tests: 533 → **590/590** (origin candidates and reasons, ORIGIN_PORTS, range-cert, VT/urlscan history,
+      zone AAAA/unreachable/walk-on/DS, gowitness, host-resolver-rules, edge list, dangling-CNAME warning, chain
+      dedupe, extras single pass with link/data/HTML icons, CPE split, report).

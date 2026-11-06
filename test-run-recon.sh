@@ -1050,6 +1050,9 @@ MOCK_ORIGIN_BODY='something else' run_case origin_nomatch --origin
 refute_grep  "$CSV.origin.txt" 'origin-(exposed|alternate|candidate)'   "a candidate serving a different page is not reported as an origin"
 assert_grep  "$CSV.origin.txt" '^\[example\.com\] origin-protected \[info\] host=example\.com origin=10\.0\.0\.1 via=backend\.example\.com,direct\.example\.com,origin\.example\.com reason=443:status-200-other-content,80:refused ' "an origin name's address that does not serve the site -> origin-protected [info], with the reason per port"
 assert_grep  "$CSV.origin.txt" 'origin-protected \[info\] host=example\.com origin=2001:db8::1 .*reason=443:refused,80:refused' "refused on every port -> origin-protected [info]"
+bash "$(dirname "$RUN_RECON")/generate-report.sh" "$CSV" -o "$OUTDIR/p.html" >/dev/null 2>&1 || true
+if python3 -c 'import sys,re; s=open(sys.argv[1],encoding="utf-8").read(); t=re.sub(r"<[^>]+>"," ",s); sys.exit(0 if "Protected origin" in s and not re.search(r"(HIGH|MEDIUM|LOW)\s+(Exposed origin|Protected origin)", t) else 1)' "$OUTDIR/p.html" 2>/dev/null
+then _pass "report: a protected origin is shown as evidence, not as a finding"; else _fail "report: a protected origin is shown as evidence, not as a finding"; fi
 ORIGIN_PORTS=443 run_case origin_ports --origin
 refute_grep  "$MOCKLOG/curl.args" ':80:'                                 "ORIGIN_PORTS=443: only 443 is tried"
 MOCK_ORIGIN_BODY='<html><title>Origin Test</title>changed</html>' run_case origin_title --origin

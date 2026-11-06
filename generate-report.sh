@@ -141,6 +141,7 @@ KIND_LABEL = {
     "takeover": "Subdomain takeover", "secrets": "Exposed secret",
     "buckets": "Exposed cloud bucket", "origin": "Exposed origin",
     "zone": "DNS zone exposure", "zonecheck": "DNS zone check", "edgehint": "Edge fingerprint",
+    "originprotected": "Protected origin",
     "http": "HTTP", "extras": "security.txt", "extrasinfo": "Web server note", "favicon": "Favicon pivot",
     "tls": "TLS / certificate",
     "params": "Parameterized URL", "cms": "CMS / tech", "osint": "OSINT",
@@ -148,7 +149,7 @@ KIND_LABEL = {
     "vuln": "Known CVE (NVD/KEV)",
 }
 # evidence of a check that ran, not a finding: kept out of the severity counts
-EVIDENCE_KINDS = {"zonecheck", "edgehint", "extrasinfo"}
+EVIDENCE_KINDS = {"zonecheck", "edgehint", "extrasinfo", "originprotected"}
 
 def sev_from_nuclei(text):
     m = re.search(r'\[(critical|high|medium|low|info|unknown)\]', text, re.I)
@@ -275,6 +276,9 @@ for kind in ["nuclei", "activescan", "takeover", "secrets", "buckets", "zone", "
                     sev = sev_from_nuclei(line)
                 elif kind == "nuclei":
                     sev = sev_from_nuclei(line)
+                elif kind == "origin" and tok0 == "origin-protected":
+                    # the origin exists and refuses the site: good news, kept as evidence
+                    kind_eff, sev = "originprotected", "info"
                 elif kind == "origin" and tok0 not in ORIGIN_FINDINGS:
                     # older runs listed JARM/CDN hints here: attributes, not exposed origins
                     kind_eff, sev = "edgehint", "info"

@@ -755,6 +755,10 @@ and origin fixtures end to end.
 the default path stays as fast as v1.18.0 and every existing column is identical (lab and farm).
 `./bench-run-recon.sh checks` now also runs the `http` fixtures.
 
+**v1.20.0** (unreleased, the v1.18 follow-ups): the default path is unchanged in speed and output; `--extras`
+needs one httpx run per seed instead of two (farm: 1.14x wall, 24% less CPU, output identical). `bench` A/B
+comparisons now ignore fields that differ between runs of the same version (`compare --exact --noise`).
+
 The v1.16 speed-up is from not querying internet archives for special-use names such as `.test`,
 which cannot exist there. The lab also exposed nine accuracy bugs, all fixed in v1.16 (listed in
 `BENCHMARK.md`), including hosts blanked under heavy load (`-t 20`), now recovered by a
