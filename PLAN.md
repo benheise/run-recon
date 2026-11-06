@@ -7,27 +7,28 @@ default path is kept only if it is no slower and its output is identical (or the
 justified accuracy fix).
 
 **Status:** Done · In progress · Planned · Blocked (needs something from Ben) · Won't do
-**Last updated:** 2026-11-05, run-recon 1.18.0 released, Batch 2 in progress
+**Last updated:** 2026-11-05, run-recon 1.19.0 (Batch 2) ready for review on `batch-2-http-fields`
 
 ## 0. Source of truth
 
 | ID | Item | Status | Check |
 |---|---|---|---|
-| R1 | Git repository, `main` = v1.18.0 (tagged), generated lab files ignored | Done (local) | `git log`, tag `v1.18.0` |
-| R2 | Push to GitHub (private `benheise/run-recon`) | Blocked: this session cannot create repositories; Ben creates an empty private repo, then it is attached and pushed | `main`, tags and branches on GitHub |
-| R3 | Each batch on its own branch, merged by pull request | In progress (`batch-2-http-fields`) | PR per batch |
+| R1 | Git repository, `main` = v1.18.0, generated lab files ignored | Done | `git log` |
+| R2 | Push to GitHub (private `benheise/run-recon`) | Done: `main` pushed. Tags cannot be pushed from Claude's sessions (HTTP 403), so releases/tags are created in the GitHub UI | `main` and branches on GitHub; release v1.18.0 |
+| R3 | Each batch on its own branch, merged by pull request | Done for Batch 2 (`batch-2-http-fields`, PR open) | PR per batch |
 
 ## 1. Batch 2: HTTP detail (WebInventory A4, A5, A6, A11)
 
 | ID | Item | Status | Check |
 |---|---|---|---|
-| B2.1 | HTTP fields as appended CSV columns, from the existing enrichment request (no extra traffic): redirect target, response time, body SHA-256, content type, X-Powered-By, auth scheme/realm, cookies, cookie flag gaps, missing security headers, HSTS max-age, Alt-Svc, HTTP flags (`CleartextAuth`, `PlainHttp`) | In progress | suite; lab fixtures (headers, cookies, basic auth over HTTP); default-path A/B: existing columns identical |
-| B2.2 | Favicon mmh3 + MD5 per host (columns), from `--extras`, `--favicon` or `--origin` | In progress | lab: ci.test (Jenkins favicon) |
-| B2.3 | Real favicon pivot: `--favicon` searches the favicon hashes (Shodan/Fofa mmh3, Censys MD5) through uncover, cert-scans the hits for in-scope names, and feeds the hits to `--origin` as candidates | In progress | suite (uncover mock); needs API keys on Kali |
-| B2.4 | Reverse DNS (`ptr` column) under `--enrich` | In progress | suite; lab PTR fixture |
-| B2.5 | `--extras` (opt-in, WebInventory's "safe extras"): robots.txt (paths become URL rows), security.txt (RFC 9116 Contact/Expires), one random-path 404 probe (catch-all 200, error-page server) → columns + `<out>.extras.txt` | In progress | lab fixtures: robots + expired/valid security.txt + catch-all host |
-| B2.6 | Report: HTTP posture on host cards; findings for cleartext auth, expired security.txt, plain HTTP | In progress | suite |
-| B2.7 | Docs, A/B vs v1.18.0, lab checks, PR | Planned | BENCHMARK.md v1.19 section |
+| B2.1 | HTTP fields as appended CSV columns, from the existing enrichment request (no extra traffic): redirect target, response time, body SHA-256, content type, X-Powered-By, auth scheme/realm, cookies, cookie flag gaps, missing security headers, HSTS max-age, Alt-Svc, HTTP flags (`CleartextAuth`, `PlainHttp`) | Done (1.19.0) | 533/533 tests; `bench-run-recon.sh http`; A/B: existing columns identical on lab and farm |
+| B2.2 | Favicon mmh3 + MD5 per host (columns), from `--extras`, `--favicon` or `--origin` | Done (1.19.0) | lab: ci.test (Jenkins favicon 81586312) |
+| B2.3 | Real favicon pivot: `--favicon` searches the favicon hashes (Shodan/Fofa mmh3, Censys MD5) through uncover, cert-scans the hits for in-scope names, and feeds the hits to `--origin` as candidates | Done (1.19.0); live check is V7 | suite (uncover mock); needs API keys on Kali |
+| B2.4 | Reverse DNS (`ptr` column) under `--enrich`; non-public addresses only via your `--resolvers` | Done (1.19.0) | suite; lab reverse zone |
+| B2.5 | `--extras` (opt-in, WebInventory's "safe extras"): robots.txt (paths become URL rows), security.txt (RFC 9116 Contact/Expires), one random-path 404 probe (catch-all 200, error-page server) → columns + `<out>.extras.txt` | Done (1.19.0) | lab: robots + expired/valid security.txt + catch-all host |
+| B2.6 | Report: HTTP posture on host cards; findings for cleartext auth, expired security.txt, plain HTTP | Done (1.19.0) | suite |
+| B2.7 | Docs, A/B vs v1.18.0, lab checks, PR | Done (PR open; merge = Ben) | BENCHMARK.md v1.19 section |
+| B2.8 | Followed redirect chain (final URL across hops) and password-form detection | Planned (not in 1.19: per-URL `Location` only) | lab redirect fixture |
 
 ## 2. Needs a run on Ben's Kali VM (internet required)
 
@@ -54,6 +55,7 @@ justified accuracy fix).
 | F7 | Report: a lone `Server: Caddy` is not an edge; versionless CPEs counted apart; "did not resolve" warning mentions a dangling CNAME | Planned | suite |
 | F8 | Chain check in one pass for all hosts (cuts ~5 s CPU on the farm) | Planned | farm A/B |
 | F9 | Setup scripts install ldnsutils (lab) | Planned | fresh Kali |
+| F10 | `--extras` in one httpx pass per seed (hash `/favicon.ico` locally, parse `<link rel=icon>` from the root body): saves ~0.85 s CPU per seed, the main cost on seed-heavy runs (farm: +40 s wall today) | Planned | farm A/B |
 
 ## 4. Batch 3: email and DNS posture, more discovery
 
@@ -83,6 +85,10 @@ justified accuracy fix).
 | T2 | Weak key / signature (`WeakKey`, `WeakSig`), `CertNotYetValid`, `DefaultCert` | Planned | lab fixture certs |
 
 ## Done (for reference)
+
+- **1.19.0 (Batch 2):** 17 HTTP columns from the enrichment request (no extra traffic); favicon hashes;
+  real favicon-hash pivot feeding `--origin`; `ptr` under `--enrich`; `--extras` (robots.txt, security.txt,
+  404 probe); report HTTP posture and findings; `bench-run-recon.sh http`; httpx cache key `httpx_json_v2`.
 
 - **1.18.0:** `--zone-exposure`; verified `--origin` with `.edge.tsv`; screenshot routing and validation;
   seed-resolving preflight, per-seed warnings, exit 3, `run.json`; TLS chain validation and the 30-day

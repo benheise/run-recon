@@ -1237,3 +1237,49 @@ questions). Every item has a lab fixture or a suite test; numbers in `BENCHMARK.
       `bash -n` + shellcheck clean.
 - [ ] Next: batch 2 of TOOL-COVERAGE.md (httpx fields as CSV columns, favicon pivot, reverse DNS,
       robots/security.txt).
+
+## v1.19.0 — Batch 2: HTTP detail (WebInventory A4, A5, A6, A11)
+
+Tracked in `PLAN.md` (B2.1–B2.7). Every item has a suite test and a lab fixture
+(`bench-run-recon.sh http`). Numbers in `BENCHMARK.md` (v1.19 section).
+
+- [x] **17 CSV columns appended after `cpe`** (existing positions unchanged; recon-db and the vuln join
+      read columns by name). From the enrichment request itself, with no extra traffic (`httpx -irh -hash
+      sha256`): `redirect_location`, `response_ms`, `body_sha256`, `content_type`, `powered_by`, `auth`
+      (scheme + realm), `cookies` (names only, never values), `cookie_issues` (no Secure / no HttpOnly),
+      `missing_sec_headers` (CSP, X-Frame-Options unless CSP `frame-ancestors`, X-Content-Type-Options, HSTS
+      on HTTPS; HTML responses only, not redirects), `hsts_max_age`, `alt_svc`, `http_flags` (`CleartextAuth`
+      = Basic/Digest over HTTP, `PlainHttp` = an HTML page served on HTTP without a redirect). Set-Cookie
+      values that httpx joins with ", " are split without breaking on `Expires=` dates.
+- [x] **Cache key `httpx_json` → `httpx_json_v2`** under `--db`: records cached before 1.19 have no headers
+      and are fetched again instead of leaving the new columns blank.
+- [x] **Favicon hashes** (`favicon_mmh3`, `favicon_md5`) per host with `--extras` or `--favicon`; `--origin`
+      records them from its own reference fetch, so no second request.
+- [x] **Real favicon pivot** (`--favicon`): each distinct favicon of the seed's live hosts is searched through
+      uncover (Shodan and Fofa by mmh3, Censys by MD5), capped at `FAVICON_LIMIT` results per hash and
+      `FAVICON_MAX_HASHES` hashes per seed; the hits are cert-scanned for in-scope names (source `favicon`) and,
+      with `--origin`, tried as origin candidates. The certificate-name search (`ssl:"seed"`) stays. Both
+      uncover calls now pass `-duc` (no update check) and `--proxy`. → `<out>.favicon.txt`.
+- [x] **`--extras`** (opt-in, in `--all`): one `httpx -path` pass per seed for robots.txt, security.txt
+      (`/.well-known/` then `/`) and one random path. robots.txt paths (no wildcards) and sitemaps become URL
+      rows (source `robots`); `robots` / `security_txt` columns; `security-txt-expired [low]`,
+      `security-txt-invalid [low]` (no Expires), `catch-all-200 [info]`, `error-page [info]` with any version
+      the page shows that the Server header does not. A missing security.txt is a column value, not a finding.
+- [x] **Reverse DNS** (`ptr`) under `--enrich`, 16 lookups in parallel. Non-public addresses are asked only of
+      the resolver passed with `--resolvers` (never of the built-in public set), so internal addresses do not
+      leak to public DNS.
+- [x] **Report:** HTTP posture on each host card (missing headers of the root page, HSTS, Alt-Svc, X-Powered-By,
+      favicon, PTR, robots.txt, security.txt, cookie flag gaps, auth realms); findings: cleartext credentials
+      (MEDIUM, per URL), plain HTTP (LOW, once per host), expired/invalid security.txt (LOW); catch-all and
+      error-page notes kept as evidence.
+- [x] **Lab:** new Caddy fixtures (nginx.test robots + expired security.txt + basic-auth `/private/`; spa.test
+      full security headers + valid security.txt; `vpn-legacy.walk.test` basic auth over HTTP), a reverse
+      zone `db.127`, `targets-http.txt`; `bench-run-recon.sh http` and `checks` (takeover, zone, origin, http):
+      **PASS**. WordPress's cookie and Jenkins's favicon and robots.txt are real, not staged.
+- [x] **`compare --exact`** treats `response_ms` as volatile (like `cert_not_after`).
+- [x] Tests: +38 → **533/533** (HTTP columns end to end and in the aggregator: auth/cleartext, HSTS, redirects,
+      non-HTML, CSP frame-ancestors, PTR public vs private resolver; extras; favicon pivot + origin candidate;
+      report). The suite caught two of its own mock bugs first: printf turned `\n` and `\"` inside the mock's
+      JSON into raw characters, so every enrichment record was invalid JSON.
+- [x] **Repository:** the toolkit is now a git repository (`benheise/run-recon`, `main` = v1.18.0); Batch 2 is
+      on `batch-2-http-fields`.

@@ -135,6 +135,8 @@ GITHUB_TOKEN=ghp_xxx run-recon -i domains.txt --github    # or supply the token 
 ```bash
 run-recon -i domains.txt --takeover            # CNAMEs of every candidate, dangling targets, subzy/nuclei
                                                #   -> results.csv.takeover.txt + results.csv.cname.tsv
+run-recon -i domains.txt --extras              # robots.txt (paths become URL rows), security.txt, one 404 probe,
+                                               #   favicon hashes -> robots/security_txt/favicon_* columns + results.csv.extras.txt
 run-recon -i domains.txt --zone-exposure       # each seed's DNS zone: AXFR on every name server, NSEC walk, NSEC3
                                                #   -> results.csv.zone.txt + results.csv.zone-names.txt (names feed the scan)
 run-recon -i domains.txt --screenshots         # httpx -ss / gowitness, each capture validated -> screenshots-<ts>/
@@ -168,7 +170,7 @@ run-recon -i domains.txt --monitor --monitor-prev old.csv --notify   # diff vs a
 run-recon -i domains.txt --all                           # full discovery + defensive set (see below)
 ```
 
-`--all` enables `--subs --resolve --certs --permute --brute --ports --js --crawlers-all --takeover --zone-exposure --screenshots --origin --active --activescan --osint --tls --ipv6 --enrich`. The remaining scanning stages (`--nuclei`, `--params`, `--secrets`, `--buckets`) and `--favicon` / `--vhost` / `--virustotal` / `--urlscan` / `--social` / `--monitor` stay opt-in. `--enrich` fetches the cloud IP-range feeds and makes per-IP RDAP lookups (passive, no packets to targets); `geo` still needs `--geodb`.
+`--all` enables `--subs --resolve --certs --permute --brute --ports --js --crawlers-all --takeover --zone-exposure --screenshots --origin --extras --active --activescan --osint --tls --ipv6 --enrich`. The remaining scanning stages (`--nuclei`, `--params`, `--secrets`, `--buckets`) and `--favicon` / `--vhost` / `--virustotal` / `--urlscan` / `--social` / `--monitor` stay opt-in. `--enrich` fetches the cloud IP-range feeds and makes per-IP RDAP and reverse-DNS lookups (passive, no packets to targets; PTR lookups of non-public addresses go only to resolvers you pass with `--resolvers`); `geo` still needs `--geodb`.
 
 ### Pipeline (per seed domain)
 
@@ -197,7 +199,7 @@ Active stages (5–8) are skipped under `--passive-only`; enrichment (7) is skip
 | `--permute` | permutations | alterx (+dnsx) | host rows (`alterx`) |
 | `--certs` | cert SAN/CN + feedback loop | tlsx | host rows (`tlsx`, `tlsx-live`) |
 | `--resolve` | DNS validation gate | dnsx | filters hosts |
-| `--favicon` | internet-scan pivot | uncover | host rows (`favicon`) |
+| `--favicon` | internet-scan pivot: certificates naming the seed, then hosts sharing a live host's favicon (Shodan/Fofa mmh3, Censys MD5) | uncover, tlsx | host rows (`favicon`), `.favicon.txt`; hits become `--origin` candidates |
 | ASN/CIDR seeds | range cert scan | asnmap, mapcidr, tlsx | seed hostnames |
 | `--ports` | port discovery | naabu | host:port → httpx |
 | `--crawlers-all` | extra crawl | gospider, hakrawler | URL rows |
@@ -206,13 +208,14 @@ Active stages (5–8) are skipped under `--passive-only`; enrichment (7) is skip
 | `--fuzz` | content discovery | feroxbuster/ffuf | URL rows |
 | `--vhost` | vhost bruteforce | ffuf | host rows (`vhost`) |
 | `--takeover` | dangling CNAME / takeover | dnsx (CNAMEs of every candidate) + subzy + nuclei `-tags takeover` | `.takeover.txt`, `.cname.tsv` |
+| `--extras` | robots.txt, security.txt, 404 probe, favicon hashes | httpx `-path` / `-favicon` | URL rows (`robots`), cols `robots`, `security_txt`, `favicon_*`, `.extras.txt` |
 | `--zone-exposure` | DNS zone exposure | dig: SOA/NS, AXFR per name server, NSEC walk, NSEC3PARAM | `.zone.txt`, `.zone-names.txt`; names join the candidates |
 | `--screenshots` | visual triage | httpx -ss (browser routed like httpx) / gowitness | `screenshots-<ts>/`, `.screenshots.tsv` (status per host) |
 | `--origin` | edge detection + origin search | httpx (headers, body hash, favicon), tlsx -jarm, cdncheck, dnsx, dig (SPF/MX), curl `--resolve` | `.origin.txt` (verified only), `.edge.tsv` |
 | `--tls` | TLS posture | tlsx + chain validation (Python `ssl`, system trust store) | CSV cols `tls_version`..`tls_flags` (joined to https rows) |
 | `--tls-full` | TLS + version/cipher enum | tlsx -version-enum -cipher-enum | adds `WeakTLS`/`WeakCipher` (noisier) |
 | `--ipv6` | AAAA resolution | dnsx -aaaa | CSV col `ipv6` (`;`-joined v6 addrs per host) |
-| `--enrich` | per-IP attribution | cloud IP-range feeds + RDAP + MaxMind | CSV cols `cloud`, `rdap_org`, `geo` |
+| `--enrich` | per-IP attribution | cloud IP-range feeds + RDAP + reverse DNS + MaxMind | CSV cols `cloud`, `rdap_org`, `ptr`, `geo` |
 | `--geodb PATH` | geo country source | mmdblookup (libmaxminddb) | sets `geo`; implies `--enrich` |
 | `--nuclei` | vuln/misconfig scan (callbacks off unless `--interactsh-server`) | nuclei | `.nuclei.txt` |
 | `--params` | hidden parameters | arjun | `.params.txt` |
@@ -256,6 +259,22 @@ Active stages (5–8) are skipped under `--passive-only`; enrichment (7) is skip
 | `rdap_org` | network/registrant org for the IP from RDAP (`--enrich`), e.g. `AMAZON-AES` |
 | `geo` | ISO-3166 country code for the IP (`--enrich --geodb`), e.g. `US` |
 | `cpe` | `;`-joined CPE 2.3 identifiers for the detected products (always on), e.g. `cpe:2.3:a:apache:http_server:2.4.41:*:*:*:*:*:*:*` |
+| `redirect_location` | the `Location` header of a redirect (always on; columns from here to `http_flags` come from the enrichment request's own headers and body, so they cost no extra request) |
+| `response_ms` | response time of that request, in milliseconds |
+| `body_sha256` | SHA-256 of the response body |
+| `content_type` | media type of the response, e.g. `text/html` |
+| `powered_by` | `X-Powered-By` header, e.g. `PHP/8.2.17` |
+| `auth` | `WWW-Authenticate` scheme and realm, e.g. `Basic realm="Legacy VPN"` |
+| `cookies` | names of the cookies the response sets (`;`-joined; values are never stored) |
+| `cookie_issues` | cookies without `Secure` or `HttpOnly`, e.g. `wordpress_test_cookie:no-HttpOnly` |
+| `missing_sec_headers` | for HTML responses: which of `Content-Security-Policy`, `X-Frame-Options` (satisfied by CSP `frame-ancestors`), `X-Content-Type-Options` and, on HTTPS, `Strict-Transport-Security` are absent |
+| `hsts_max_age` | `max-age` of the HSTS header (HTTPS only) |
+| `alt_svc` | `Alt-Svc` header (e.g. HTTP/3 advertised) |
+| `http_flags` | `CleartextAuth` (Basic/Digest over plain HTTP), `PlainHttp` (an HTML page served on plain HTTP without a redirect) |
+| `favicon_mmh3`, `favicon_md5` | the host's favicon hashes, Shodan-compatible mmh3 and MD5 (`--extras`, `--favicon` or `--origin`) |
+| `ptr` | reverse DNS of `ip` (`--enrich`) |
+| `robots` | robots.txt summary, e.g. `200 disallow=2 allow=0 sitemap=1` (`--extras`) |
+| `security_txt` | `present contact=… expires=…`, `expired …`, `missing` (`--extras`) |
 
 The `tls_*` columns are populated only for `https` rows when `--tls` is on (tlsx is matched to the row by
 `host:port`, default 443). They mirror WebInventory's TLS posture flags, and the HTML report surfaces each
@@ -319,7 +338,8 @@ reported as failed (not "passed"), and an NXDOMAIN seed is called out. Each seed
 none of its candidate names resolves, or when no name answers the live probe.
 
 Side files next to the CSV, by flag: `.takeover.txt` + `.cname.tsv` (`--takeover`), `.zone.txt` +
-`.zone-names.txt` (`--zone-exposure`), `.origin.txt` + `.edge.tsv` (`--origin`), `.screenshots.tsv` +
+`.zone-names.txt` (`--zone-exposure`), `.origin.txt` + `.edge.tsv` (`--origin`), `.extras.txt` (`--extras`),
+`.favicon.txt` (`--favicon`), `.screenshots.tsv` +
 `screenshots-<ts>/` (`--screenshots`), `.nuclei.txt`, `.params.txt`, `.secrets.txt`, `.buckets.txt`,
 `.cms.txt`, `.activescan.txt`, `.osint.txt`, `.virustotal.txt`, `.urlscan.txt`, `.social.txt`,
 `.new-assets.txt`, `.run.json` (always) and `.report.html`.
@@ -332,6 +352,22 @@ Side files next to the CSV, by flag: `.takeover.txt` + `.cname.tsv` (`--takeover
 | `nsec-zone-walkable [medium]` | the zone is signed with NSEC, so following the chain lists every name (capped at `ZONE_WALK_MAX`, default 5000) |
 | `nsec3-hashes-exposed [low]` | NSEC3: hashed names can be collected and cracked offline; the parameters (iterations, salt, opt-out) are recorded, nothing is cracked |
 | `zone-checked [info]` | none of the above: evidence that the check ran (signed or not, transfers refused on n/n servers) |
+
+**Extras findings** (`.extras.txt`, `--extras`). One `httpx -path` pass per seed requests `/robots.txt`,
+`/.well-known/security.txt` (then `/security.txt`) and one random path on every live root, as WebInventory's
+"safe extras" do. robots.txt `Disallow`/`Allow` paths (without wildcards) and sitemaps become URL rows with
+source `robots`, so they are probed and enriched like crawled URLs.
+
+| Finding | Meaning |
+|---|---|
+| `security-txt-expired [low]` | security.txt exists but its `Expires` date has passed (RFC 9116) |
+| `security-txt-invalid [low]` | security.txt has no `Expires` field |
+| `catch-all-200 [info]` | the random path answered 200: every crawled or fuzzed path on this host looks real (soft 404) |
+| `error-page [info]` | status, Server header and title of the 404 page; `reveals=` names a server version the page shows and the Server header does not |
+
+A missing security.txt is recorded in the `security_txt` column, not as a finding. Cost: two short httpx
+runs per seed (about 0.85 s of CPU each, mostly start-up), so seed-heavy runs pay most: +40 s on the
+50-seed farm (`BENCHMARK.md`).
 
 **Origin findings** (`.origin.txt`). For each live host, `--origin` records the edge in `.edge.tsv`
 (several `Server` headers such as `Caddy, nginx/1.21.6`, `Via`, CDN headers such as `cf-ray`, the cdncheck
@@ -680,6 +716,10 @@ the full checklist in `BENCHMARK.md`):
 except for dropped crawl junk (`…/%5C/…` URLs); `--tls` now validates certificate chains, which costs about
 2 s on the 50-seed farm (`TLS_CHAIN_CHECK=0` to skip). `./bench-run-recon.sh checks` runs the takeover, zone
 and origin fixtures end to end.
+
+**v1.19.0** (Batch 2): the 17 HTTP columns come from the request the enrichment pass already sends, so
+the default path stays as fast as v1.18.0 and every existing column is identical (lab and farm).
+`./bench-run-recon.sh checks` now also runs the `http` fixtures.
 
 The v1.16 speed-up is from not querying internet archives for special-use names such as `.test`,
 which cannot exist there. The lab also exposed nine accuracy bugs, all fixed in v1.16 (listed in

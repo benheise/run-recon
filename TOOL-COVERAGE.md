@@ -68,17 +68,17 @@ run-recon is an external attack-surface pipeline; WebInventory is an internal, a
 inventory. Some differences are by design. "Planned" items keep the default traffic unchanged and
 arrive behind a switch, as WebInventory's opt-in probes do.
 
-| WebInventory capability (product sheet §) | run-recon v1.17 (v1.18 changes in bold) | Status |
+| WebInventory capability (product sheet §) | run-recon v1.17 (v1.18 and v1.19 changes in bold) | Status |
 |---|---|---|
 | Fail-closed scope, `-Scope`, `-ListTargets` (A1) | per-seed scope filter on discovered names; no authorisation file, no dry run | **gap** (batch 4: `--scope FILE`, `--list-targets`) |
 | Connect scan, any-port HTTP/TLS detection (A2, A3) | naabu `--ports`, then httpx | parity in approach; naabu not yet lab-run |
-| HTTP fields (A4): FinalUrl, RedirectChain, Auth, Cookies, CookieFlagIssues, MissingSecHeaders, HstsMaxAge, AltSvc, BodySha256, ResponseMs | status, length, title, server, technologies | **gap** (batch 2: httpx `-location`, `-irh`, `-hash`, response time) |
-| Favicon mmh3 / MD5 (A5) | none (`--favicon` is an `ssl:` query) | **gap** (batch 2: httpx `-favicon`, real hash pivot via uncover) |
-| robots.txt, security.txt, 404 probe (A6) | none | **gap** (batch 2, opt-in) |
+| HTTP fields (A4): FinalUrl, RedirectChain, Auth, Cookies, CookieFlagIssues, MissingSecHeaders, HstsMaxAge, AltSvc, BodySha256, ResponseMs | status, length, title, server, technologies; **v1.19: `redirect_location`, `response_ms`, `body_sha256`, `content_type`, `powered_by`, `auth`, `cookies`, `cookie_issues`, `missing_sec_headers`, `hsts_max_age`, `alt_svc`, `http_flags` (`CleartextAuth`, `PlainHttp`), from the enrichment request itself (no extra traffic)** | parity except the followed redirect chain (per-URL `Location` only; each hop that was crawled has its own row) and password-form detection |
+| Favicon mmh3 / MD5 (A5) | **v1.19: `favicon_mmh3`, `favicon_md5` with `--extras`, `--favicon` or `--origin`; `--favicon` searches the hash on Shodan/Fofa (mmh3) and Censys (MD5) through uncover** | parity (opt-in here; on by default in WebInventory) |
+| robots.txt, security.txt, 404 probe (A6) | **v1.19: `--extras`: `robots` and `security_txt` columns, robots paths as URL rows, `security-txt-expired/invalid [low]`, `catch-all-200`, error-page versions** | parity (opt-in) |
 | OPTIONS / risky methods (A7), identification paths (A8) | nuclei tech templates under `--active` | partial |
 | TLS posture (A9): version matrix, ciphers, weak ciphers, key/sig strength, chain validation | negotiated version/cipher, expiry, self-signed, name mismatch; **v1.18: chain validation against the system trust store (`CertUntrusted`), `CertExpiring` at 30 days like `-CertWarnDays`** | partial: chain validation now at parity; version matrix and key/sig strength still to map |
 | SAN vhosts (A10) | SANs feed discovery (tlsx), vhost brute (`--vhost`) | different approach |
-| Reverse DNS (A11) | none | **gap** (batch 2: dnsx `-ptr`) |
+| Reverse DNS (A11) | **v1.19: `ptr` column under `--enrich`; non-public addresses asked only of your `--resolvers`** | parity (opt-in, as in WebInventory) |
 | Fingerprinting engine, CPEs (A12) | httpx tech detection (Wappalyzer data) + rule-based CPE emission (FPV-06) | parity for web; no Recog banners |
 | Version advisories (A13) | offline NVD/KEV/EPSS join (`recon-db.sh vulns`) | covered by the join |
 | JARM (B1) | tlsx `-jarm` under `--origin`, **v1.18: a host attribute in `<out>.edge.tsv`, no longer reported as an "exposed origin"** | parity; JA4S not planned (FoxIO licence) |
@@ -99,7 +99,7 @@ arrive behind a switch, as WebInventory's opt-in probes do.
 | Batch | Contents | Status |
 |---|---|---|
 | 1 | nuclei callbacks off by default; asnmap key check and visible errors; CNAME/dangling takeover check; katana honours `--resolvers`/`--proxy`; stdin closed for all tools; late HTTPS retry in the live probe; CSV formula guard; pinned tool versions with a lab-verified warning | **done in v1.17.0** |
-| 2 | httpx fields (final URL, redirect target, security headers, cookie flags, HSTS, Alt-Svc, body hash, response time, favicon mmh3) as appended CSV columns; real favicon pivot; reverse DNS; opt-in robots/security.txt | next |
+| 2 | httpx fields (final URL, redirect target, security headers, cookie flags, HSTS, Alt-Svc, body hash, response time, favicon mmh3) as appended CSV columns; real favicon pivot; reverse DNS; opt-in robots/security.txt | **done in v1.19.0** (see `PLAN.md`) |
 | 3 | Email and DNS posture (SPF, DMARC, MTA-STS, DNSSEC, CAA, dangling MX/NS); cloudlist inventory diff; tldfinder seed expansion; lab fixtures for naabu, alterx, shuffledns, cdncheck, uncover, notify | |
 | 4 | Evidence and history: scope file + dry run, run manifest and run.json, field-level delta, first/last seen in recon-db | run.json done in v1.18.0 |
 | report review | `REPORT-REVIEW.md`: `--zone-exposure`, verified `--origin`, screenshot routing and validation, run integrity (seed-resolving preflight, per-seed warnings, exit 3, run.json), report rebuild (names, cards, graded TLS), TLS chain validation, crawl-junk filter | **done in v1.18.0** |
