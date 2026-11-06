@@ -93,6 +93,10 @@ GO_TOOLS=(
   "github.com/projectdiscovery/cdncheck/cmd/cdncheck@v1.4.0|cdncheck"   # CDN/WAF provider tagging
   "github.com/projectdiscovery/uncover/cmd/uncover@v1.2.1|uncover"      # Shodan/Censys/Fofa pivot
   "github.com/projectdiscovery/notify/cmd/notify@v1.0.7|notify"         # monitoring notifications
+  # --- v1.20 additions (Batch 3) ---
+  "github.com/projectdiscovery/cloudlist/cmd/cloudlist@v1.5.1|cloudlist" # cloud inventory diff (--cloudlist)
+  "github.com/projectdiscovery/tldfinder/cmd/tldfinder@v0.0.2|tldfinder" # TLD variants (--tld-variants)
+  "github.com/projectdiscovery/vulnx/v2/cmd/vulnx@v2.0.2|vulnx"         # product advisories (--vulnx)
   "github.com/owasp-amass/amass/v4/...@v4.2.0|amass"                    # passive subdomains
   "github.com/tomnomnom/assetfinder@v0.1.1|assetfinder"                 # passive subdomains
   "github.com/PentestPad/subzy@v1.2.1|subzy"                            # subdomain takeover (lab)
@@ -752,7 +756,7 @@ PRESENT=""; MISSING=""
 for tool in gau waybackurls anew unfurl qsreplace gf httpx-toolkit katana subfinder dnsx \
             tlsx alterx nuclei hakrawler gospider ffuf subjs getJS urlfinder waymore \
             arjun uro dirsearch xnLinkFinder linkfinder secretfinder \
-            naabu shuffledns puredns massdns asnmap mapcidr cdncheck uncover notify \
+            naabu shuffledns puredns massdns asnmap mapcidr cdncheck uncover notify cloudlist tldfinder vulnx \
             amass assetfinder findomain subzy gowitness jsluice trufflehog \
             github-subdomains github-endpoints cloud_enum dnsvalidator \
             wpscan droopescan joomscan cmseek whatweb tookie-osint \

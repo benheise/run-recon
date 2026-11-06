@@ -36,7 +36,13 @@
 #                          LAB_PROTECTED_IP; wp.test not reported)
 #   http                   HTTP detail (1.19): security headers, HSTS, cookies, cleartext auth,
 #                          robots.txt / security.txt / 404 probe (--extras), favicon, PTR (--enrich)
-#   checks                 takeover + zone + origin + http; non-zero if any fails
+#   posture                --dns-posture against posture.test (permissive SPF, DMARC p=none,
+#                          MTA-STS testing, dangling MX and NS, a lame NS) and the clean
+#                          good.posture.test; --cloudlist against a lab Terraform state
+#   discovery              the discovery tools end to end: naabu (an alternate port), alterx
+#                          (--permute), shuffledns+massdns (--brute), cdncheck, uncover without
+#                          keys, and --monitor --notify to a local webhook
+#   checks                 takeover + zone + origin + http + posture + discovery; non-zero if any fails
 #   help
 #
 # Needs docker (+compose) and the run-recon toolchain for up/run/bench; compare
@@ -145,7 +151,12 @@ gen_lab(){ # <farm_n>
     printf 'direct.nginx.test. IN A %s\n' "$LAB_ORIGIN_IP"
     printf 'nginx.test. IN TXT "v=spf1 ip4:%s -all"\n' "$LAB_ORIGIN_IP"
     printf 'origin.spa.test. IN A %s\n' "$LAB_PROTECTED_IP"
+    # discovery fixtures: a name only alterx's permutations guess (--permute) and one only
+    # the lab wordlist holds (--brute)
+    printf 'grafana.nginx.test. IN A 127.0.0.1\nbackup-db.nginx.test. IN A 127.0.0.1\n'
   } > "$LAB/db.test"
+  printf 'www\nbackup-db\nnot-there-1\nnot-there-2\n' > "$LAB/brute-wordlist.txt"
+  printf 'nginx.test\n' > "$LAB/targets-discovery.txt"
   rm -f "$LAB/test.zone"
   # zone-exposure fixtures: names that no wordlist or passive source would find
   #   walk.test   DNSSEC-signed with NSEC  -> the chain can be walked
@@ -168,6 +179,38 @@ gen_lab(){ # <farm_n>
   done
   sign_zone walk.test 0
   sign_zone nsec3.test 1
+  # email/DNS posture fixtures (--dns-posture): posture.test gets everything wrong, its
+  # subdomain good.posture.test gets everything right
+  #   NS  ns.posture.test (CoreDNS, authoritative), ns-gone.nowhere.test (nowhere.test does
+  #       not exist: dangling), ns-lame.posture.test -> BIND, which refuses posture.test (lame)
+  #   MX  mx1.posture.test (exists), mx-old.gone-mail.test (gone-mail.test does not exist)
+  #   SPF include:_spf.posture.test +all; DMARC p=none without rua; MTA-STS testing whose
+  #   policy lists mx1 only; no TLS-RPT; CAA letsencrypt.org
+  {
+    printf '$ORIGIN posture.test.\n$TTL 60\n'
+    printf '@ IN SOA ns.posture.test. hostmaster.posture.test. %s 7200 3600 1209600 60\n' "$serial"
+    printf '@ IN NS ns.posture.test.\n@ IN NS ns-gone.nowhere.test.\n@ IN NS ns-lame.posture.test.\n'
+    printf 'ns IN A 127.0.0.1\nns-lame IN A %s\n@ IN A 127.0.0.1\nmx1 IN A 127.0.0.1\nmta-sts IN A 127.0.0.1\n' "$LAB_NSEC3_IP"
+    printf '@ IN MX 10 mx1.posture.test.\n@ IN MX 20 mx-old.gone-mail.test.\n'
+    printf '@ IN TXT "v=spf1 include:_spf.posture.test +all"\n_spf IN TXT "v=spf1 ip4:127.0.0.1 -all"\n'
+    printf '_dmarc IN TXT "v=DMARC1; p=none"\n_mta-sts IN TXT "v=STSv1; id=20261101"\n'
+    printf '@ IN CAA 0 issue "letsencrypt.org"\n'
+    printf 'good IN A 127.0.0.1\ngood IN MX 10 mx1.posture.test.\ngood IN TXT "v=spf1 mx -all"\n'
+    printf '_dmarc.good IN TXT "v=DMARC1; p=reject; rua=mailto:dmarc@posture.test"\n'
+    printf '_mta-sts.good IN TXT "v=STSv1; id=20261101"\nmta-sts.good IN A 127.0.0.1\n'
+    printf '_smtp._tls.good IN TXT "v=TLSRPTv1; rua=mailto:tlsrpt@posture.test"\n'
+  } > "$LAB/db.posture.test"
+  printf 'posture.test\ngood.posture.test\n' > "$LAB/targets-posture.txt"
+  # --cloudlist: a Terraform state (cloudlist's terraform provider reads it offline) with the
+  # ingress address the scan sees, and one the scan never finds
+  {
+    printf '{"version": 4, "terraform_version": "1.6.0", "serial": 1, "lineage": "run-recon-lab", "outputs": {},\n'
+    printf ' "resources": [\n'
+    printf '  {"mode": "managed", "type": "aws_instance", "name": "web", "instances": [{"attributes": {"id": "i-lab0001", "public_ip": "127.0.0.1"}}]},\n'
+    printf '  {"mode": "managed", "type": "aws_instance", "name": "forgotten", "instances": [{"attributes": {"id": "i-lab0002", "public_ip": "127.0.0.8"}}]}\n'
+    printf ' ]}\n'
+  } > "$LAB/cloud.tfstate"
+  printf -- '- provider: terraform\n  id: lab\n  tf_state_file: %s\n' "$LAB/cloud.tfstate" > "$LAB/cloudlist.yaml"
   printf 'walk.test\nxfr.test\nnsec3.test\nnginx.test\n' > "$LAB/targets-zone.txt"
   printf 'nginx.test\nalias.test\norphan.test\n' > "$LAB/targets-takeover.txt"
   printf 'nginx.test\nspa.test\nwp.test\n' > "$LAB/targets-origin.txt"
@@ -181,7 +224,7 @@ gen_lab(){ # <farm_n>
   # HTTP-detail check (bench-run-recon.sh http): the four sites, the cleartext-auth VPN and a
   # catch-all name from the walk.test zone
   printf 'nginx.test\nspa.test\nwp.test\nci.test\nvpn-legacy.walk.test\nwww.walk.test\n' > "$LAB/targets-http.txt"
-  log "generated: SPA (120 KB), farm of $n vhosts, zones db.test db.walk.test db.xfr.test db.nsec3.test db.127, targets and ground truth"
+  log "generated: SPA (120 KB), farm of $n vhosts, zones db.test db.walk.test db.xfr.test db.nsec3.test db.posture.test db.127, targets and ground truth"
 }
 
 # sign_zone ZONE NSEC3(0|1): DNSSEC-sign lab/db.ZONE into lab/db.ZONE.signed with
@@ -587,6 +630,101 @@ cmd_origin(){
   return "$fail"
 }
 
+# posture: the email/DNS posture fixtures (lab/db.posture.test, the MTA-STS policies in the
+# Caddyfile) and the cloud inventory diff against lab/cloud.tfstate (run-recon 1.20)
+cmd_posture(){
+  lab_env
+  [ -f "$RUN_RECON" ] || die "run-recon not found at $RUN_RECON"
+  [ -s "$LAB/targets-posture.txt" ] || die "no lab/targets-posture.txt (run: $0 up)"
+  local t; t="$(mktemp -d /tmp/bench-posture.XXXXXX)"
+  # MTA-STS policies are fetched with certificate checks; the lab's are issued by Caddy's local CA
+  export LAB_DNS_IP LAB_ORIGIN_IP LAB_PROTECTED_IP LAB_NSEC3_IP
+  compose -f "$COMPOSE_FILE" exec -T ingress cat /data/caddy/pki/authorities/local/root.crt > "$t/caddy-root.crt" 2>/dev/null
+  [ -s "$t/caddy-root.crt" ] || die "could not read the ingress's local CA (is the lab up?)"
+  local cl=(); if have cloudlist; then cl=(--cloudlist "$LAB/cloudlist.yaml"); else log "  skip cloudlist not installed: no cloud inventory check"; fi
+  log "email/DNS posture check against lab/targets-posture.txt -> $t"
+  ( cd "$t" && bash "$RUN_RECON" -i "$LAB/targets-posture.txt" -o "$t/p.csv" --resolvers "$RESOLVERS_FILE" \
+      --dns-posture --mta-sts-ca "$t/caddy-root.crt" "${cl[@]}" --no-report >"$t/run.out" 2>"$t/run.err" ) || true
+  local f="$t/p.csv.dnsposture.txt" v="$t/p.csv.dnsposture.tsv" fail=0
+  _ck(){ if grep -qE "$2" "$1" 2>/dev/null; then log "  ok   $3"; else log "  FAIL $3 (see $1, $t/run.err)"; fail=1; fi; }
+  _ck "$f" '^\[posture\.test\] spf-permissive \[high\] host=posture\.test all=\+all '                  "posture.test: SPF +all -> spf-permissive [high]"
+  _ck "$f" '^\[posture\.test\] dmarc-none \[low\] host=posture\.test '                               "posture.test: DMARC p=none -> dmarc-none [low]"
+  _ck "$f" '^\[posture\.test\] dmarc-no-rua \[info\] host=posture\.test '                            "posture.test: no rua -> dmarc-no-rua [info]"
+  _ck "$f" '^\[posture\.test\] mta-sts-testing \[info\] host=posture\.test '                         "posture.test: policy fetched over verified TLS, mode testing"
+  _ck "$f" '^\[posture\.test\] mta-sts-mx-mismatch \[medium\] host=posture\.test mx=mx-old\.gone-mail\.test ' "posture.test: an MX host the policy does not list"
+  _ck "$f" '^\[posture\.test\] tlsrpt-missing \[info\] host=posture\.test '                         "posture.test: no TLS-RPT"
+  _ck "$f" '^\[posture\.test\] mx-dangling \[high\] host=posture\.test mx=mx-old\.gone-mail\.test '  "posture.test: MX host whose domain does not exist -> mx-dangling [high]"
+  _ck "$f" '^\[posture\.test\] ns-dangling \[high\] host=posture\.test ns=ns-gone\.nowhere\.test '   "posture.test: NS host whose domain does not exist -> ns-dangling [high]"
+  _ck "$f" "^\\[posture\\.test\\] ns-lame \\[medium\\] host=posture\\.test ns=ns-lame\\.posture\\.test\\($(printf '%s' "$LAB_NSEC3_IP" | sed 's/\./\\./g')\\) reason=refused " "posture.test: BIND refuses the zone -> ns-lame [medium]"
+  if grep -qE 'caa-missing.*host=posture\.test|ns-lame.*ns=ns\.posture\.test' "$f" 2>/dev/null; then log "  FAIL posture.test: CAA present / CoreDNS authoritative, yet reported"; fail=1
+  else log "  ok   posture.test: CAA present and ns.posture.test authoritative: not reported"; fi
+  if grep -q 'host=good\.posture\.test' "$f" 2>/dev/null; then log "  FAIL good.posture.test reported: $(grep 'host=good\.posture\.test' "$f" | head -n 2 | tr '\n' ' ')"; fail=1
+  else log "  ok   good.posture.test (SPF mx -all, DMARC reject+rua, MTA-STS enforce, TLS-RPT): no finding"; fi
+  _ck "$v" '^good\.posture\.test	seed	posture\.test	mx1\.posture\.test	v=spf1 mx -all	-all	1	p=reject	enforce	yes	' "dnsposture.tsv: the clean name's row"
+  if [ "${#cl[@]}" -gt 0 ]; then
+    _ck "$t/p.csv.cloud.txt" '^\[cloud\] cloud-asset-unseen \[info\] host=127\.0\.0\.8 provider=terraform account=lab ' "cloudlist: an account's address the scan never saw -> cloud-asset-unseen"
+    _ck "$t/p.csv.cloud-assets.tsv" '^terraform	lab	[^	]*		127\.0\.0\.1	yes$'             "cloudlist: the ingress address is matched to the scan's inventory"
+  fi
+  [ "$fail" = 0 ] && log "posture check: PASS" || log "posture check: FAIL"
+  return "$fail"
+}
+
+# discovery: the discovery tools against the lab (run-recon 1.20). Run A is the baseline
+# inventory; run B adds --ports/--permute/--brute and --monitor --notify against run A, so the
+# alternate-port URL is a new asset and reaches a local webhook.
+cmd_discovery(){
+  lab_env
+  [ -f "$RUN_RECON" ] || die "run-recon not found at $RUN_RECON"
+  [ -s "$LAB/targets-discovery.txt" ] || die "no lab/targets-discovery.txt (run: $0 up)"
+  local t fail=0 port; t="$(mktemp -d /tmp/bench-discovery.XXXXXX)"
+  _ck(){ if grep -qE "$2" "$1" 2>/dev/null; then log "  ok   $3"; else log "  FAIL $3 (see $1)"; fail=1; fi; }
+  log "discovery check against lab/targets-discovery.txt -> $t"
+  ( cd "$t" && bash "$RUN_RECON" -i "$LAB/targets-discovery.txt" -o "$t/a.csv" --resolvers "$RESOLVERS_FILE" \
+      --resolve --no-report >"$t/a.out" 2>"$t/a.err" ) || true
+  # a local webhook (loopback, random port) that records what notify posts
+  port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+  python3 -I -c '
+import http.server, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        b = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        open(sys.argv[2], "ab").write(b + b"\n"); self.send_response(200); self.end_headers()
+    def log_message(self, *a): pass
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()' "$port" "$t/webhook.txt" &
+  local hook=$!
+  printf 'custom:\n  - id: lab\n    custom_webhook_url: http://127.0.0.1:%s/hook\n    custom_method: POST\n    custom_format: "{{data}}"\n    custom_headers:\n      Content-Type: text/plain\n' "$port" > "$t/notify.yaml"
+  ( cd "$t" && NOTIFY_CONFIG="$t/notify.yaml" bash "$RUN_RECON" -i "$LAB/targets-discovery.txt" -o "$t/b.csv" \
+      --resolvers "$RESOLVERS_FILE" --resolve --permute --brute --brute-wordlist "$LAB/brute-wordlist.txt" \
+      --ports --port-spec 80,443,8443 --origin --monitor --monitor-prev "$t/a.csv" --notify --no-report >"$t/b.out" 2>"$t/b.err" ) || true
+  sleep 1; kill "$hook" 2>/dev/null; wait "$hook" 2>/dev/null
+  if have naabu; then _ck "$t/b.csv" ',https://nginx\.test:8443(/[^,]*)?,nginx\.test,'        "naabu: the alternate port 8443 found and probed"
+  else log "  skip naabu not installed"; fi
+  if have alterx; then _ck "$t/b.csv" ',https?://grafana\.nginx\.test[^,]*,grafana\.nginx\.test,[^,]*alterx' "alterx (--permute): grafana.nginx.test guessed and validated"
+  else log "  skip alterx not installed"; fi
+  if have shuffledns && have massdns; then _ck "$t/b.csv" ',https?://backup-db\.nginx\.test[^,]*,backup-db\.nginx\.test,[^,]*bruteforce' "shuffledns+massdns (--brute): backup-db.nginx.test from the wordlist"
+  else log "  skip shuffledns+massdns not installed (massdns: build from github.com/blechschmidt/massdns)"; fi
+  if grep -qE 'grafana|backup-db|not-there' "$t/a.csv" 2>/dev/null; then log "  FAIL the baseline run found names only permutations or the wordlist hold"; fail=1
+  else log "  ok   the baseline run (no --permute/--brute) does not have them"; fi
+  if have cdncheck; then
+    _ck "$t/b.csv.edge.tsv" '^nginx\.test	nginx\.test	Caddy	nginx/[^	]*	[^	]*	[^	]*		'   "cdncheck: no CDN tag for the loopback edge"
+    # the same call origin_check makes, on a Cloudflare address (cdncheck's ranges are built in)
+    if echo 104.16.0.1 | cdncheck -resp -silent -nc 2>/dev/null | sed -E 's/\x1B\[[0-9;]*[A-Za-z]//g' | grep -q '^104\.16\.0\.1 .*\[cloudflare\]'; then
+      log "  ok   cdncheck: 104.16.0.1 tagged cloudflare in the format origin_check parses"
+    else log "  FAIL cdncheck output format changed (origin_check expects 'IP [type] [provider]')"; fail=1; fi
+  fi
+  _ck "$t/b.csv.new-assets.txt" '^https://nginx\.test:8443'                                    "--monitor: the alternate-port URL is a new asset vs run A"
+  if have notify; then _ck "$t/webhook.txt" 'new asset\(s\) vs a\.csv'                         "--notify: one message (-bulk) posted to the lab webhook (NOTIFY_CONFIG)"
+    _ck "$t/webhook.txt" 'https://nginx\.test:8443'                                            "--notify: the message lists the new asset"
+  else log "  skip notify not installed"; fi
+  if have uncover; then
+    mkdir -p "$t/nokeys"
+    HOME="$t/nokeys" uncover -q 'ssl:"nginx.test"' -silent -duc >/dev/null 2>"$t/uncover.err" || true
+    _ck "$t/uncover.err" 'requires keys but no keys'                                            "uncover without keys: the message run-recon turns into a warning"
+  fi
+  [ "$fail" = 0 ] && log "discovery check: PASS" || log "discovery check: FAIL"
+  return "$fail"
+}
+
 # http: the HTTP-detail fixtures in lab/Caddyfile and lab/db.127 (run-recon 1.19)
 cmd_http(){
   lab_env
@@ -645,13 +783,17 @@ cmd_checks(){
   cmd_zone || rc=1
   cmd_origin || rc=1
   cmd_http || rc=1
-  [ "$rc" = 0 ] && log "lab checks: PASS (takeover, zone, origin, http)" || log "lab checks: FAIL"
+  cmd_posture || rc=1
+  cmd_discovery || rc=1
+  [ "$rc" = 0 ] && log "lab checks: PASS (takeover, zone, origin, http, posture, discovery)" || log "lab checks: FAIL"
   return "$rc"
 }
 
 case "${1:-help}" in
   up)       shift; cmd_up "$@";;
   takeover) cmd_takeover;;
+  posture)  cmd_posture;;
+  discovery) cmd_discovery;;
   zone)     cmd_zone;;
   origin)   cmd_origin;;
   http)     cmd_http;;
@@ -662,5 +804,5 @@ case "${1:-help}" in
   compare)  shift; cmd_compare "$@";;
   bench)    shift; cmd_bench "$@";;
   help|-h|--help) sed -n '2,43p' "$0" | sed 's/^# \{0,1\}//';;
-  *) die "unknown command: ${1:-} (try: up|down|hosts|run|compare|bench|takeover|zone|origin|http|checks)";;
+  *) die "unknown command: ${1:-} (try: up|down|hosts|run|compare|bench|takeover|zone|origin|http|posture|discovery|checks)";;
 esac

@@ -85,6 +85,34 @@ http://vpn-legacy.walk.test {
 	respond "legacy VPN portal" 200
 }
 
+# --- an alternate port (--ports): nginx.test also answers on 8443 (127.0.0.1:8443) ---
+https://nginx.test:8443 {
+	respond "lab alternate-port service" 200
+}
+
+# --- MTA-STS policies (--dns-posture): posture.test in testing mode, listing only one of its
+# two MX hosts; good.posture.test enforced and complete ---
+https://mta-sts.posture.test {
+	handle /.well-known/mta-sts.txt {
+		header Content-Type "text/plain; charset=utf-8"
+		respond `version: STSv1
+mode: testing
+mx: mx1.posture.test
+max_age: 86400
+` 200
+	}
+}
+https://mta-sts.good.posture.test {
+	handle /.well-known/mta-sts.txt {
+		header Content-Type "text/plain; charset=utf-8"
+		respond `version: STSv1
+mode: enforce
+mx: mx1.posture.test
+max_age: 604800
+` 200
+	}
+}
+
 # --- the protected origin (origin.spa.test -> LAB_PROTECTED_IP:80 -> :8080) ---
 http://:8080 {
 	respond "direct access denied" 403

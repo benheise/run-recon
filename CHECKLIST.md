@@ -1339,3 +1339,49 @@ lab with the real tools. Numbers in `BENCHMARK.md` (v1.20 follow-ups section).
 - [x] Tests: 533 → **590/590** (origin candidates and reasons, ORIGIN_PORTS, range-cert, VT/urlscan history,
       zone AAAA/unreachable/walk-on/DS, gowitness, host-resolver-rules, edge list, dangling-CNAME warning, chain
       dedupe, extras single pass with link/data/HTML icons, CPE split, report).
+
+## v1.20.0 (unreleased) — Batch 3: email and DNS posture, cloud inventory, TLD variants, vulnx
+
+Tracked in `PLAN.md` (B3.1–B3.5), on `batch-3-email-dns` (stacked on the follow-ups). Every item has suite
+tests; B3.1, B3.2, B3.3 and B3.5 were checked against the lab with the real tools.
+
+- [x] **B3.1 `--dns-posture`** (in `--all`): per seed and zone apex, in the main process before the workers,
+      through your resolvers. SPF (`+all`/`?all`/no `all`, missing, multiple, more than 10 lookups following
+      `include:`/`redirect=`, an include with no record, an include of a domain that does not exist, `ptr`),
+      DMARC (own record or the organizational domain's, `sp=` for subdomains; missing, multiple, invalid,
+      `p=none`, `pct` < 100, no `rua`), MTA-STS (record, then the policy over HTTPS with certificate
+      verification and no redirects; `--mta-sts-ca FILE` adds a CA without disabling verification; not fetched
+      under `--passive-only`; testing/none/invalid modes, MX hosts the policy does not list), TLS-RPT, CAA at
+      the apex. Mail checks only for names with MX or SPF, and the apex; a name that sends no mail gets the
+      `[low]` advice (`v=spf1 -all`, `p=reject`). → `<out>.dnsposture.txt`, `<out>.dnsposture.tsv`.
+- [x] **B3.2 dangling MX/NS, lame NS**: MX and NS hosts that do not exist (`[high]` when their domain does not
+      exist either: whoever registers it takes the mail or the zone), MX hosts with no address, and lame
+      delegations (each name server asked `SOA +norec` directly: refused, failing, timing out or answering
+      without authority). If no name server answers from where the scan runs, one `ns-unreachable [info]`
+      line replaces a lame finding per server.
+- [x] **B3.3 `--cloudlist [CONFIG]`**: cloudlist lists your accounts' assets; `cloud-asset-unseen [info]` for an
+      asset the scan did not find (`scope=in` under a seed), `cloud-ip-unaccounted [low]` for an address in a
+      cloud provider's ranges (`--enrich`) that no listed account owns. Internal addresses are listed, not
+      reported. → `<out>.cloud.txt`, `<out>.cloud-assets.tsv`.
+- [x] **B3.4 `--tld-variants`** (tldfinder `-dm tld`): the seed's name under other TLDs with a `same_ns` ownership
+      hint; listed only, never in scope (it queries public DNS whatever `-r` says). **`--vulnx`** (vulnx 2.0.2):
+      for each product in the `cpe` column, the CVE and KEV counts and the top CVEs by EPSS, as `[info]` leads
+      (no version matching; the version-matched join stays `recon-db.sh vulns`). → `<out>.tld-variants.txt`,
+      `<out>.vulnx.txt`, `<out>.vulnx.tsv`.
+- [x] **B3.5 lab coverage** (`bench-run-recon.sh discovery`): naabu finds an alternate port (8443), alterx
+      guesses `grafana.nginx.test`, shuffledns + massdns find `backup-db.nginx.test` from the lab wordlist,
+      cdncheck's output format is the one `--origin` parses, uncover without keys gives the message run-recon
+      now turns into one warning, and `--monitor --notify` posts one message to a loopback webhook.
+- [x] **Found by the discovery check:** with `--ports`, `--origin` took the first https record of a host as its
+      reference, which could be another service on another port (`:8443`); it now prefers the default port.
+- [x] **notify**: one message per run (`-bulk`) with a summary line; `NOTIFY_CONFIG` → `-pc`; `--proxy` passed.
+- [x] **uncover without keys**: one warning ("uncover has no API keys for its engines") instead of an empty
+      result with no explanation.
+- [x] **Report**: "Email and DNS posture" table and posture findings in the findings table; cloud inventory
+      findings; vulnx advisories and TLD variants as context.
+- [x] **Lab**: `posture.test` (everything wrong) and `good.posture.test` (everything right) in a new zone, MTA-STS
+      policies on the ingress, a Terraform state for cloudlist, the 8443 port, the discovery names and wordlist;
+      `bench-run-recon.sh posture` and `discovery`, both in `checks`.
+- [x] **Setup**: cloudlist 1.5.1, tldfinder 0.0.2, vulnx 2.0.2 (`github.com/projectdiscovery/vulnx/v2`) pinned.
+- [x] **Checks:** suite 590 → **635/635**; `bench-run-recon.sh checks` **PASS** on all six fixtures; A/B vs the
+      follow-ups: lab identical; `--dns-posture` on the farm +0.8 s wall, +2.5 s CPU, CSV identical.

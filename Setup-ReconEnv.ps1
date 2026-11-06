@@ -12,7 +12,8 @@
          - Go tools -> /usr/local/bin: gau, waybackurls, httpx, katana, subfinder,
            dnsx, tlsx, alterx, nuclei, hakrawler, gospider, ffuf, subjs, getJS,
            urlfinder, anew, unfurl, qsreplace, gf, plus v1.4.0: naabu, shuffledns,
-           puredns, massdns, asnmap, mapcidr, cdncheck, uncover, notify, amass,
+           puredns, massdns, asnmap, mapcidr, cdncheck, uncover, notify, cloudlist,
+           tldfinder, vulnx, amass,
            assetfinder, findomain, subzy, gowitness, jsluice, trufflehog,
            github-subdomains, github-endpoints, cloud_enum, dnsvalidator,
            wpscan, droopescan, joomscan, cmseek, whatweb
@@ -226,6 +227,10 @@ goinstall github.com/projectdiscovery/mapcidr/cmd/mapcidr@v1.1.97       mapcidr
 goinstall github.com/projectdiscovery/cdncheck/cmd/cdncheck@v1.4.0     cdncheck
 goinstall github.com/projectdiscovery/uncover/cmd/uncover@v1.2.1       uncover
 goinstall github.com/projectdiscovery/notify/cmd/notify@v1.0.7         notify
+# --- v1.20 additions (Batch 3) ---
+goinstall github.com/projectdiscovery/cloudlist/cmd/cloudlist@v1.5.1   cloudlist
+goinstall github.com/projectdiscovery/tldfinder/cmd/tldfinder@v0.0.2   tldfinder
+goinstall github.com/projectdiscovery/vulnx/v2/cmd/vulnx@v2.0.2        vulnx
 goinstall github.com/owasp-amass/amass/v4/...@v4.2.0                   amass
 goinstall github.com/tomnomnom/assetfinder@v0.1.1                      assetfinder
 goinstall github.com/PentestPad/subzy@v1.2.1                           subzy
