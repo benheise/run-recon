@@ -122,6 +122,8 @@ RECON_DIR="$(dirname "$RECON_SELF")"
 : "${MONITOR_PREV:=}"      # prior CSV to diff against (default: newest recon-*.csv in out-dir)
 : "${NOTIFY:=0}"           # 1 = pipe the new-asset diff through 'notify' if configured
 : "${NOTIFY_CONFIG:=}"     # notify provider config (default: ~/.config/notify/provider-config.yaml)
+: "${CACHE_FRESH_ACTIVE:=}" # 1 = with --db, re-measure every target-facing result instead of reading it from the
+                           # cache (default: 1 under --monitor, so a change is seen the run it happens)
 : "${GITHUB:=0}"           # 1 = mine GitHub for subdomains + endpoints (needs a token)
 : "${GITHUB_TOKEN_FILE:=}" # file with GitHub token(s), 1/line; else env GITHUB_TOKEN is used
 : "${BUCKETS:=0}"          # 1 = cloud bucket enumeration (cloud_enum: S3/Azure/GCP) -> side artifact
@@ -296,7 +298,9 @@ cache_split() {
   local src="$1" keyf="$2" hitval="$3" misskeys="$4"
   : > "$hitval"; : > "$misskeys"
   [ -s "$keyf" ] || return 0
-  if [ "$USE_DB" != "1" ]; then cp "$keyf" "$misskeys"; return 0; fi
+  # every cache_split source is a target-facing result (probe, enrichment, crawl, ports,
+  # TLS, JARM): under --monitor they are measured afresh (CACHE_FRESH_ACTIVE) and only stored
+  if [ "$USE_DB" != "1" ] || [ "${CACHE_FRESH_ACTIVE:-0}" = 1 ]; then cp "$keyf" "$misskeys"; return 0; fi
   local pos="$keyf.pos" neg="$keyf.neg"
   db_cache_mget "$src" "$CACHE_TTL" "$keyf" > "$pos" 2>/dev/null || : > "$pos"
   db_cache_mget "${src}!neg" "$NEG_TTL" "$keyf" > "$neg" 2>/dev/null || : > "$neg"
@@ -645,7 +649,18 @@ stage() {
 # Pure string suffix match (no regex) so dotted domains can't over-match.
 # ---------------------------------------------------------------------------
 scope_filter() {
-  awk -v d="$1" '
+  # --scope exclusions (SCOPE_DENY: lines "name" = it and below, "*.name" = below only)
+  awk -v d="$1" -v sf="${SCOPE_DENY:-}" '
+    function denied(h,  s, i) {
+      s = h
+      while (1) {
+        if (s in dall) return 1
+        if (s != h && (s in dsub)) return 1
+        i = index(s, "."); if (i == 0) return 0
+        s = substr(s, i + 1)
+      }
+    }
+    BEGIN { nd = 0; if (sf != "") while ((getline l < sf) > 0) { if (substr(l, 1, 2) == "*.") dsub[substr(l, 3)] = 1; else dall[l] = 1; nd++ } }
     {
       u=$0
       h=u
@@ -655,10 +670,117 @@ scope_filter() {
       sub(/:[0-9]+$/,"",h)                          # strip :port
       hl=tolower(h)
       if (hl=="") next
+      if (nd && denied(hl)) next
       if (hl==d) { print u; next }
       suf="." d
       if (length(hl) > length(suf) && substr(hl, length(hl)-length(suf)+1)==suf) { print u }
     }'
+}
+
+# ---------------------------------------------------------------------------
+# --scope helpers. Names are held to the scope by scope_filter (exclusions; the seeds were
+# checked before the run started). Two more checks need data that only exists at run time:
+#   scope_addr_filter IN OUT SEED  names that resolve into an excluded range are dropped
+#                                  before anything connects to them (non-resolving names
+#                                  stay: the takeover check needs them)
+#   scope_ip_filter SEED KIND      addresses run-recon picks itself (internet-scan hits,
+#                                  origin candidates) must be inside an allowed range
+# Everything held back is recorded in parts/scopeskip.<seed>.tsv (-> <out>.scope.txt).
+# ---------------------------------------------------------------------------
+scope_addr_filter() {
+  local in="$1" out="$2" seed="$3" safe
+  if [ "${SCOPE_DENY_NETS:-0}" != 1 ] || [ ! -s "$in" ]; then
+    [ "$in" = "$out" ] || { cat "$in" > "$out" 2>/dev/null || : > "$out"; }
+    return 0
+  fi
+  safe="$(printf '%s' "$seed" | tr -c 'A-Za-z0-9.-' '_')"
+  local rf=(); [ -n "$RESOLVERS" ] && [ -s "$RESOLVERS" ] && rf=(-r "$RESOLVERS")
+  _to "$STAGE_TIMEOUT" dnsx -l "$in" -silent -json -a -aaaa "${rf[@]}" < /dev/null 2>/dev/null > "$in.scope.json" || true
+  if ! python3 - "$in" "$in.scope.json" "$SCOPE_DIR/nets.txt" "$out.scope.tmp" "$WORKDIR/parts/scopeskip.$safe.tsv" "$seed" <<'PYSAF'
+import sys, json, ipaddress
+inf, js, nets_f, out, skip, seed = sys.argv[1:7]
+deny = [ipaddress.ip_network(l.split()[1]) for l in open(nets_f) if l.startswith("deny ")]
+bad = {}
+for line in open(js, encoding="utf-8", errors="replace"):
+    try:
+        j = json.loads(line)
+    except Exception:
+        continue
+    if not isinstance(j, dict):
+        continue
+    h = str(j.get("host") or "").lower().rstrip(".")
+    for a in list(j.get("a") or []) + list(j.get("aaaa") or []):
+        try:
+            ip = ipaddress.ip_address(str(a))
+        except ValueError:
+            continue
+        if any(ip in n for n in deny):
+            bad.setdefault(h, str(ip))
+kept = [n.strip() for n in open(inf, encoding="utf-8", errors="replace") if n.strip() and n.strip().lower() not in bad]
+open(out, "w").write("".join(x + "\n" for x in kept))
+with open(skip, "a") as f:
+    for h, a in sorted(bad.items()):
+        f.write("\t".join([seed, "name", h, "address=" + a, "resolves into an excluded range"]) + "\n")
+PYSAF
+  then
+    # fail closed: a name whose addresses could not be checked is not contacted
+    warn "[$seed] --scope: could not check the names' addresses; $(grep -c . "$in" 2>/dev/null || echo 0) name(s) held back"
+    : > "$out"; rm -f "$in.scope.json" "$out.scope.tmp"; return 0
+  fi
+  mv "$out.scope.tmp" "$out"; rm -f "$in.scope.json"
+  return 0
+}
+
+scope_ip_filter() {
+  if [ "${SCOPE_ON:-0}" != 1 ]; then cat; return 0; fi
+  local safe; safe="$(printf '%s' "$1" | tr -c 'A-Za-z0-9.-' '_')"
+  python3 -c '
+import sys, ipaddress
+nets_f, skip, seed, kind = sys.argv[1:5]
+allow, deny = [], []
+for l in open(nets_f):
+    f = l.split()
+    if len(f) == 2:
+        (allow if f[0] == "allow" else deny).append(ipaddress.ip_network(f[1]))
+held = []
+for line in sys.stdin:
+    t = line.strip()
+    if not t:
+        continue
+    a = t[1:].split("]", 1)[0] if t.startswith("[") else (t if t.count(":") > 1 else t.split(":", 1)[0])
+    try:
+        ip = ipaddress.ip_address(a)
+    except ValueError:
+        held.append((t, "not an address")); continue
+    if any(ip in n for n in deny):
+        held.append((t, "inside an excluded range"))
+    elif any(ip in n for n in allow):
+        sys.stdout.write(t + "\n")
+    else:
+        held.append((t, "outside the allowed ranges"))
+with open(skip, "a") as f:
+    for t, why in held:
+        f.write("\t".join([seed, kind, t, "", why]) + "\n")
+' "$SCOPE_DIR/nets.txt" "$WORKDIR/parts/scopeskip.$safe.tsv" "$1" "$2" || true
+}
+
+# scope_url_regex: one katana -cs regex for the scope's allowed names (or, with address
+# exclusions, for the live hosts already checked), and one -cos regex for its exclusions
+scope_url_regex() {
+  local mode="$1" f="$2" any="" sub=""
+  [ -s "$f" ] || return 0
+  if [ "$mode" = hosts ]; then
+    any="$(sed -E 's/:[0-9]+$//' "$f" | sort -u | sed 's/\./\\./g' | paste -sd'|' -)"
+    [ -n "$any" ] && printf '^https?://(%s)(:[0-9]+)?([/?#]|$)' "$any"
+    return 0
+  fi
+  any="$(grep -v '^\*\.' "$f" | sed 's/\./\\./g' | paste -sd'|' -)"
+  sub="$(grep '^\*\.' "$f" | sed 's/^\*\.//; s/\./\\./g' | paste -sd'|' -)"
+  local alt=""
+  [ -n "$any" ] && alt="([^/?#@]*\\.)?($any)"
+  [ -n "$sub" ] && alt="${alt:+$alt|}[^/?#@]*\\.($sub)"
+  [ -n "$alt" ] && printf '^https?://(%s)(:[0-9]+)?([/?#]|$)' "$alt"
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -980,13 +1102,17 @@ PYON
   # 3. pair hosts with candidates and verify
   python3 - "$domain" "$ref" "$jarm" "$cdn" "$res" "$txt" "$etsv" "$cand" "$ORIGIN_MAX_CHECKS" "$raw/favicon_hits.txt" \
       "${dres#@}" "${RANGE_CERTS_FILE:-}" "$WORKDIR/parts/virustotal.$(printf '%s' "$domain" | tr -c 'A-Za-z0-9.-' '_').txt" \
-      "$WORKDIR/parts/urlscan.$(printf '%s' "$domain" | tr -c 'A-Za-z0-9.-' '_').txt" <<'PYOC' || true
+      "$WORKDIR/parts/urlscan.$(printf '%s' "$domain" | tr -c 'A-Za-z0-9.-' '_').txt" \
+      "$([ "${SCOPE_ON:-0}" = 1 ] && printf '%s' "$SCOPE_DIR/nets.txt")" \
+      "$WORKDIR/parts/scopeskip.$(printf '%s' "$domain" | tr -c 'A-Za-z0-9.-' '_').tsv" <<'PYOC' || true
 import sys, json, re, ipaddress, subprocess
 seed, ref, jarm_f, cdn_f, res_f, txt_f, etsv, cand_f, maxc = sys.argv[1:10]
 fav_f = sys.argv[10] if len(sys.argv) > 10 else ""
 resolver = sys.argv[11] if len(sys.argv) > 11 else ""
 range_f = sys.argv[12] if len(sys.argv) > 12 else ""
 hist_files = [x for x in sys.argv[13:15]]
+nets_f = sys.argv[15] if len(sys.argv) > 15 else ""
+skip_f = sys.argv[16] if len(sys.argv) > 16 else ""
 EDGE_HEADERS = [("cf-ray", "Cloudflare"), ("cf_ray", "Cloudflare"), ("x_amz_cf_id", "CloudFront"), ("x_amz_cf_pop", "CloudFront"),
                 ("x_served_by", "Fastly"), ("x_fastly_request_id", "Fastly"), ("akamai_grn", "Akamai"), ("x_akamai_transformed", "Akamai"),
                 ("x_azure_ref", "Azure Front Door"), ("x_msedge_ref", "Azure Front Door"), ("x_sucuri_id", "Sucuri"),
@@ -1130,6 +1256,24 @@ for hf in hist_files:
                 add(m.group(1), "history:virustotal")
     except (OSError, TypeError):
         pass
+# --scope: an address run-recon picked itself is contacted only inside the allowed ranges
+if nets_f:
+    allow, deny = [], []
+    for l in open(nets_f):
+        f = l.split()
+        if len(f) == 2:
+            (allow if f[0] == "allow" else deny).append(ipaddress.ip_network(f[1]))
+    held = []
+    for ip in sorted(cands):
+        a = ipaddress.ip_address(ip)
+        why = ("inside an excluded range" if any(a in x for x in deny) else
+               "" if any(a in x for x in allow) else "outside the allowed ranges")
+        if why:
+            held.append((ip, ",".join(sorted(cands.pop(ip))), why))
+    if held and skip_f:
+        with open(skip_f, "a") as o:
+            for ip, src, why in held:
+                o.write("\t".join([seed, "origin-candidate", ip, "via=" + src, why]) + "\n")
 pairs, n = [], 0
 for host, rs in sorted(refs.items()):
     edge_ips = {x["ip"] for x in rs if x["ip"]}
@@ -1285,11 +1429,13 @@ favicon_pivot() {
   done < <(cut -f2,3 "$fav" | sort -u)
   sort -u "$hits" -o "$hits"
   [ -s "$hits" ] && have tlsx || return 0
-  awk -F: '{ print $1 ":" ($2 == "" ? 443 : $2) }' "$hits" | sort -u > "$raw/favicon_hits_hp.txt"
+  awk -F: '{ print $1 ":" ($2 == "" ? 443 : $2) }' "$hits" | sort -u | scope_ip_filter "$domain" internet-scan-hit > "$raw/favicon_hits_hp.txt"
+  [ -s "$raw/favicon_hits_hp.txt" ] || return 0
   local ftl=(-l "$raw/favicon_hits_hp.txt" -san -cn -resp-only -silent -timeout 10)
   { [ -n "$RESOLVERS" ] && [ -s "$RESOLVERS" ]; } && ftl+=(-r "$RESOLVERS")
   _to "$STAGE_TIMEOUT" tlsx "${ftl[@]}" < /dev/null 2>/dev/null | scope_filter "$domain" | sort -u > "$raw/favpivot.raw" || : > "$raw/favpivot.raw"
   comm -13 <(sort -u "$raw/hosts.txt" 2>/dev/null) "$raw/favpivot.raw" > "$raw/favpivot.new" 2>/dev/null || cp "$raw/favpivot.raw" "$raw/favpivot.new"
+  scope_addr_filter "$raw/favpivot.new" "$raw/favpivot.new" "$domain"
   if [ "$RESOLVE" = "1" ] && [ -s "$raw/favpivot.new" ]; then
     resolve_hosts "$raw/favpivot.new" "$raw/host_faviconpivot.txt" "$domain"
   else
@@ -1660,7 +1806,7 @@ for ln in sys.stdin:
   if [ "$SCREENSHOTS" = "1" ] && [ -s "$livehosts" ]; then
     local _ssdir="$WORKDIR/screenshots"; mkdir -p "$_ssdir/screenshot"
     local _sstarget="$livehosts"
-    if [ "$USE_DB" = "1" ]; then
+    if [ "$USE_DB" = "1" ] && [ "${CACHE_FRESH_ACTIVE:-0}" != 1 ]; then
       local _ssmiss="$raw/ss_miss.txt"
       _ss_restore "$livehosts" "$_ssdir/screenshot" "$_ssmiss"   # cached PNGs -> run dir
       _sstarget="$_ssmiss"
@@ -1683,11 +1829,18 @@ for ln in sys.stdin:
         # your resolvers know (split horizon, the lab) failed to render, or rendered another
         # host. Chrome's --host-resolver-rules maps each name to the address those resolvers
         # gave, so the capture shows the host httpx probed.
-        if [ -n "$RESOLVERS" ] && [ -s "$RESOLVERS" ] && have dnsx; then
-          local _hrr
-          sed -E 's/:[0-9]+$//' "$_sstarget" | sort -u > "$raw/ss_names.txt"
-          _hrr="$(_to 60 dnsx -l "$raw/ss_names.txt" -a -json -silent -r "$RESOLVERS" < /dev/null 2>/dev/null | python3 -c '
-import sys, json, re
+        # Under --scope the same rules hold the browser to the scope: every name this seed
+        # knows (all in scope) is mapped, and "MAP * ~NOTFOUND" makes any other name (a
+        # redirect elsewhere, third-party assets) fail to resolve, so nothing outside the
+        # scope is contacted. The proxy's own name is excluded from the rules.
+        if { { [ -n "$RESOLVERS" ] && [ -s "$RESOLVERS" ]; } || [ "${SCOPE_ON:-0}" = 1 ]; } && have dnsx; then
+          local _hrr _hrf=() _hra=(-a)
+          [ -n "$RESOLVERS" ] && [ -s "$RESOLVERS" ] && _hrf=(-r "$RESOLVERS")
+          [ "${SCOPE_ON:-0}" = 1 ] && _hra+=(-aaaa)
+          { sed -E 's/:[0-9]+$//' "$_sstarget"; if [ "${SCOPE_ON:-0}" = 1 ]; then cat "$raw/hosts.txt" 2>/dev/null || true; fi; } | sort -u > "$raw/ss_names.txt"
+          _hrr="$(_to 60 dnsx -l "$raw/ss_names.txt" "${_hra[@]}" -json -silent "${_hrf[@]}" < /dev/null 2>/dev/null | python3 -c '
+import sys, json, re, os
+scoped = sys.argv[1] == "1"
 rules = []
 for line in sys.stdin:
     try:
@@ -1696,9 +1849,16 @@ for line in sys.stdin:
         continue
     h = str(j.get("host") or "").lower()
     a = [x for x in (j.get("a") or []) if isinstance(x, str) and re.fullmatch(r"[0-9.]{7,15}", x)]
-    if h and a and re.fullmatch(r"[a-z0-9_.-]{1,253}", h) and len(rules) < 2000:
-        rules.append("MAP %s %s" % (h, a[0]))
-print(", ".join(rules))' 2>/dev/null)" || _hrr=""
+    a6 = [x for x in (j.get("aaaa") or []) if isinstance(x, str) and re.fullmatch(r"[0-9a-fA-F:]{2,39}", x)] if scoped else []
+    if h and (a or a6) and re.fullmatch(r"[a-z0-9_.-]{1,253}", h) and len(rules) < 2000:
+        rules.append("MAP %s %s" % (h, a[0] if a else "[%s]" % a6[0]))
+if scoped:
+    rules.append("MAP * ~NOTFOUND")
+    for k in ("SS_PROXY_SERVER", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        m = re.match(r"^(?:[a-z][a-z0-9+.-]*://)?(?:[^@/]*@)?(\[[^\]]+\]|[^:/]+)", os.environ.get(k) or "", re.I)
+        if m and "EXCLUDE " + m.group(1) not in rules:
+            rules.append("EXCLUDE " + m.group(1))
+print(", ".join(rules))' "${SCOPE_ON:-0}" 2>/dev/null)" || _hrr=""
           [ -n "$_hrr" ] && _ssargs+=(-ho "--host-resolver-rules=$_hrr")
         fi
         _to "$STAGE_TIMEOUT" "$HTTPX_BIN" "${_ssargs[@]}" "${rr2[@]}" >/dev/null 2>>"$raw/ss.err" || true
@@ -1893,7 +2053,8 @@ cms_scan() {
     [ -z "$u" ] && continue
     fp=""
     if have whatweb; then
-      fp="$(_to "$STAGE_TIMEOUT" whatweb --no-errors --color=never "$u" 2>/dev/null || true)"
+      local _wwr=(); [ "${SCOPE_ON:-0}" = 1 ] && _wwr=(--follow-redirect=never)
+      fp="$(_to "$STAGE_TIMEOUT" whatweb --no-errors --color=never "${_wwr[@]}" "$u" 2>/dev/null || true)"
     elif have nuclei; then
       nuclei_oast_args
       fp="$(printf '%s\n' "$u" | _to "$STAGE_TIMEOUT" nuclei -tags tech -silent "${_NO[@]}" "${rr2[@]}" 2>/dev/null || true)"
@@ -1973,7 +2134,8 @@ cms_scan() {
   # --- generic/unknown: cmseek auto-detects many CMSs ---
   if [ -s "$ot" ] && have cmseek; then
     while IFS= read -r u; do [ -z "$u" ] && continue
-      _to "$STAGE_TIMEOUT" cmseek -u "$u" --follow-redirect 2>/dev/null < /dev/null \
+      local _cmr=(--follow-redirect); [ "${SCOPE_ON:-0}" = 1 ] && _cmr=()
+      _to "$STAGE_TIMEOUT" cmseek -u "$u" "${_cmr[@]}" 2>/dev/null < /dev/null \
         | grep -aiE 'detected|version|cms' | sed "s#^#[$domain] cmseek #" >> "$out" || true
     done < "$ot"
   fi
@@ -2190,6 +2352,8 @@ nuclei_oast_args(){
             if [ -n "${NUCLEI_ITOKEN:-}" ]; then _NO+=(-itoken "$NUCLEI_ITOKEN"); fi;;
     *)      _NO=(-ni);;
   esac
+  # --scope: a template's redirect could lead off the scope
+  if [ "${SCOPE_ON:-0}" = 1 ]; then _NO+=(-dr); fi
   return 0   # set -e: a false last test must not abort the worker
 }
 
@@ -2317,8 +2481,9 @@ process_one() {
 
   # cert SAN/CN harvest, phase 1: candidate hosts, pre-probe (tlsx)
   if [ "$CERTS" = "1" ] && have tlsx; then
+    scope_addr_filter "$hosts" "$hosts" "$domain"
     local _certc=0
-    if [ "$USE_DB" = "1" ]; then
+    if [ "$USE_DB" = "1" ] && [ "${CACHE_FRESH_ACTIVE:-0}" != 1 ]; then
       local _cc; _cc="$(db_cache_get certsan "$domain" "$CACHE_TTL" || true)"
       if [ -n "$_cc" ]; then printf '%s\n' "$_cc" > "$raw/host_tlsx.txt"; _certc=1; fi
     fi
@@ -2344,6 +2509,9 @@ process_one() {
     if grep -q 'requires keys but no keys' "$raw/uncover.err" 2>/dev/null && seen_once uncover nokeys; then
       warn "--favicon: uncover has no API keys for its engines (SHODAN_API_KEY, CENSYS_API_ID + CENSYS_API_SECRET, FOFA_KEY, or ~/.config/uncover/provider-config.yaml): the internet-scan pivot finds nothing"
     fi
+    if [ "${SCOPE_ON:-0}" = 1 ] && [ -s "$favips" ]; then
+      scope_ip_filter "$domain" internet-scan-hit < "$favips" > "$favips.in"; mv "$favips.in" "$favips"
+    fi
     if [ -s "$favips" ] && have tlsx; then
       local ftl=(-l "$favips" -san -cn -resp-only -silent -timeout 10)
       { [ -n "$RESOLVERS" ] && [ -s "$RESOLVERS" ]; } && ftl+=(-r "$RESOLVERS")
@@ -2358,11 +2526,13 @@ process_one() {
   # names harvested by --zone-exposure (AXFR / NSEC walk) at or under this seed
   if [ "$ZONE_EXPOSURE" = "1" ] && [ -s "$WORKDIR/zone_names.txt" ]; then
     awk -F'\t' -v d="$domain" '{ n=$2; if (n == d || (length(n) > length(d) && substr(n, length(n)-length(d)) == "." d)) print n }' \
-      "$WORKDIR/zone_names.txt" | sort -u > "$raw/host_zone.txt" || : > "$raw/host_zone.txt"
+      "$WORKDIR/zone_names.txt" | { if [ "${SCOPE_ON:-0}" = 1 ]; then scope_filter "$domain"; else cat; fi; } \
+      | sort -u > "$raw/host_zone.txt" || : > "$raw/host_zone.txt"
     [ -s "$raw/host_zone.txt" ] && log "[$domain] zone exposure: $(wc -l < "$raw/host_zone.txt" | tr -d ' ') name(s) from AXFR/NSEC added to the candidates"
     cat "$raw/host_zone.txt" >> "$hosts" 2>/dev/null || true
   fi
   sort -u "$hosts" -o "$hosts"
+  scope_addr_filter "$hosts" "$hosts" "$domain"
   # the takeover check needs every candidate, including names that no longer resolve
   # (a dangling CNAME returns NXDOMAIN), so keep the list from before the resolve gate
   [ "$TAKEOVER" = "1" ] && cp "$hosts" "$raw/hosts_all.txt" 2>/dev/null
@@ -2548,6 +2718,16 @@ process_one() {
           [ -n "$RESOLVERS" ] && [ -s "$RESOLVERS" ] && katargs+=(-r "$RESOLVERS")
           [ -n "$PROXY" ] && katargs+=(-proxy "$PROXY")
           [ "$FILTER_STATIC" = "1" ] && katargs+=(-ef "$STATIC_EXT")
+          # --scope: the crawl follows links only inside the scope (katana applies -cs on
+          # top of -fs rdn, and -cos before both); with address exclusions, only the live
+          # hosts already checked
+          if [ "${SCOPE_ON:-0}" = 1 ]; then
+            local _kcs _kcos
+            if [ "${SCOPE_DENY_NETS:-0}" = 1 ]; then _kcs="$(scope_url_regex hosts "$_khosts")"
+            else _kcs="$(scope_url_regex names "$SCOPE_DIR/allow_names.txt")"; fi
+            _kcos="$(scope_url_regex names "$SCOPE_DIR/deny_names.txt")"
+            katargs+=(-cs "${_kcs:-^$}"); [ -n "$_kcos" ] && katargs+=(-cos "$_kcos")
+          fi
           local _kfresh="$raw/kat_fresh.txt" _krc=0
           _to "$STAGE_TIMEOUT" katana "${katargs[@]}" 2>/dev/null > "$_kfresh" || _krc=$?
           cat "$_kfresh" >> "$k" 2>/dev/null || true
@@ -2570,6 +2750,13 @@ process_one() {
       have subjs && { cat "$live" | _to "$STAGE_TIMEOUT" subjs 2>/dev/null >> "$jsfiles" || true; }
       have getJS && { _to "$STAGE_TIMEOUT" getJS --input "$live" --complete 2>/dev/null >> "$jsfiles" || true; }
       sort -u "$jsfiles" -o "$jsfiles" 2>/dev/null || true
+      # --scope: xnLinkFinder fetches the JS files; only those on this seed's live hosts
+      if [ "${SCOPE_ON:-0}" = 1 ] && [ -s "$jsfiles" ]; then
+        awk 'FILENAME == ARGV[1] { h = $0; sub(/:[0-9]+$/, "", h); ok[tolower(h)] = 1; next }
+             { h = $0; sub(/^[A-Za-z][A-Za-z0-9+.-]*:\/\//, "", h); sub(/[\/?#].*$/, "", h); sub(/:[0-9]+$/, "", h); if (tolower(h) in ok) print }' \
+          "$livehosts" "$jsfiles" > "$jsfiles.in" 2>/dev/null || : > "$jsfiles.in"
+        mv "$jsfiles.in" "$jsfiles"
+      fi
       if [ -s "$jsfiles" ]; then
         have xnLinkFinder && { _to "$STAGE_TIMEOUT" xnLinkFinder -i "$jsfiles" -sf "$domain" -o cli 2>/dev/null | grep -oE 'https?://[^ ]+' >> "$js" || true; }
         cat "$jsfiles" >> "$js" || true   # the JS file URLs are themselves assets
@@ -2612,6 +2799,7 @@ process_one() {
            -mc 200,204,301,302,307,401,403 -t "$FUZZ_THREADS" -rate "$RATE" 2>/dev/null \
         | awk -v d="$domain" 'NF{print $0"."d}' | scope_filter "$domain" | sort -u \
         > "$raw/host_vhost.txt" || : > "$raw/host_vhost.txt"
+      scope_addr_filter "$raw/host_vhost.txt" "$raw/host_vhost.txt" "$domain"
     fi
 
     # cert feedback loop (phase 2): grab certs off the LIVE hosts, harvest new
@@ -2621,6 +2809,7 @@ process_one() {
       { [ -n "$RESOLVERS" ] && [ -s "$RESOLVERS" ]; } && tl2+=(-r "$RESOLVERS")
       _to "$STAGE_TIMEOUT" tlsx "${tl2[@]}" 2>>"$raw/tlsx.err" | scope_filter "$domain" | sort -u > "$raw/tlsxlive.raw" || : > "$raw/tlsxlive.raw"
       comm -13 <(sort -u "$hosts") <(sort -u "$raw/tlsxlive.raw") > "$raw/tlsxlive.new" 2>/dev/null || : > "$raw/tlsxlive.new"
+      scope_addr_filter "$raw/tlsxlive.new" "$raw/tlsxlive.new" "$domain"
       if [ "$RESOLVE" = "1" ] && [ -s "$raw/tlsxlive.new" ]; then
         resolve_hosts "$raw/tlsxlive.new" "$raw/host_tlsxlive.txt" "$domain"
       else
@@ -2838,6 +3027,22 @@ USAGE:
 REQUIRED:
   -i, --input FILE        Text file with one domain per line (# comments ok)
 
+SCOPE (checked before anything is sent):
+      --scope FILE        Hold the run to the names and ranges FILE allows (one entry per line, # comments):
+                            example.com      the name and every name under it
+                            *.example.com    the names under it, not example.com itself
+                            192.0.2.0/24     an address or CIDR (IPv4 or IPv6)    AS64500  an ASN
+                            !dev.example.com an exclusion (any form above, ! or -); exclusions win
+                          A seed outside the scope, an invalid input line or a malformed entry stops the
+                          run (exit 2). Discovered names outside it are dropped; names resolving into an
+                          excluded range are not contacted; addresses run-recon picks itself (--origin
+                          candidates, --favicon hits, range sweeps) are contacted only inside the allowed
+                          ranges; the crawl, nuclei (no redirects) and the screenshot browser stay inside
+                          it. What was held back -> <out>.scope.txt
+      --list-targets      Print the plan (each seed: in scope or why not) and exit; nothing is sent.
+                          Exit 0 if the run would start, 2 if it would refuse.
+      --drop-out-of-scope Skip out-of-scope and invalid seed lines (with a warning) instead of stopping.
+
 OUTPUT:
   -o, --output FILE       CSV output path (default: <out-dir>/recon-<timestamp>.csv)
   -D, --out-dir DIR       Working/output directory (default: ./recon-output)
@@ -2961,7 +3166,9 @@ ANALYSIS / TRIAGE (side artifacts written next to the CSV; not URL rows):
       --social-user NAME  Username to search with --social (instead of the domain-derived brand).
 
 MONITORING:
-      --monitor           Diff discovered URLs against a prior CSV  -> <out>.new-assets.txt
+      --monitor           Diff discovered URLs against a prior CSV  -> <out>.new-assets.txt, and each
+                          service field by field (new / removed / status, title, server, tech, CPE,
+                          redirect, auth, HTTP flags, address, TLS, certificate, favicon) -> <out>.delta.tsv
       --monitor-prev F    Prior CSV to diff against (default: newest recon-*.csv in out-dir).
       --notify            Pipe the new-asset list through 'notify' (if configured).
 
@@ -3010,6 +3217,10 @@ INPUT MODES:
       --fuzz-ext LIST     Extra extensions to probe, e.g. php,bak,json (default: none).
       --no-filter-static  Keep image/font/css URLs (default: filtered out).
       --keep-work         Do not delete the intermediate _work tree.
+      --resume            Continue an interrupted run (Ctrl-C, SIGTERM, a crash): run the SAME command
+                          again with --resume. The seeds that had finished are kept; the others and the
+                          main-process stages run again. Matched by the command line, the input and the
+                          scope file (hashes kept in the work dir's state file; no values are stored).
       --no-progress       Suppress stage timers and the progress heartbeat.
       --no-asn            Skip host IP + ASN resolution (leave ip/asn/asn_org columns blank).
       --limits FILE       Load per-source OSINT timeouts/delays from FILE (generate with
@@ -3045,14 +3256,17 @@ Side-artifact files (when the matching flag is set): <out>.takeover.txt, <out>.c
 <out>.screenshots.tsv, screenshots-<ts>/,
 <out>.nuclei.txt, <out>.params.txt, <out>.secrets.txt, <out>.buckets.txt, <out>.cms.txt,
 <out>.activescan.txt, <out>.osint.txt, <out>.virustotal.txt, <out>.urlscan.txt, <out>.social.txt,
-<out>.new-assets.txt. Always: <out>.run.json (version, command line, tool versions, per-seed counts,
-warnings, exit status) and <out>.report.html (unless --no-report).
+<out>.new-assets.txt, <out>.delta.tsv (--monitor), <out>.scope.txt (--scope). Always: <out>.run.json (version, command line, tool versions, per-seed counts,
+warnings, exit status), <out>.report.html (unless --no-report) and <out>.manifest.sha256 (SHA-256 of
+every file the run wrote; check with sha256sum -c).
 
-Exit status: 0 finished with results; 2 bad arguments or input; 3 finished with NO results (0 URL rows).
+Exit status: 0 finished with results; 2 bad arguments or input (or refused by --scope); 3 finished with
+NO results (0 URL rows); 130/143 interrupted by SIGINT/SIGTERM (resumable with --resume).
 EOF
 }
 
 INPUT=""
+SCOPE_FILE=""; LIST_TARGETS=0; DROP_OUT_OF_SCOPE=0; RESUME=0
 OUT_DIR="./recon-output"
 KEEP_WORK=0
 RESOLVERS_FILE=""
@@ -3062,6 +3276,10 @@ RUN_DNS_CHECK="not run"; RUN_EXIT=0
 while [ $# -gt 0 ]; do
   case "$1" in
     -i|--input)        INPUT="${2:?}"; shift 2;;
+    --scope)           SCOPE_FILE="${2:?}"; shift 2;;
+    --list-targets)    LIST_TARGETS=1; shift;;
+    --drop-out-of-scope) DROP_OUT_OF_SCOPE=1; shift;;
+    --resume)          RESUME=1; shift;;
     -o|--output)       OUTPUT="${2:?}"; shift 2;;
     -D|--out-dir)      OUT_DIR="${2:?}"; shift 2;;
     -t|--threads)      THREADS="${2:?}"; shift 2;;
@@ -3165,6 +3383,255 @@ if [ -z "$INPUT" ]; then err "Missing required --input FILE"; usage; exit 2; fi
 # so every tool started below inherits a closed stdin.
 exec < /dev/null
 if [ ! -f "$INPUT" ]; then err "Input file not found: $INPUT"; exit 2; fi
+
+# --- scope (--scope FILE) and the dry run (--list-targets) -------------------------
+# Before anything is sent: the scope file is parsed (a malformed entry stops the run),
+# every input line is classified (domain, ASN, IPv4 CIDR, or invalid) and every seed is
+# checked against the scope. An out-of-scope or invalid seed stops the run (exit 2)
+# unless --drop-out-of-scope; CIDR seeds lose the excluded addresses. The compiled scope
+# (allowed and excluded names, address ranges, ASNs) guides every later stage.
+# --list-targets prints the same plan and exits without sending anything.
+SCOPE_ON=0; SCOPE_DIR=""; SCOPE_TMP=""; SCOPE_DENY=""; SCOPE_DENY_NETS=0; INPUT_ORIG="$INPUT"
+if [ -n "$SCOPE_FILE" ] || [ "$LIST_TARGETS" = "1" ]; then
+  if ! have python3; then err "python3 is required"; exit 1; fi
+  if [ -n "$SCOPE_FILE" ] && [ ! -f "$SCOPE_FILE" ]; then err "Scope file not found: $SCOPE_FILE"; exit 2; fi
+  SCOPE_TMP="$(mktemp -d "${TMPDIR:-/tmp}/run-recon-scope.XXXXXX")" || { err "cannot create a temporary directory"; exit 1; }
+  trap '[ -n "${HEARTBEAT_PID:-}" ] && kill "$HEARTBEAT_PID" 2>/dev/null; [ -n "${SCOPE_TMP:-}" ] && rm -rf "$SCOPE_TMP"; true' EXIT
+  _scrc=0
+  python3 - "$INPUT" "${SCOPE_FILE:-}" "$SCOPE_TMP" "$DROP_OUT_OF_SCOPE" <<'PYSCOPE' || _scrc=$?
+import sys, os, re, json, hashlib, ipaddress
+inp, scope_f, outd, drop = sys.argv[1:5]
+NAME = re.compile(r"^[a-z0-9_]([a-z0-9_-]{0,62})(\.[a-z0-9_]([a-z0-9_-]{0,62}))*$")
+SEED_NAME = re.compile(r"^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$")   # the input normalizer's rule
+def w(name, lines):
+    with open(os.path.join(outd, name), "w", encoding="utf-8") as f:
+        f.write("".join(l + "\n" for l in lines))
+allow_n, deny_n, allow_net, deny_net, allow_as, deny_as, errors = [], [], [], [], set(), set(), []
+summary = {"file": scope_f, "sha256": "", "entries": 0}
+if scope_f:
+    data = open(scope_f, "rb").read()
+    summary["sha256"] = hashlib.sha256(data).hexdigest()
+    for no, line in enumerate(data.decode("utf-8", "replace").splitlines(), 1):
+        t = line.split("#", 1)[0].strip()
+        if not t:
+            continue
+        neg = t[0] in "!-"
+        v = t[1:].strip() if neg else t
+        low = v.lower().rstrip(".")
+        if re.fullmatch(r"(?i)as\d{1,10}", v):
+            (deny_as if neg else allow_as).add("AS%d" % int(v[2:]))
+        elif re.fullmatch(r"[0-9a-fA-F:.]+(/\d{1,3})?", v) and (":" in v or re.fullmatch(r"[0-9.]+(/\d{1,2})?", v) and v.count(".") == 3):
+            try:
+                net = ipaddress.ip_network(v, strict=True)
+            except ValueError as e:
+                try:
+                    fix = ipaddress.ip_network(v, strict=False)
+                    errors.append("line %d: %s has host bits set (did you mean %s?)" % (no, v, fix))
+                except ValueError:
+                    errors.append("line %d: %s is not a valid address or CIDR (%s)" % (no, v, e))
+                continue
+            (deny_net if neg else allow_net).append(net)
+        else:
+            sub = low.startswith("*.")
+            base = low[2:] if sub else low
+            if "://" in base or "/" in base or ":" in base or " " in base:
+                errors.append("line %d: %s: write a bare name (example.com, *.example.com), an address or CIDR, or an ASN" % (no, v))
+                continue
+            if not NAME.match(base) or len(base) > 253:
+                errors.append("line %d: %s is not a valid name" % (no, v))
+                continue
+            if "." not in base:
+                errors.append("line %d: %s is a whole top-level domain; list the domains you own" % (no, v))
+                continue
+            (deny_n if neg else allow_n).append(("*." if sub else "") + base)
+        summary["entries"] += 1
+    if not (allow_n or allow_net or allow_as) and not errors:
+        errors.append("the scope file allows nothing (only exclusions or comments)")
+if errors:
+    sys.stderr.write("scope file %s:\n" % scope_f + "".join("  %s\n" % e for e in errors))
+    sys.exit(2)
+def covers(entries, n):
+    for e in entries:
+        if e.startswith("*."):
+            if n.endswith("." + e[2:]):
+                return e
+        elif n == e or n.endswith("." + e):
+            return e
+    return ""
+def collapse(nets, v):
+    return list(ipaddress.collapse_addresses([x for x in nets if x.version == v]))
+A4, D4 = collapse(allow_net, 4), collapse(deny_net, 4)
+plan, seeds, seen = [], [], set()
+n_in = n_out = n_bad = 0
+for no, raw in enumerate(open(inp, encoding="utf-8", errors="replace").read().splitlines(), 1):
+    t = raw.replace("\r", "").split("#", 1)[0].strip()
+    if not t:
+        continue
+    show = t[:80]
+    compact = t.replace(" ", "")
+    kind = status = why = ""
+    if re.fullmatch(r"(?i)as\d{1,10}", compact):
+        kind, val = "asn", "AS%d" % int(compact[2:])
+        show = val
+        if val in seen:
+            continue
+        seen.add(val)
+        if not scope_f:
+            status, why = "in", "no --scope"
+        elif val in deny_as:
+            status, why = "out", "excluded by !" + val
+        elif val in allow_as:
+            status, why = "in", val
+        else:
+            status, why = "out", "no ASN entry for it"
+        if status == "in":
+            seeds.append(val)
+    elif re.fullmatch(r"([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}", compact):
+        kind, show = "cidr", compact
+        try:
+            net = ipaddress.ip_network(compact, strict=True)
+        except ValueError:
+            try:
+                fix = ipaddress.ip_network(compact, strict=False)
+                status, why = "invalid", "host bits set (did you mean %s?)" % fix
+            except ValueError:
+                status, why = "invalid", "not a valid CIDR"
+            net = None
+        if net is not None:
+            if str(net) in seen:
+                continue
+            seen.add(str(net))
+            if not scope_f:
+                status, why, keep = "in", "no --scope", [net]
+            else:
+                host = next((a for a in A4 if net.subnet_of(a)), None)
+                if host is None:
+                    status, why, keep = "out", "not inside an allowed range", []
+                else:
+                    keep = [net]
+                    for d in D4:
+                        nxt = []
+                        for r in keep:
+                            if r.subnet_of(d):
+                                continue
+                            if d.subnet_of(r):
+                                nxt.extend(r.address_exclude(d))
+                            else:
+                                nxt.append(r)
+                        keep = nxt
+                    keep = list(ipaddress.collapse_addresses(keep))
+                    if not keep:
+                        status, why = "out", "every address is excluded"
+                    elif keep == [net]:
+                        status, why = "in", str(host)
+                    else:
+                        status, why = "in", "%s, minus the exclusions: %d range(s) scanned" % (host, len(keep))
+            if status == "in":
+                seeds.extend(str(k) for k in keep)
+    else:
+        d = re.sub(r"^(https?://)?", "", t.lower())
+        d = re.sub(r"/.*$", "", d).strip()
+        if SEED_NAME.match(d):
+            kind, show = "domain", d
+            if d in seen:
+                continue
+            seen.add(d)
+            if not scope_f:
+                status, why = "in", "no --scope"
+            else:
+                den = covers(deny_n, d)
+                ok = covers(allow_n, d)
+                if den:
+                    status, why = "out", "excluded by !" + den
+                elif ok:
+                    status, why = "in", ok
+                else:
+                    status, why = "out", "no entry covers it"
+            if status == "in":
+                seeds.append(d)
+        else:
+            kind, status = "-", "invalid"
+            if re.fullmatch(r"[0-9.]+", compact) and compact.count(".") == 3:
+                why = "a bare address: write it as %s/32" % compact
+            elif ":" in compact and re.fullmatch(r"[0-9a-fA-F:./\[\]]+", compact):
+                why = "IPv6 seeds are not supported"
+            elif re.search(r":\d+$", d):
+                why = "a port is not part of a seed (--ports scans ports)"
+            else:
+                why = "not a domain, an ASN or an IPv4 CIDR"
+    if status == "in":
+        n_in += 1
+    elif status == "out":
+        n_out += 1
+    else:
+        n_bad += 1
+    plan.append("\t".join([str(no), show.replace("\t", " "), kind, status, why]))
+w("plan.tsv", plan)
+w("seeds.txt", seeds)
+w("allow_names.txt", allow_n)
+w("deny_names.txt", deny_n)
+w("nets.txt", ["allow %s" % n for n in allow_net] + ["deny %s" % n for n in deny_net])
+w("asns.txt", ["allow %s" % a for a in sorted(allow_as)] + ["deny %s" % a for a in sorted(deny_as)])
+summary.update({"allow_names": len(allow_n), "deny_names": len(deny_n), "allow_ranges": len(allow_net),
+                "deny_ranges": len(deny_net), "asns": len(allow_as), "deny_asns": len(deny_as),
+                "seeds_in": n_in, "seeds_out": n_out, "seeds_invalid": n_bad, "dropped": drop == "1" and (n_out + n_bad) > 0})
+json.dump(summary, open(os.path.join(outd, "summary.json"), "w"))
+if scope_f and (n_out or n_bad) and drop != "1":
+    sys.exit(3)
+if not seeds:
+    sys.exit(4)
+PYSCOPE
+  if [ "$_scrc" = 2 ]; then err "the scope file has errors (see above); nothing was sent."; exit 2; fi
+  _scsum="$(python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); print("%d entr%s (%d name(s), %d range(s), %d ASN(s); %d exclusion(s))" % (s["entries"], "y" if s["entries"]==1 else "ies", s["allow_names"], s["allow_ranges"], s["asns"], s["deny_names"]+s["deny_ranges"]+s["deny_asns"]))' "$SCOPE_TMP/summary.json" 2>/dev/null || echo '?')"
+  if [ "$LIST_TARGETS" = "1" ]; then
+    {
+      printf 'run-recon %s --list-targets: the plan; nothing is sent\n' "$VERSION"
+      printf 'input  : %s\n' "$INPUT"
+      if [ -n "$SCOPE_FILE" ]; then printf 'scope  : %s (sha256 %s): %s\n' "$SCOPE_FILE" "$(sha256sum "$SCOPE_FILE" | cut -c1-16)" "$_scsum"
+      else printf 'scope  : none (no --scope: every seed runs)\n'; fi
+      printf '\n%-6s %-40s %-7s %-13s %s\n' LINE SEED KIND STATUS WHY
+      awk -F'\t' '{ st = ($4 == "in") ? "in scope" : ($4 == "out") ? "OUT OF SCOPE" : "INVALID"
+                    printf "%-6s %-40s %-7s %-13s %s\n", $1, $2, $3, st, $5 }' "$SCOPE_TMP/plan.tsv"
+      _pin="$(awk -F'\t' '$4=="in"' "$SCOPE_TMP/plan.tsv" | wc -l | tr -d ' ')"
+      _pbad="$(awk -F'\t' '$4!="in"' "$SCOPE_TMP/plan.tsv" | wc -l | tr -d ' ')"
+      printf '\n%s seed(s) in scope' "$_pin"
+      if [ "$_pbad" -gt 0 ] && [ -n "$SCOPE_FILE" ] && [ "$DROP_OUT_OF_SCOPE" != 1 ]; then
+        printf ', %s out of scope or invalid: the run would REFUSE to start (--drop-out-of-scope skips them)\n' "$_pbad"
+      elif [ "$_pbad" -gt 0 ]; then printf ', %s skipped (out of scope or invalid)\n' "$_pbad"
+      else printf '\n'; fi
+      printf 'traffic: %s\n' "$([ "$PASSIVE_ONLY" = 1 ] && echo 'passive sources only (--passive-only): nothing is sent to the targets' || echo 'live probes and crawling of the names found under these seeds')"
+      if [ -n "$SCOPE_FILE" ]; then
+        printf 'scope  : names are kept to the allowed names minus the exclusions; addresses run-recon picks itself\n'
+        printf '         (origin candidates, internet-scan hits, range scans) only inside the allowed ranges\n'
+      fi
+      [ "${#RUN_ARGS[@]}" -gt 0 ] && printf 'options: %s\n' "$(printf '%s ' "${RUN_ARGS[@]}" | sed -E 's#(://)[^/@ ]*@#\1***@#g; s/ $//')"
+    }
+    _lrc=0
+    [ "$_scrc" = 3 ] && _lrc=2
+    [ "$_scrc" = 4 ] && _lrc=2
+    exit "$_lrc"
+  fi
+  if [ "$_scrc" = 3 ]; then
+    err "--scope $SCOPE_FILE: these seeds are not allowed (nothing was sent):"
+    awk -F'\t' '$4 != "in" { printf "  line %s: %s: %s: %s\n", $1, $2, ($4 == "out" ? "out of scope" : "invalid"), $5 }' "$SCOPE_TMP/plan.tsv" >&2
+    err "Fix the input or the scope file, check with --list-targets, or pass --drop-out-of-scope to skip them."
+    exit 2
+  fi
+  if [ "$_scrc" = 4 ]; then err "no seed left to run (see --list-targets)."; exit 2; fi
+  if [ "$_scrc" != 0 ]; then err "the scope check failed (python exit $_scrc); nothing was sent."; exit 2; fi
+  if [ -n "$SCOPE_FILE" ]; then
+    SCOPE_ON=1
+    INPUT="$SCOPE_TMP/seeds.txt"
+    if [ -s "$SCOPE_TMP/deny_names.txt" ]; then SCOPE_DENY=1; fi
+    grep -q '^deny ' "$SCOPE_TMP/nets.txt" 2>/dev/null && SCOPE_DENY_NETS=1
+    # an address exclusion keeps out every name that resolves into it: that needs dnsx
+    if [ "$SCOPE_DENY_NETS" = 1 ] && [ "$PASSIVE_ONLY" != 1 ] && ! have dnsx; then
+      err "--scope: the scope excludes addresses, and checking which names resolve into them needs dnsx (not installed). Nothing was sent."
+      exit 2
+    fi
+    awk -F'\t' '$4 != "in" { printf "--scope: skipped line %s: %s: %s: %s\n", $1, $2, ($4 == "out" ? "out of scope" : "invalid"), $5 }' "$SCOPE_TMP/plan.tsv" > "$SCOPE_TMP/dropped.txt"
+  fi
+fi
 
 # --- dependency check ------------------------------------------------------
 if ! have python3; then err "python3 is required (run the PowerShell setup first)"; exit 1; fi
@@ -3447,16 +3914,135 @@ if [ "$SOCIAL" = "1" ]; then
 fi
 
 # --- prepare working dirs --------------------------------------------------
+# The work dir holds a state file: what the run was started with (hashes of the command
+# line, the input and the scope file; no values) and whether it finished. A run that is
+# interrupted keeps its work dir; the same command with --resume continues it: the seeds
+# that finished are kept, the rest (and the main-process stages) run again.
 mkdir -p "$OUT_DIR"
-TS="$(date +%Y%m%d-%H%M%S)"
-WORKDIR="$(cd "$OUT_DIR" && pwd)/_work-$TS"
+RUN_ARGS_SHA="$(for _a in "${RUN_ARGS[@]}"; do [ "$_a" = --resume ] || printf '%s\0' "$_a"; done | sha256sum | cut -c1-64)"
+RUN_INPUT_SHA="$(sha256sum < "$INPUT_ORIG" | cut -c1-64)"
+RUN_SCOPE_SHA=-; [ -n "$SCOPE_FILE" ] && RUN_SCOPE_SHA="$(sha256sum < "$SCOPE_FILE" | cut -c1-64)"
+RESUMED=0; RESUME_DONE=0; RUN_SESSIONS=1
+# A running run holds a lock on its work dir (flock on state.lock, released when the run and
+# every process it started are gone, even after kill -9 or a reboot): --resume never takes
+# over a work dir that is still in use.
+if [ "$RESUME" = 1 ]; then
+  _rw=""; _rbusy=""
+  for _st in "$(cd "$OUT_DIR" && pwd)"/_work-*/state; do     # sorted: the newest match wins
+    [ -f "$_st" ] || continue
+    grep -qx 'status=complete' "$_st" && continue
+    grep -qx "args_sha256=$RUN_ARGS_SHA" "$_st" && grep -qx "input_sha256=$RUN_INPUT_SHA" "$_st" \
+      && grep -qx "scope_sha256=$RUN_SCOPE_SHA" "$_st" || continue
+    if have flock && ! ( flock -n 9 ) 9>>"$(dirname "$_st")/state.lock" 2>/dev/null; then _rbusy="$(dirname "$_st")"; continue; fi
+    _rw="$(dirname "$_st")"
+  done
+  if [ -z "$_rw" ] && [ -n "$_rbusy" ]; then
+    err "--resume: the run in $_rbusy is still running (its lock is held); stop it first."
+    exit 2
+  fi
+  if [ -z "$_rw" ]; then
+    err "--resume: no interrupted run in $OUT_DIR was started with this command line, this input and this scope."
+    err "  (Resume with exactly the original options; a finished run is not resumed.)"
+    exit 2
+  fi
+  if have flock; then exec 9>>"$_rw/state.lock"; flock -n 9 || { err "--resume: $_rw was taken by another process"; exit 2; }; fi
+  WORKDIR="$_rw"; TS="$(sed -n 's/^ts=//p' "$WORKDIR/state" | head -n 1)"
+  OUTPUT="$(sed -n 's/^output=//p' "$WORKDIR/state" | head -n 1)"
+  # keep what the finished seeds produced (done/, their parts and raw dirs, screenshots);
+  # everything else is rebuilt, so no stage appends to a half-written file
+  RESUME_DONE="$(python3 - "$WORKDIR" <<'PYRES'
+import os, re, shutil, sys
+wd = sys.argv[1]
+dd = os.path.join(wd, "done")
+done = set(os.listdir(dd)) if os.path.isdir(dd) else set()
+def rm(p):
+    if os.path.isdir(p) and not os.path.islink(p):
+        shutil.rmtree(p, ignore_errors=True)
+    else:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+for e in os.listdir(wd):
+    if e not in ("done", "parts", "raw", "screenshots", "state", "state.lock", "warnings.txt"):
+        rm(os.path.join(wd, e))
+for sub, pat in (("parts", r"^[^.]+\.(.+)\.[^.]+$"), ("raw", r"^(.+)$")):
+    d = os.path.join(wd, sub)
+    os.makedirs(d, exist_ok=True)
+    for e in os.listdir(d):
+        m = re.match(pat, e)
+        if not (m and m.group(1) in done):
+            rm(os.path.join(d, e))
+print(len(done))
+PYRES
+)" || { err "--resume: could not prepare $WORKDIR"; exit 1; }
+  RESUMED=1
+  RUN_SESSIONS=$(( $(grep -c '^session=' "$WORKDIR/state" || true) + 1 ))
+  sed -i 's/^status=.*/status=running/' "$WORKDIR/state"
+  printf 'session=%s\n' "$RUN_STARTED" >> "$WORKDIR/state"
+else
+  TS="$(date +%Y%m%d-%H%M%S)"
+  WORKDIR="$(cd "$OUT_DIR" && pwd)/_work-$TS"
+fi
 mkdir -p "$WORKDIR/raw" "$WORKDIR/parts"
+if [ "$RESUMED" = 0 ] && have flock; then exec 9>>"$WORKDIR/state.lock"; flock -n 9 || true; fi
+# the compiled scope moves into the work dir (workers read it there)
+if [ -n "$SCOPE_TMP" ]; then
+  mv "$SCOPE_TMP" "$WORKDIR/scope" && SCOPE_TMP=""
+  SCOPE_DIR="$WORKDIR/scope"
+  if [ "$SCOPE_ON" = 1 ]; then
+    INPUT="$SCOPE_DIR/seeds.txt"
+    [ "$SCOPE_DENY" = 1 ] && SCOPE_DENY="$SCOPE_DIR/deny_names.txt"
+    while IFS= read -r _l; do [ -n "$_l" ] && warn "$_l"; done < "$SCOPE_DIR/dropped.txt"
+    # stages that cannot be held to the scope
+    if [ "$CRAWLERS_ALL" = 1 ]; then
+      warn "--crawlers-all under --scope: gospider and hakrawler cannot be held to the scope, so they are skipped (katana still crawls, inside the scope)"
+      CRAWLERS_ALL=0
+    fi
+    if [ "$SCREENSHOTS" = 1 ]; then
+      if [ "$SCREENSHOT_TOOL" = gowitness ] || ! have "$HTTPX_BIN" || ! have dnsx; then
+        warn "--screenshots under --scope needs httpx and dnsx: the browser is held to the scope's names with Chrome host-resolver rules, which gowitness cannot take. No screenshots."
+        SCREENSHOTS=0
+      else
+        SCREENSHOT_TOOL=httpx
+      fi
+    fi
+  fi
+fi
 if [ -z "$OUTPUT" ]; then
   OUTPUT="$(cd "$OUT_DIR" && pwd)/recon-$TS.csv"
 else
   case "$OUTPUT" in /*) :;; *) OUTPUT="$(pwd)/$OUTPUT";; esac
   mkdir -p "$(dirname "$OUTPUT")"
 fi
+if [ "$RESUMED" = 0 ]; then
+  printf 'version=%s\nts=%s\noutput=%s\nargs_sha256=%s\ninput_sha256=%s\nscope_sha256=%s\nstatus=running\nsession=%s\n' \
+    "$VERSION" "$TS" "$OUTPUT" "$RUN_ARGS_SHA" "$RUN_INPUT_SHA" "$RUN_SCOPE_SHA" "$RUN_STARTED" > "$WORKDIR/state"
+fi
+# Ctrl-C / SIGTERM: stop every stage this run started, keep the work dir, say how to resume.
+# The whole tree is frozen first (a stopped process cannot start the next stage), listed
+# again (to catch a child forked meanwhile), then terminated and continued.
+_tree(){ local _c; for _c in $(pgrep -P "$1" 2>/dev/null); do printf '%s\n' "$_c"; _tree "$_c"; done; }
+_on_interrupt(){
+  trap - INT TERM
+  if have pgrep; then
+    local _p
+    _p="$(_tree $$)"
+    if [ -n "$_p" ]; then
+      # shellcheck disable=SC2086  # one PID per word
+      kill -STOP $_p 2>/dev/null || true; _p="$(_tree $$)"
+      # shellcheck disable=SC2086
+      { kill -STOP $_p; kill -TERM $_p; kill -CONT $_p; } 2>/dev/null || true
+    fi
+  fi
+  [ -n "${HEARTBEAT_PID:-}" ] && { kill "$HEARTBEAT_PID" 2>/dev/null || true; HEARTBEAT_PID=""; }
+  sed -i 's/^status=.*/status=interrupted/' "$WORKDIR/state" 2>/dev/null || true
+  err "interrupted: $(find "$WORKDIR/done" -type f 2>/dev/null | wc -l | tr -d ' ') of ${NDOM:-?} seed(s) had finished. The work so far is kept in $WORKDIR;"
+  err "  run the same command again with --resume to continue from there."
+  exit "$1"
+}
+trap '_on_interrupt 130' INT
+trap '_on_interrupt 143' TERM
 
 # --- detect ASN / CIDR seeds (expanded to hostnames after resolvers are set) --
 HAS_RANGES=0
@@ -3512,6 +4098,23 @@ sed 's/\r$//' "$INPUT" \
   | sed -E 's#^\s*(https?://)?##; s#/.*$##; s/^\s+//; s/\s+$//' \
   | grep -E '^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$' \
   | sort -u > "$DOMAINS_FILE" || true
+# lines that are neither a domain nor an ASN/CIDR seed were always dropped silently (counted
+# first, so a clean input costs no python start)
+_ign=""; _nin="$(sed 's/\r$//; s/#.*$//' "$INPUT" | grep -c '[^[:space:]]' || true)"
+_nrg="$(sed 's/\r$//; s/#.*$//' "$INPUT" | tr -d ' ' | grep -cE '^(AS[0-9]+|([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2})$' || true)"
+[ "${_nin:-0}" -gt $(( $(wc -l < "$DOMAINS_FILE") + ${_nrg:-0} )) ] && _ign="$(python3 -c '
+import re, sys
+bad = []
+for l in open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines():
+    t = l.replace("\r", "").split("#", 1)[0].strip()
+    if not t or re.fullmatch(r"AS[0-9]+|([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}", t.replace(" ", "")):
+        continue
+    d = re.sub(r"/.*$", "", re.sub(r"^\s*(https?://)?", "", t.lower())).strip()
+    if not re.fullmatch(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}", d):
+        bad.append(t[:60])
+if bad:
+    print("%d line(s): %s%s" % (len(bad), ", ".join(bad[:5]), ", ..." if len(bad) > 5 else ""))' "$INPUT" 2>/dev/null || true)"
+[ -n "$_ign" ] && warn "input: ignored $_ign (not a domain, an ASN or an IPv4 CIDR; --list-targets shows why)"
 
 # --- ASN/CIDR seed mode: expand owned ranges, cert-scan them for hostnames ---
 # For an asset owner this surfaces forgotten hosts no passive source will show.
@@ -3570,6 +4173,34 @@ if [ "$HAS_RANGES" = "1" ]; then
   have mapcidr && [ -s "$CIDRS" ] && { mapcidr -cl "$CIDRS" -aggregate -silent < /dev/null 2>/dev/null | sort -u > "$CIDRS.agg" && [ -s "$CIDRS.agg" ] && mv "$CIDRS.agg" "$CIDRS"; } || true
   rm -f "$CIDRS.agg"
   sort -u "$CIDRS" -o "$CIDRS" 2>/dev/null || true
+  # --scope: the excluded ranges are taken out of the sweep, and the ranges of the allowed
+  # ASNs (asnmap) become allowed addresses for the later stages (origin candidates, pivots)
+  if [ "$SCOPE_ON" = 1 ] && [ -s "$CIDRS" ]; then
+    python3 - "$CIDRS" "$SCOPE_DIR/nets.txt" <<'PYSCR' || { err "--scope: could not apply the exclusions to the ranges; nothing was scanned."; exit 2; }
+import sys, ipaddress
+cf, nf = sys.argv[1:3]
+deny = [ipaddress.ip_network(l.split()[1]) for l in open(nf) if l.startswith("deny ")]
+keep = []
+for l in open(cf):
+    t = l.strip()
+    if not t:
+        continue
+    parts = [ipaddress.ip_network(t, strict=False)]
+    for d in deny:
+        nxt = []
+        for r in parts:
+            if r.version != d.version or not r.overlaps(d):
+                nxt.append(r)
+            elif not r.subnet_of(d):
+                nxt.extend(r.address_exclude(d))
+        parts = nxt
+    keep.extend(parts)
+keep = list(ipaddress.collapse_addresses(keep))
+open(cf, "w").write("".join("%s\n" % k for k in keep))
+with open(nf, "a") as f:
+    f.write("".join("allow %s\n" % k for k in keep))
+PYSCR
+  fi
   EXPANDED="$WORKDIR/expanded_from_ranges.txt"; : > "$EXPANDED"
   # certificate-scan ports: 443 by default; with --ports, the same port list naabu uses
   if [ -z "$RANGE_TLS_PORTS" ]; then
@@ -3607,6 +4238,35 @@ for line in sys.stdin:
 open(sys.argv[1], "w").write("".join("%s\t%s\n" % p for p in sorted(pairs)))
 print("\n".join(sorted(names)))' "$RANGE_CERTS_FILE" | sort -u > "$EXPANDED" || : > "$EXPANDED"
   fi
+  # --scope: a name found on a range certificate becomes a seed only if the scope allows it
+  if [ "$SCOPE_ON" = 1 ] && [ -s "$EXPANDED" ]; then
+    python3 - "$EXPANDED" "$SCOPE_DIR" "$WORKDIR/parts/scopeskip._ranges.tsv" <<'PYSCN' || : > "$EXPANDED"
+import sys, os
+ef, sd, skip = sys.argv[1:4]
+def load(n):
+    return [l.strip() for l in open(os.path.join(sd, n)) if l.strip()]
+A, D = load("allow_names.txt"), load("deny_names.txt")
+def covers(es, n):
+    return next((e for e in es if (n.endswith("." + e[2:]) if e.startswith("*.") else (n == e or n.endswith("." + e)))), "")
+keep, held = [], []
+for l in open(ef):
+    n = l.strip().lower()
+    if not n:
+        continue
+    d = covers(D, n)
+    if d:
+        held.append((n, "excluded by !" + d))
+    elif covers(A, n):
+        keep.append(n)
+    else:
+        held.append((n, "not among the scope's names"))
+open(ef, "w").write("".join(n + "\n" for n in keep))
+with open(skip, "a") as f:
+    f.write("".join("\t".join(["ranges", "range-certificate-name", n, "", why]) + "\n" for n, why in held))
+PYSCN
+    _rh="$(cut -f3 "$WORKDIR/parts/scopeskip._ranges.tsv" 2>/dev/null | sort -u | grep -c . || true)"
+    [ "${_rh:-0}" -gt 0 ] && warn "--scope: $_rh name(s) on the ranges' certificates are not in the scope and were not added as seeds (listed in <out>.scope.txt)"
+  fi
   if [ -s "$EXPANDED" ]; then
     cat "$EXPANDED" >> "$DOMAINS_FILE"; sort -u "$DOMAINS_FILE" -o "$DOMAINS_FILE"
     ok "ASN/CIDR expansion: added $(wc -l < "$EXPANDED" | tr -d ' ') hostname(s) from cert scan of $(wc -l < "$CIDRS" | tr -d ' ') CIDR(s)."
@@ -3628,6 +4288,7 @@ log " EASM URL enumeration  |  v$VERSION"
 log " Authorization reminder: only assess assets you are permitted to."
 log "--------------------------------------------------------------"
 log " Input domains : $NDOM"
+log " Scope         : $([ "$SCOPE_ON" = 1 ] && echo "$SCOPE_FILE: ${_scsum:-}" || echo 'none (--scope FILE holds the run to a list)')"
 log " Threads       : $THREADS"
 log " Mode          : $([ "$PASSIVE_ONLY" = 1 ] && echo passive-only || { [ "$NO_VALIDATE" = 1 ] && echo 'crawl, no-validate' || echo 'passive + crawl + validate'; })"
 log " Subdomains    : $(onoff $DO_SUBS)    Deep(waymore): $(onoff $DEEP)    Rounds: $ROUNDS"
@@ -3763,6 +4424,11 @@ export RDAP_TIMEOUT RDAP_DELAY INTERNETDB_TIMEOUT INTERNETDB_DELAY VT_TIMEOUT VT
 export USE_DB CACHE_TTL RECON_DB_NAME RECON_DB_DSN PGDATABASE PGUSER PGHOST PGPORT PGPASSWORD
 export NEG_TTL CB_THRESHOLD CB_SERIALIZE PROXY HTTP_RETRIES LATE_RETRY SKIP_SPECIAL_USE NUCLEI_OAST NUCLEI_ISERVER ZONE_EXPOSURE DNS_POSTURE
 export CERT_WARN_DAYS TLS_CHAIN_CHECK EXTRAS FAVICON_LIMIT FAVICON_MAX_HASHES ORIGIN_PORTS RANGE_CERTS_FILE
+export SCOPE_ON SCOPE_DIR SCOPE_DENY SCOPE_DENY_NETS
+# --monitor compares with what the targets answer now: with --db, the cache still serves the
+# passive lookups (archives, subdomain sources, OSINT), never a probe result
+[ -z "$CACHE_FRESH_ACTIVE" ] && { [ "$MONITOR" = 1 ] && CACHE_FRESH_ACTIVE=1 || CACHE_FRESH_ACTIVE=0; }
+export CACHE_FRESH_ACTIVE
 # route GET-heavy stages (curl/whatweb/gau/wget/python) through the proxy if set;
 # ProjectDiscovery tools additionally get an explicit -proxy flag at their call sites.
 if [ -n "$PROXY" ]; then
@@ -3928,11 +4594,23 @@ if [ "$DNS_POSTURE" = "1" ]; then
   mkdir -p "$WORKDIR/parts"
   POSTURE_RES=""; [ -n "$RESOLVERS" ] && [ -s "$RESOLVERS" ] && POSTURE_RES="$(grep -vE '^\s*(#|$)' "$RESOLVERS" | head -n 1 | sed -E 's/:[0-9]+$//')"
   log "Email/DNS posture: $(grep -c . "$DOMAINS_FILE") seed(s) and their zones${POSTURE_RES:+ (resolver $POSTURE_RES)}"
-  python3 - "$DOMAINS_FILE" "$WORKDIR/parts/dnsposture.all.txt" "$WORKDIR/dnsposture.tsv" "$POSTURE_RES" "$MTA_STS_CA" "$PASSIVE_ONLY" <<'PYPOSTURE' 2>>"$WORKDIR/dnsposture.err" || warn "email/DNS posture check failed (see $WORKDIR/dnsposture.err)"
+  python3 - "$DOMAINS_FILE" "$WORKDIR/parts/dnsposture.all.txt" "$WORKDIR/dnsposture.tsv" "$POSTURE_RES" "$MTA_STS_CA" "$PASSIVE_ONLY" \
+      "$([ "$SCOPE_ON" = 1 ] && printf '%s' "$SCOPE_DIR")" <<'PYPOSTURE' 2>>"$WORKDIR/dnsposture.err" || warn "email/DNS posture check failed (see $WORKDIR/dnsposture.err)"
 import subprocess, sys, re, os
 from concurrent.futures import ThreadPoolExecutor
 seeds_f, out_f, tsv_f, resolver, cafile, passive = sys.argv[1:7]
+scope_d = sys.argv[7] if len(sys.argv) > 7 else ""
 res = ["@" + resolver] if resolver else []
+def _sload(n):
+    try:
+        return [l.strip() for l in open(os.path.join(scope_d, n)) if l.strip()]
+    except OSError:
+        return []
+S_ALLOW, S_DENY = (_sload("allow_names.txt"), _sload("deny_names.txt")) if scope_d else ([], [])
+def _covers(es, n):
+    return any((n.endswith("." + e[2:]) if e.startswith("*.") else (n == e or n.endswith("." + e))) for e in es)
+def in_scope(n):
+    return not scope_d or (_covers(S_ALLOW, n) and not _covers(S_DENY, n))
 FIND, ROWS = [], []
 def dig(name, typ, server=None, norec=False, t=3):
     """(status, answers, aa): status is NOERROR/NXDOMAIN/SERVFAIL/REFUSED/... or TIMEOUT;
@@ -4159,6 +4837,8 @@ def mail_checks(bracket, name, apex, row):
         row["mta_sts"] = "-"
     elif passive == "1":
         row["mta_sts"] = "record (policy not fetched: --passive-only)"
+    elif not in_scope("mta-sts." + name):
+        row["mta_sts"] = "record (policy not fetched: mta-sts.%s is outside --scope)" % name
     else:
         pol, why = mta_sts_policy(name)
         if pol is None:
@@ -4341,7 +5021,7 @@ PYTLD
 fi
 
 export -f _ss_norm 2>/dev/null || true
-export -f process_one special_use_domain nuclei_oast_args takeover_check origin_check missing_keys late_pause prep_file scope_filter resolve_hosts brute_subs analyze_hosts cms_scan activescan osint_scan uro_filter \
+export -f process_one special_use_domain nuclei_oast_args takeover_check origin_check missing_keys late_pause prep_file scope_filter scope_addr_filter scope_ip_filter scope_url_regex resolve_hosts brute_subs analyze_hosts cms_scan activescan osint_scan uro_filter \
           _to _delay fmt_hms stage log ok warn err have _c \
           cache_or_run cb_fail cb_open _cbdir _cbkey _serialized seen_once url_junk_filter 2>/dev/null || true
 
@@ -4364,17 +5044,31 @@ if [ "${PROGRESS:-1}" = "1" ] && [ "${HEARTBEAT:-0}" -gt 0 ] 2>/dev/null; then
         "$(_c $'\033[1;35m')" "$(_c $'\033[0m')" "$(fmt_hms $_el)" \
         "$(_c $'\033[2m')" "$_done" "$NDOMAINS" "$(_c $'\033[0m')" >&2
     done
-  ) &
+  ) 9>&- &   # without the work-dir lock: its sleep may outlive the run by a few seconds
   HEARTBEAT_PID=$!
 fi
 # make sure the ticker never outlives the run (WORKDIR cleanup stays with the
 # keep-work-aware logic at the end of the script)
-trap '[ -n "${HEARTBEAT_PID:-}" ] && kill "$HEARTBEAT_PID" 2>/dev/null || true' EXIT INT TERM
+trap '[ -n "${HEARTBEAT_PID:-}" ] && kill "$HEARTBEAT_PID" 2>/dev/null; [ -n "${SCOPE_TMP:-}" ] && rm -rf "$SCOPE_TMP"; true' EXIT
 
 # xargs runs the per-domain worker N at a time. Invoke via 'bash' explicitly so
 # this does not depend on the script's execute bit (survives Windows round-trips).
+TODO_FILE="$DOMAINS_FILE"
+if [ "$RESUMED" = 1 ]; then
+  TODO_FILE="$WORKDIR/todo.txt"
+  while IFS= read -r _d; do
+    [ -n "$_d" ] || continue
+    [ -e "$WORKDIR/done/$(printf '%s' "$_d" | tr -c 'A-Za-z0-9.-' '_')" ] || printf '%s\n' "$_d"
+  done < "$DOMAINS_FILE" > "$TODO_FILE"
+  RESUME_DONE=$(( NDOMAINS - $(grep -c . "$TODO_FILE" || true) ))
+  ok "--resume (session $RUN_SESSIONS): $RESUME_DONE of $NDOMAINS seed(s) had finished in $WORKDIR; running the other $(grep -c . "$TODO_FILE" || true)"
+fi
+# in the background, then wait: bash runs a trap (Ctrl-C, SIGTERM) only after a foreground
+# command ends, but interrupts a wait at once, so an interrupt stops the workers right away
 # shellcheck disable=SC2016
-cat "$DOMAINS_FILE" | xargs -P "$THREADS" -I{} bash "$SELF" --__worker {} || true
+cat "$TODO_FILE" | xargs -P "$THREADS" -I{} bash "$SELF" --__worker {} &
+WORKERS_PID=$!
+wait "$WORKERS_PID" || true
 
 if [ -n "$HEARTBEAT_PID" ]; then kill "$HEARTBEAT_PID" 2>/dev/null || true; HEARTBEAT_PID=""; fi
 if [ "${PROGRESS:-1}" = "1" ]; then
@@ -5329,6 +6023,39 @@ for kind in takeover origin extras favicon nuclei params secrets buckets cms act
     fi
   fi
 done
+# --scope: the seeds checked and everything held back (not contacted) -> <out>.scope.txt
+if [ "$SCOPE_ON" = 1 ] && [ -n "$SCOPE_DIR" ] && [ -d "$SCOPE_DIR" ]; then
+  python3 - "$SCOPE_DIR" "$WORKDIR" "$OUTPUT.scope.txt" <<'PYSCOUT' 2>/dev/null || warn " could not write $OUTPUT.scope.txt"
+import sys, os, json, glob
+sd, wd, out = sys.argv[1:4]
+s = json.load(open(os.path.join(sd, "summary.json")))
+lines = ["[scope] scope-file [info] file=%s sha256=%s entries=%d names=%d ranges=%d asns=%d exclusions=%d"
+         % (s["file"], s["sha256"], s["entries"], s["allow_names"], s["allow_ranges"], s["asns"],
+            s["deny_names"] + s["deny_ranges"] + s["deny_asns"])]
+for l in open(os.path.join(sd, "plan.tsv"), encoding="utf-8", errors="replace"):
+    f = l.rstrip("\n").split("\t")
+    if len(f) < 5:
+        continue
+    if f[3] == "in":
+        lines.append("[scope] seed-in-scope [info] seed=%s kind=%s line=%s entry=%s" % (f[1], f[2], f[0], f[4].replace(" ", "_")))
+    else:
+        lines.append("[scope] seed-skipped [info] seed=%s line=%s status=%s note=%s" % (f[1].replace(" ", "_"), f[0], f[3], f[4]))
+held = set()
+for p in sorted(glob.glob(os.path.join(wd, "parts", "scopeskip.*.tsv"))):
+    for l in open(p, encoding="utf-8", errors="replace"):
+        f = l.rstrip("\n").split("\t")
+        if len(f) >= 5:
+            held.add(tuple(f[:5]))
+for seed, kind, target, extra, why in sorted(held):
+    lines.append("[%s] scope-held-back [info] kind=%s target=%s%s note=not contacted: %s"
+                 % (seed, kind, target, (" " + extra) if extra else "", why))
+open(out, "w").write("".join(x + "\n" for x in lines))
+PYSCOUT
+  if [ -s "$OUTPUT.scope.txt" ]; then
+    _sh="$(grep -c ' scope-held-back ' "$OUTPUT.scope.txt" || true)"
+    ok " scope           : $OUTPUT.scope.txt (${_sh:-0} target(s) held back, not contacted)"
+  fi
+fi
 # edge / origin attributes from --origin (one row per live host)
 if ls "$WORKDIR"/parts/edge.*.tsv >/dev/null 2>&1; then
   { printf 'seed_domain\thost\tedge\torigin_software\tedge_evidence\tjarm\tcdn\tfavicon_mmh3\ttitle\tedge_ip\n'
@@ -5605,12 +6332,28 @@ if [ "$MONITOR" = "1" ]; then
     comm -13 <(tail -n +2 "$PREV" 2>/dev/null | cut -d, -f2 | sort -u) \
              <(tail -n +2 "$OUTPUT" 2>/dev/null | cut -d, -f2 | sort -u) > "$NEWASSETS" 2>/dev/null || : > "$NEWASSETS"
     NN="$(wc -l < "$NEWASSETS" | tr -d ' ')"
+    # field by field, per service (recon-db.sh diff): <out>.delta.tsv
+    _dline=""
+    if [ "$RECON_DB_LIB_LOADED" = 1 ] && declare -F db_diff >/dev/null; then
+      if db_diff "$PREV" "$OUTPUT" -o "$OUTPUT.delta.tsv" --new-seeds "$DOMAINS_FILE" 2>"$WORKDIR/delta.err"; then
+        IFS=$'\t' read -r _dn _dr _dc _df _dso _dsn <<< "${DIFF_SUMMARY:-}"
+        _dline="$_dn new, $_dr removed, $_dc changed service(s) ($_df field change(s))"
+        ok " Changes         : $_dline vs $(basename "$PREV") -> $OUTPUT.delta.tsv"
+        [ "${_dso:--}" != - ] && warn " --monitor: seed(s) only in $(basename "$PREV") were not compared: $_dso"
+      else
+        warn " --monitor: the field-by-field comparison failed (see $WORKDIR/delta.err)"
+      fi
+    else
+      warn " --monitor: recon-db.sh not found next to run-recon; no field-by-field comparison (<out>.delta.tsv)"
+    fi
     if [ "$NN" -gt 0 ]; then
       ok " Monitoring      : $NN new asset(s) vs $(basename "$PREV") -> $NEWASSETS"
       if [ "$NOTIFY" = "1" ] && have notify; then
         # one message per run (-bulk), to the providers in NOTIFY_CONFIG when set
         _nf=(-silent -bulk); [ -n "$NOTIFY_CONFIG" ] && _nf+=(-pc "$NOTIFY_CONFIG"); [ -n "$PROXY" ] && _nf+=(-proxy "$PROXY")
-        { printf 'run-recon: %s new asset(s) vs %s\n' "$NN" "$(basename "$PREV")"; cat "$NEWASSETS"; } \
+        { printf 'run-recon: %s new asset(s) vs %s\n' "$NN" "$(basename "$PREV")"
+          [ -n "$_dline" ] && printf 'services: %s (see %s)\n' "$_dline" "$(basename "$OUTPUT").delta.tsv"
+          cat "$NEWASSETS"; } \
           | _to 60 notify "${_nf[@]}" >/dev/null 2>>"$WORKDIR/notify.err" || warn " --notify: notify failed (see $WORKDIR/notify.err)"
       fi
     else
@@ -5623,7 +6366,7 @@ fi
 
 # --- persist this run's host inventory into the DB (for later reference) ----
 if [ "$USE_DB" = "1" ]; then
-  if db_load_csv "$OUTPUT" "$TS"; then
+  if db_load_csv "$OUTPUT" "$TS" "$DOMAINS_FILE"; then
     ok " DB store        : loaded $RES_ROWS host row(s) into recon_hosts (run_ts=$TS)."
   else
     warn " DB store: could not load the CSV into recon_hosts (continuing)."
@@ -5638,7 +6381,8 @@ RUN_T1="$(date +%s 2>/dev/null || echo 0)"
 cat "$WORKDIR"/parts/seedstat.*.tsv 2>/dev/null > "$WORKDIR/seedstat.tsv" || : > "$WORKDIR/seedstat.tsv"
 RUN_RESOLVERS_N=0; [ -n "$RESOLVERS" ] && [ -s "$RESOLVERS" ] && RUN_RESOLVERS_N="$(grep -cvE '^\s*(#|$)' "$RESOLVERS" || true)"
 if [ "${#RUN_ARGS[@]}" -gt 0 ]; then printf '%s\0' "${RUN_ARGS[@]}" > "$WORKDIR/run_args.bin"; else : > "$WORKDIR/run_args.bin"; fi
-RR_VERSION="$VERSION" RR_STARTED="$RUN_STARTED" RR_DURATION="$(( RUN_T1 - RUN_T0 ))" RR_INPUT="$INPUT" \
+RR_SCOPE_DIR="$([ "$SCOPE_ON" = 1 ] && printf '%s' "$SCOPE_DIR")" RR_SESSIONS="$RUN_SESSIONS" RR_REUSED="$RESUME_DONE" \
+RR_VERSION="$VERSION" RR_STARTED="$RUN_STARTED" RR_DURATION="$(( RUN_T1 - RUN_T0 ))" RR_INPUT="$INPUT_ORIG" \
 RR_NDOM="${NDOM:-0}" RR_TOOLVERS="${_tvline:-}" RR_LABVER="${LAB_VERIFIED:-}" RR_RESOLVERS="$RESOLVERS" \
 RR_RESOLVERS_N="$RUN_RESOLVERS_N" RR_DNS_CHECK="$RUN_DNS_CHECK" RR_PROXY="$PROXY" RR_SS_CHROME="$SS_CHROME" \
 RR_SS_PROXY="$SS_PROXY_SERVER" RR_SS_BYPASS="$SS_PROXY_BYPASS" RR_ROWS="$RES_ROWS" RR_EXIT="$RUN_EXIT" \
@@ -5658,7 +6402,7 @@ for line in open(os.path.join(wd, "seedstat.tsv"), encoding="utf-8", errors="rep
     if len(f) >= 4:
         seeds.append({"seed": f[0], "candidates": num(f[1]), "resolved": num(f[2]), "live_hosts": num(f[3])})
 arts = {}
-for k in ("takeover", "origin", "zone", "dnsposture", "cloud", "tld-variants", "vulnx", "extras", "favicon", "nuclei",
+for k in ("scope", "takeover", "origin", "zone", "dnsposture", "cloud", "tld-variants", "vulnx", "extras", "favicon", "nuclei",
           "params", "secrets", "buckets", "cms", "activescan", "osint", "virustotal", "urlscan", "social"):
     p = "%s.%s.txt" % (out, k)
     if os.path.isfile(p):
@@ -5666,7 +6410,7 @@ for k in ("takeover", "origin", "zone", "dnsposture", "cloud", "tld-variants", "
 for k, p in (("edge_hosts", out + ".edge.tsv"), ("cname_names", out + ".cname.tsv"),
              ("zone_names", out + ".zone-names.txt"), ("screenshots", out + ".screenshots.tsv"),
              ("dnsposture_names", out + ".dnsposture.tsv"), ("cloud_assets", out + ".cloud-assets.tsv"),
-             ("vulnx_cves", out + ".vulnx.tsv")):
+             ("vulnx_cves", out + ".vulnx.tsv"), ("delta_changes", out + ".delta.tsv")):
     if os.path.isfile(p):
         arts[k] = max(0, sum(1 for l in open(p, encoding="utf-8", errors="replace") if l.strip()) - 1)
 warns = []
@@ -5694,7 +6438,20 @@ rec = {
     "url_rows": num(E("RR_ROWS")) or 0, "artifacts": arts,
     "warnings": warns[:200], "warnings_total": len(warns),
     "exit_status": num(E("RR_EXIT")) or 0,
+    "sessions": num(E("RR_SESSIONS")) or 1, "seeds_resumed": num(E("RR_REUSED")) or 0,
 }
+sd = E("RR_SCOPE_DIR") or ""
+if sd and os.path.isfile(os.path.join(sd, "summary.json")):
+    sc = json.load(open(os.path.join(sd, "summary.json")))
+    held = {}
+    p = out + ".scope.txt"
+    if os.path.isfile(p):
+        for l in open(p, encoding="utf-8", errors="replace"):
+            m = re.search(r" scope-held-back \[info\] kind=(\S+)", l)
+            if m:
+                held[m.group(1)] = held.get(m.group(1), 0) + 1
+    sc["held_back"] = held
+    rec["scope"] = sc
 with open(out + ".run.json", "w", encoding="utf-8") as f:
     json.dump(rec, f, indent=2)
     f.write("\n")
@@ -5717,6 +6474,50 @@ if [ "$REPORT" = "1" ]; then
   fi
 fi
 
+# --- manifest: SHA-256 of every file this run wrote ------------------------------
+# <out>.manifest.sha256, in sha256sum's own format with paths relative to the CSV's
+# directory, so `cd <dir> && sha256sum -c <out>.manifest.sha256` verifies the set later.
+# "Written by this run" = the CSV, <out>.* and screenshots-<ts>/ modified since the run
+# started; an older file with the same prefix (an earlier run with the same -o) is left
+# out and named, so the manifest never vouches for something this run did not produce.
+_man="$(RR_T0="$RUN_T0" python3 - "$OUTPUT" "${SHOTDIR:-}" <<'PYMAN' 2>"$WORKDIR/manifest.err"
+import sys, os, hashlib
+out, shots = sys.argv[1:3]
+t0 = int(os.environ.get("RR_T0") or 0) - 1
+d, base = os.path.dirname(out) or ".", os.path.basename(out)
+man = out + ".manifest.sha256"
+def h(p):
+    s = hashlib.sha256()
+    with open(p, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            s.update(b)
+    return s.hexdigest()
+files, stale = [], []
+for e in os.scandir(d):
+    if not e.is_file(follow_symlinks=False) or e.path == man:
+        continue
+    if e.name == base or e.name.startswith(base + "."):
+        (files if e.stat().st_mtime >= t0 else stale).append(e.path)
+if shots and os.path.isdir(shots):
+    for root, _, names in os.walk(shots):
+        files += [os.path.join(root, n) for n in names if os.path.isfile(os.path.join(root, n))]
+lines = sorted("%s  %s" % (h(p), os.path.relpath(p, d)) for p in files)
+with open(man + ".tmp", "w", encoding="utf-8") as f:
+    f.write("".join(l + "\n" for l in lines))
+os.replace(man + ".tmp", man)
+print("%d\t%s\t%d\t%s" % (len(lines), h(man), len(stale), ", ".join(os.path.basename(p) for p in sorted(stale)[:5])
+                                + (", ..." if len(stale) > 5 else "")))
+PYMAN
+)" || _man=""
+if [ -n "$_man" ] && [ -s "$OUTPUT.manifest.sha256" ]; then
+  IFS=$'	' read -r _mn _msha _mns _mstale <<< "$_man"
+  ok " manifest        : $OUTPUT.manifest.sha256 ($_mn file(s), sha256 ${_msha:0:16}...; verify: cd $(dirname "$OUTPUT") && sha256sum -c $(basename "$OUTPUT").manifest.sha256)"
+  [ "${_mns:-0}" -gt 0 ] && warn " manifest: $_mns older file(s) named like this run's outputs were left out (an earlier run with the same -o): $_mstale"
+else
+  warn " could not write $OUTPUT.manifest.sha256 (see $WORKDIR/manifest.err)"
+fi
+
+sed -i 's/^status=.*/status=complete/' "$WORKDIR/state" 2>/dev/null || true
 if [ "$KEEP_WORK" = "1" ]; then
   log "Intermediate artifacts kept in: $WORKDIR"
 else

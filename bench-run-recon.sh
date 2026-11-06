@@ -42,7 +42,14 @@
 #   discovery              the discovery tools end to end: naabu (an alternate port), alterx
 #                          (--permute), shuffledns+massdns (--brute), cdncheck, uncover without
 #                          keys, and --monitor --notify to a local webhook
-#   checks                 takeover + zone + origin + http + posture + discovery; non-zero if any fails
+#   scope                  --scope / --list-targets: the seed check, origin candidates held back, the
+#                          browser held to the names, an address exclusion proved at the origin's
+#                          access log (and a control run without --scope)
+#   resume                 SIGTERM after two seeds, then --resume: the CSV must equal an uninterrupted run
+#   history                --monitor's field-by-field delta and recon-db.sh history/changes across two runs
+#                          with the spa backend stopped in between (the store too, with RECON_DB_DSN)
+#   checks                 takeover + zone + origin + http + posture + discovery + scope + resume + history;
+#                          non-zero if any fails
 #   help
 #
 # Needs docker (+compose) and the run-recon toolchain for up/run/bench; compare
@@ -483,7 +490,7 @@ cmd_bench(){
       --baseline-script) base_script="${2:-}"; shift 2 || shift;;
       --ab)              ab="${2:-}"; shift 2 || shift;;
       --results)         results="${2:-}"; shift 2 || shift;;
-      -h|--help) sed -n '2,43p' "$0" | sed 's/^# \{0,1\}//'; return 0;;
+      -h|--help) awk 'NR > 1 && !/^#/ { exit } NR > 1 && !/^# ?=+$/' "$0" | sed 's/^# \{0,1\}//'; return 0;;
       -*) die "bench: unknown option: $1";;
       *) shift;;
     esac
@@ -777,6 +784,139 @@ PYHTTP
   return "$rc"
 }
 
+# scope: --scope against the lab (run-recon 1.20). The seed check before anything is sent,
+# origin candidates outside the allowed ranges (not contacted), the browser held to the
+# scope, and an address exclusion proved at the origin's own access log: a request to
+# LAB_ORIGIN_IP reaches the nginx container from the docker bridge gateway.
+cmd_scope(){
+  lab_env
+  [ -f "$RUN_RECON" ] || die "run-recon not found at $RUN_RECON"
+  local t fail=0 rc ip pip cid gw n0 n1 n2
+  t="$(mktemp -d /tmp/bench-scope.XXXXXX)"
+  _ck(){ if grep -qE "$2" "$1" 2>/dev/null; then log "  ok   $3"; else log "  FAIL $3 (see $1)"; fail=1; fi; }
+  _nck(){ if grep -qE "$2" "$1" 2>/dev/null; then log "  FAIL $3 (see $1)"; fail=1; else log "  ok   $3"; fi; }
+  ip="$(printf '%s' "$LAB_ORIGIN_IP" | sed 's/\./\\./g')"; pip="$(printf '%s' "$LAB_PROTECTED_IP" | sed 's/\./\\./g')"
+  log "scope check -> $t"
+  printf 'nginx.test\nspa.test\nwp.test\n' > "$t/s1.txt"
+  printf 'nginx.test\nspa.test\nwp.test\nci.test\n' > "$t/in.txt"
+  # 1. the dry run: ci.test is outside the scope, so the run would refuse to start
+  rc=0; bash "$RUN_RECON" -i "$t/in.txt" --scope "$t/s1.txt" --list-targets > "$t/plan.txt" 2>&1 || rc=$?
+  if [ "$rc" = 2 ] && grep -qE '^4 +ci\.test +domain +OUT OF SCOPE +no entry covers it' "$t/plan.txt"; then
+    log "  ok   --list-targets: ci.test out of scope, exit 2 (the run would refuse)"
+  else log "  FAIL --list-targets (exit $rc, see $t/plan.txt)"; fail=1; fi
+  # 2. no address entries: the origin candidates are held back, the browser is held to the names
+  ( cd "$t" && bash "$RUN_RECON" -i "$t/in.txt" -o "$t/a.csv" --resolvers "$RESOLVERS_FILE" --scope "$t/s1.txt" \
+      --drop-out-of-scope --origin --screenshots --no-report >"$t/a.out" 2>"$t/a.err" ) || true
+  _nck "$t/a.csv" ',ci\.test,'                                          "--drop-out-of-scope: ci.test is not run"
+  _nck "$t/a.csv.origin.txt" 'origin-(exposed|protected)'             "no address entries: no origin candidate is contacted"
+  _ck  "$t/a.csv.scope.txt" "kind=origin-candidate target=$ip via=[^ ]*direct\.nginx\.test" "the origin candidate $LAB_ORIGIN_IP is listed as held back"
+  _ck  "$t/a.csv.screenshots.tsv" '^nginx\.test	[^	]*	ok'               "the browser, held to the scope's names (MAP * ~NOTFOUND), still renders nginx.test"
+  # 3. the origin addresses allowed: the same verdicts as without --scope
+  printf 'nginx.test\nspa.test\nwp.test\n%s/32\n%s/32\n' "$LAB_ORIGIN_IP" "$LAB_PROTECTED_IP" > "$t/s2.txt"
+  ( cd "$t" && bash "$RUN_RECON" -i "$LAB/targets-origin.txt" -o "$t/b.csv" --resolvers "$RESOLVERS_FILE" --scope "$t/s2.txt" \
+      --origin --no-report >"$t/b.out" 2>"$t/b.err" ) || true
+  _ck "$t/b.csv.origin.txt" "origin-exposed \[high\] host=nginx\.test origin=$ip port=80"  "allowed ranges: nginx.test's origin $LAB_ORIGIN_IP verified"
+  _ck "$t/b.csv.origin.txt" "origin-protected \[info\] host=spa\.test origin=$pip"          "allowed ranges: spa.test origin-protected"
+  # 4. an address exclusion, checked at the origin's access log
+  cid="$(compose -f "$COMPOSE_FILE" ps -q nginx 2>/dev/null | head -n 1)"
+  gw="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.Gateway}} {{end}}' "$cid" 2>/dev/null | awk '{print $1}')"
+  _direct(){ docker logs "$cid" 2>&1 | grep -c "^$gw " || true; }
+  printf 'direct\nbackup-db\nnot-there-1\n' > "$t/wl.txt"
+  printf 'nginx.test\n' > "$t/in-n.txt"
+  printf 'nginx.test\n!%s\n!backup-db.nginx.test\n' "$LAB_ORIGIN_IP" > "$t/s3.txt"
+  n0="$(_direct)"
+  ( cd "$t" && bash "$RUN_RECON" -i "$t/in-n.txt" -o "$t/c.csv" --resolvers "$RESOLVERS_FILE" --scope "$t/s3.txt" \
+      --resolve --brute --brute-wordlist "$t/wl.txt" --certs --no-report >"$t/c.out" 2>"$t/c.err" ) || true
+  sleep 1; n1="$(_direct)"
+  _nck "$t/c.csv" 'direct\.nginx\.test|backup-db\.nginx\.test'         "excluded: direct.nginx.test (its address) and backup-db.nginx.test (its name) are not in the CSV"
+  _ck  "$t/c.csv.scope.txt" "kind=name target=direct\.nginx\.test address=$ip "   "direct.nginx.test listed as held back (resolves into $LAB_ORIGIN_IP)"
+  if [ -n "$gw" ] && [ "$n1" = "$n0" ]; then log "  ok   no request reached $LAB_ORIGIN_IP (origin access log: $n0 -> $n1 direct requests)"
+  else log "  FAIL requests reached $LAB_ORIGIN_IP under --scope (origin access log: $n0 -> $n1; gateway ${gw:-?})"; fail=1; fi
+  ( cd "$t" && bash "$RUN_RECON" -i "$t/in-n.txt" -o "$t/d.csv" --resolvers "$RESOLVERS_FILE" \
+      --resolve --brute --brute-wordlist "$t/wl.txt" --certs --no-report >"$t/d.out" 2>"$t/d.err" ) || true
+  sleep 1; n2="$(_direct)"
+  if [ "$n2" -gt "$n1" ] && grep -q 'direct\.nginx\.test' "$t/d.csv"; then
+    log "  ok   control: without --scope the same run probes direct.nginx.test ($((n2 - n1)) direct request(s) logged)"
+  else log "  FAIL control: the run without --scope did not reach $LAB_ORIGIN_IP ($n1 -> $n2), so the check proves nothing"; fail=1; fi
+  # 5. MTA-STS: the policy host outside the scope is not fetched
+  printf 'posture.test\n!mta-sts.posture.test\n' > "$t/s4.txt"; printf 'posture.test\n' > "$t/in-p.txt"
+  ( cd "$t" && bash "$RUN_RECON" -i "$t/in-p.txt" -o "$t/e.csv" --resolvers "$RESOLVERS_FILE" --scope "$t/s4.txt" \
+      --dns-posture --no-report >"$t/e.out" 2>"$t/e.err" ) || true
+  _ck "$t/e.csv.dnsposture.tsv" 'policy not fetched: mta-sts\.posture\.test is outside --scope' "MTA-STS: the policy is not fetched from an excluded name"
+  [ "$fail" = 0 ] && log "scope check: PASS" || log "scope check: FAIL"
+  return "$fail"
+}
+
+# resume: a lab run stopped by SIGTERM after two seeds, then --resume; its CSV must equal an
+# uninterrupted run's (field by field; the second reference run is the noise floor)
+cmd_resume(){
+  lab_env
+  [ -f "$RUN_RECON" ] || die "run-recon not found at $RUN_RECON"
+  local t fail=0 rc pid i
+  t="$(mktemp -d /tmp/bench-resume.XXXXXX)"
+  log "resume check -> $t"
+  _rrun(){ local d="$1"; shift; mkdir -p "$t/$d"; ( cd "$t" && exec bash "$RUN_RECON" -i "$LAB/targets.txt" -D "$t/$d" -o "$t/$d/r.csv" \
+      --resolvers "$RESOLVERS_FILE" --tls -t 1 --no-report "$@" >"$t/$d.out" 2>>"$t/$d.err" ); }
+  _rrun ref1 || true; _rrun ref2 || true
+  # in the background with exec, so $! is run-recon itself (not a subshell around it)
+  mkdir -p "$t/cut"
+  ( cd "$t" && exec bash "$RUN_RECON" -i "$LAB/targets.txt" -D "$t/cut" -o "$t/cut/r.csv" \
+      --resolvers "$RESOLVERS_FILE" --tls -t 1 --no-report >"$t/cut.out" 2>>"$t/cut.err" ) & pid=$!
+  for i in $(seq 1 600); do
+    [ "$(find "$t/cut" -path '*/_work-*/done/*' -type f 2>/dev/null | wc -l)" -ge 2 ] && break; sleep 0.2
+  done
+  kill -TERM "$pid" 2>/dev/null; rc=0; wait "$pid" || rc=$?
+  if [ "$rc" = 143 ] && grep -qx 'status=interrupted' "$t"/cut/_work-*/state 2>/dev/null; then
+    log "  ok   SIGTERM after $(find "$t/cut" -path '*/_work-*/done/*' -type f | wc -l) of 4 seeds: exit 143, work dir kept"
+  else log "  FAIL SIGTERM: exit $rc (want 143), state $(grep -h '^status=' "$t"/cut/_work-*/state 2>/dev/null)"; fail=1; fi
+  sleep 1
+  rc=0; _rrun cut --resume || rc=$?
+  if [ "$rc" = 0 ] && grep -qE -- '--resume \(session 2\): [0-9]+ of 4 seed' "$t/cut.err"; then log "  ok   --resume finished the run ($(grep -oE '[0-9]+ of 4 seed\(s\) had finished' "$t/cut.err" | tail -n 1))"
+  else log "  FAIL --resume (exit $rc, see $t/cut.err)"; fail=1; fi
+  if [ -f "$t/ref1/r.csv" ] && [ -f "$t/ref2/r.csv" ] && [ -f "$t/cut/r.csv" ] \
+     && ( cmd_compare "$t/ref1/r.csv" "$t/cut/r.csv" --exact --noise "$t/ref2/r.csv" ) > "$t/cmp.txt" 2>&1 && grep -q 'RESULT: identical' "$t/cmp.txt"; then
+    log "  ok   the resumed run's CSV equals the uninterrupted run's (compare --exact, noise floor from a second run)"
+  else log "  FAIL the resumed CSV differs (see $t/cmp.txt)"; fail=1; fi
+  [ "$fail" = 0 ] && log "resume check: PASS" || log "resume check: FAIL"
+  return "$fail"
+}
+
+# history: two lab runs with the spa backend stopped in between. --monitor must report the
+# change field by field (<out>.delta.tsv), and recon-db.sh changes/history must find it, from
+# the run CSVs and, when RECON_DB_DSN points at a PostgreSQL database, from the store (--db).
+cmd_history(){
+  lab_env
+  [ -f "$RUN_RECON" ] || die "run-recon not found at $RUN_RECON"
+  local t fail=0 db=()
+  t="$(mktemp -d /tmp/bench-history.XXXXXX)"
+  [ -n "${RECON_DB_DSN:-}" ] && db=(--db)
+  _ck(){ if grep -qE "$2" "$1" 2>/dev/null; then log "  ok   $3"; else log "  FAIL $3 (see $1)"; fail=1; fi; }
+  log "history check -> $t${RECON_DB_DSN:+ (store: \$RECON_DB_DSN)}"
+  mkdir -p "$t/runs"
+  ( cd "$t" && bash "$RUN_RECON" -i "$LAB/targets.txt" -D "$t/runs" --resolvers "$RESOLVERS_FILE" --tls "${db[@]}" --no-report >"$t/a.out" 2>"$t/a.err" ) || true
+  sleep 1
+  compose -f "$COMPOSE_FILE" stop spa >/dev/null 2>&1
+  ( cd "$t" && bash "$RUN_RECON" -i "$LAB/targets.txt" -D "$t/runs" --resolvers "$RESOLVERS_FILE" --tls "${db[@]}" --monitor >"$t/b.out" 2>"$t/b.err" ) || true
+  compose -f "$COMPOSE_FILE" start spa >/dev/null 2>&1
+  local b; b="$(ls -t "$t"/runs/recon-*.csv | head -n 1)"
+  _ck "$b.delta.tsv" '^changed	spa\.test	https://spa\.test	status_code	200	502$'  "--monitor: spa.test's status 200 -> 502, field by field"
+  if awk -F'\t' 'NR > 1 && $2 != "spa.test"' "$b.delta.tsv" | grep -q .; then log "  FAIL changes reported for the services that did not change (see $b.delta.tsv)"; fail=1
+  else log "  ok   nothing else changed (nginx, wp, ci: no delta lines)"; fi
+  _ck "$b.report.html" 'Changes since the previous run'                              "report: the Changes section"
+  bash "$HERE/recon-db.sh" changes spa.test --csv "$t/runs" > "$t/changes.tsv" 2>&1
+  _ck "$t/changes.tsv" '	spa\.test	https://spa\.test	changed	status_code	200	502$'       "recon-db.sh changes --csv: the same event, with its run"
+  if [ -n "${RECON_DB_DSN:-}" ]; then
+    bash "$HERE/recon-db.sh" changes spa.test > "$t/db-changes.tsv" 2>&1
+    _ck "$t/db-changes.tsv" '	spa\.test	https://spa\.test	changed	status_code	200	502$'  "recon-db.sh changes (PostgreSQL store, --db): the same event"
+    bash "$HERE/recon-db.sh" history nginx.test > "$t/db-history.tsv" 2>&1
+    _ck "$t/db-history.tsv" '^nginx\.test	https://nginx\.test	[0-9-]+	[0-9-]+	[0-9]+	[0-9]+	present	200 ' "recon-db.sh history (store): nginx.test present, first/last seen"
+  else
+    log "  skip the store (set RECON_DB_DSN to a PostgreSQL database to check --db history)"
+  fi
+  [ "$fail" = 0 ] && log "history check: PASS" || log "history check: FAIL"
+  return "$fail"
+}
+
 cmd_checks(){
   local rc=0
   cmd_takeover || rc=1
@@ -785,7 +925,10 @@ cmd_checks(){
   cmd_http || rc=1
   cmd_posture || rc=1
   cmd_discovery || rc=1
-  [ "$rc" = 0 ] && log "lab checks: PASS (takeover, zone, origin, http, posture, discovery)" || log "lab checks: FAIL"
+  cmd_scope || rc=1
+  cmd_resume || rc=1
+  cmd_history || rc=1
+  [ "$rc" = 0 ] && log "lab checks: PASS (takeover, zone, origin, http, posture, discovery, scope, resume, history)" || log "lab checks: FAIL"
   return "$rc"
 }
 
@@ -794,6 +937,9 @@ case "${1:-help}" in
   takeover) cmd_takeover;;
   posture)  cmd_posture;;
   discovery) cmd_discovery;;
+  scope)    cmd_scope;;
+  resume)   cmd_resume;;
+  history)  cmd_history;;
   zone)     cmd_zone;;
   origin)   cmd_origin;;
   http)     cmd_http;;
@@ -803,6 +949,6 @@ case "${1:-help}" in
   run)      shift; cmd_run "$@";;
   compare)  shift; cmd_compare "$@";;
   bench)    shift; cmd_bench "$@";;
-  help|-h|--help) sed -n '2,43p' "$0" | sed 's/^# \{0,1\}//';;
-  *) die "unknown command: ${1:-} (try: up|down|hosts|run|compare|bench|takeover|zone|origin|http|posture|discovery|checks)";;
+  help|-h|--help) awk 'NR > 1 && !/^#/ { exit } NR > 1 && !/^# ?=+$/' "$0" | sed 's/^# \{0,1\}//';;
+  *) die "unknown command: ${1:-} (try: up|down|hosts|run|compare|bench|takeover|zone|origin|http|posture|discovery|scope|resume|history|checks)";;
 esac

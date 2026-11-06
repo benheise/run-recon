@@ -85,6 +85,52 @@ printf '%s\n' example.com api.example.com > domains.txt
 run-recon -i domains.txt -o results.csv
 ```
 
+### Scope (checked before anything is sent)
+
+```bash
+run-recon -i domains.txt --scope scope.txt --list-targets   # the plan: each seed in scope or why not; nothing sent
+run-recon -i domains.txt --scope scope.txt -o results.csv   # the run, held to scope.txt (fail-closed)
+run-recon -i domains.txt --scope scope.txt --drop-out-of-scope   # skip out-of-scope seeds instead of stopping
+```
+
+The scope file has one entry per line (`#` comments), like WebInventory's `-Scope`:
+
+| Entry | Allows |
+|---|---|
+| `example.com` | the name and every name under it |
+| `*.example.com` | the names under it, not `example.com` itself |
+| `192.0.2.0/24`, `2001:db8::/48`, `198.51.100.7` | addresses (IPv4 or IPv6) |
+| `AS64500` | an ASN seed, and the ranges asnmap returns for it |
+| `!dev.example.com`, `!192.0.2.5`, `-AS64501` | an exclusion (any form above, `!` or `-`); exclusions win |
+
+Fail-closed means:
+- **Before anything is sent.** A malformed entry (a URL, a CIDR with host bits set, a whole TLD) stops
+  the run (exit 2) with its line number. So does an out-of-scope seed, or an input line that is not a
+  domain, an ASN or an IPv4 CIDR (a bare address, `host:port`), unless `--drop-out-of-scope`.
+- **CIDR seeds.** A CIDR seed must lie inside an allowed range. Its excluded addresses are taken out of
+  the sweep, and so are the excluded parts of an allowed ASN's ranges.
+- **Discovered names.** A name found by any source passes only if no exclusion covers it. A name that
+  resolves into an excluded range is never contacted: it is checked with dnsx before the certificate
+  harvest, the takeover check and the probe.
+- **Addresses run-recon picks itself** are contacted only inside the allowed ranges: `--origin`
+  candidates, `--favicon` / certificate-search hits, and names found on range certificates (those must
+  also be among the scope's names). A scope with no address entries means no origin verification.
+- **Tools that follow links.**
+  - katana follows a link only inside the scope (`-cs`/`-cos`). With address exclusions it crawls only
+    the live hosts already checked.
+  - The screenshot browser resolves only the seed's own names; `MAP * ~NOTFOUND` covers everything else,
+    so redirects and third-party assets go nowhere.
+  - nuclei follows no redirects (`-dr`), and neither do whatweb or cmseek.
+  - gospider and hakrawler (`--crawlers-all`) cannot be held to a scope, so they are skipped.
+  - gowitness cannot be held either, so screenshots need httpx.
+  - xnLinkFinder fetches only JS files on the seed's live hosts.
+  - The MTA-STS policy is fetched only from an in-scope name.
+- **The record.** What was held back goes to `<out>.scope.txt`, each item with the reason it was not
+  contacted. run.json records the scope file's SHA-256, the seed counts and what was held back.
+
+Without `--scope`, run-recon keeps each seed's discoveries under that seed, as before. Input lines it
+ignores (not a domain, an ASN or a CIDR) are now named in a warning instead of being dropped silently.
+
 ### Modes & tuning
 
 ```bash
@@ -97,6 +143,7 @@ run-recon -i domains.txt --crawl-depth 3       # deeper katana crawl
 run-recon -i domains.txt --max-urls 20000      # raise the per-domain validation cap (default 5000)
 run-recon -i domains.txt --no-filter-static    # keep image/font/css URLs (default: filtered)
 run-recon -i domains.txt --keep-work           # retain intermediate artifacts for audit
+run-recon -i domains.txt -o r.csv --resume     # continue an interrupted run (same command + --resume)
 run-recon -i domains.txt --db                   # cache crawl/OSINT + persist inventory (see §6; needs one-time setup)
 run-recon -i domains.txt --no-report            # skip the end-of-run HTML report (see §6)
 run-recon -h
@@ -174,6 +221,7 @@ run-recon -i domains.txt --active --cms-wordlist plugins.txt   # custom plugin/t
 
 ```bash
 run-recon -i domains.txt --monitor                       # diff vs newest prior recon-*.csv -> results.csv.new-assets.txt
+                                                         #   + results.csv.delta.tsv (each service, field by field)
 run-recon -i domains.txt --monitor --monitor-prev old.csv --notify   # diff vs a specific CSV, push via 'notify'
 NOTIFY_CONFIG=notify.yaml run-recon -i d.txt --monitor --notify      # one message per run to the providers in notify.yaml
 run-recon -i domains.txt --all                           # full discovery + defensive set (see below)
@@ -343,8 +391,28 @@ artifact, all warnings, and the exit status. The HTML report's run header is bui
 | Exit status | Meaning |
 |---|---|
 | `0` | the run finished with at least one URL row |
-| `2` | bad arguments or input |
+| `2` | bad arguments or input, or refused by `--scope` (nothing was sent) |
 | `3` | the run finished with **no results** (0 URL rows). The log ends with "Finished with NO results" instead of "Complete.", and the report shows a banner |
+| `130` / `143` | interrupted by SIGINT (Ctrl-C) / SIGTERM: every stage the run started is stopped, the work dir is kept, and the same command with `--resume` continues it |
+
+**Evidence: `<out>.manifest.sha256`.** The last thing a run writes is the SHA-256 of every file it wrote:
+the CSV, each `<out>.*` side file, run.json, the report and the screenshots. The file is in `sha256sum`'s
+own format with paths relative to the CSV's directory, so `cd <dir> && sha256sum -c <out>.manifest.sha256`
+checks the set later. A file with the same prefix that is older than the run (left by an earlier run with
+the same `-o`) is not listed, and a warning names it. The run log prints the manifest's own hash, for
+recording elsewhere.
+
+**Resume.** Each work dir has a `state` file holding the run's status and hashes of the command line,
+the input and the scope file (no values). While a run is going it holds a lock (`flock`) on the work dir.
+On Ctrl-C or SIGTERM, run-recon freezes and stops every process it started, marks the run interrupted
+and keeps the work dir (exit 130/143). Running the same command again with `--resume`:
+1. finds the newest interrupted work dir whose hashes match (an unlocked one only: never one still in use);
+2. keeps the seeds that finished: their markers, their parts and their raw dirs;
+3. runs the other seeds and the main-process stages (range sweeps, zone and posture checks) again;
+4. aggregates as usual.
+
+run.json records the number of sessions and how many seeds were carried over. Another command line, a
+changed input or a finished run is refused (exit 2).
 
 The resolver preflight looks up the first seed, so a resolver that answers SERVFAIL or REFUSED for it is
 reported as failed (not "passed"), and an NXDOMAIN seed is called out. Each seed also gets a warning when
@@ -357,7 +425,8 @@ Side files next to the CSV, by flag: `.takeover.txt` + `.cname.tsv` (`--takeover
 `.favicon.txt` (`--favicon`), `.screenshots.tsv` +
 `screenshots-<ts>/` (`--screenshots`), `.nuclei.txt`, `.params.txt`, `.secrets.txt`, `.buckets.txt`,
 `.cms.txt`, `.activescan.txt`, `.osint.txt`, `.virustotal.txt`, `.urlscan.txt`, `.social.txt`,
-`.new-assets.txt`, `.run.json` (always) and `.report.html`.
+`.new-assets.txt` + `.delta.tsv` (`--monitor`), `.scope.txt` (`--scope`), `.run.json` (always), `.report.html`
+and `.manifest.sha256` (always, written last).
 
 **Zone exposure findings** (`.zone.txt`, one line per zone):
 
@@ -507,6 +576,31 @@ The point of EASM is *change over time*, not a one-shot snapshot. The pipeline h
 ```
 
 `--monitor` writes `results.csv.new-assets.txt`; add `--notify` to push that list through ProjectDiscovery `notify` (Slack/Discord/webhook, configured in `~/.config/notify/`). Point at a specific baseline with `--monitor-prev old.csv`.
+
+It also writes `results.csv.delta.tsv`, a field-by-field comparison like WebInventory's `_delta.csv`. The
+columns are `change seed service field old new`, and the unit is the service (`scheme://host:port`,
+default ports dropped) within its seed.
+- **new / removed:** reported only for seeds both runs covered. A seed that only one run had is named in a
+  warning.
+- **changed:** compares status, title, server, technologies, CPE, redirect target, auth, HTTP flags,
+  missing security headers, address and ASN, IPv6, TLS version, certificate expiry and issuer, TLS flags
+  and the favicon hash. The values come from the service's root URL, else its smallest URL.
+- **Rules:**
+  - A field is compared only when the stage that fills it ran in both runs, judged by a field that stage
+    always fills: with `tls_version` present, an empty `tls_flags` means "no flag" and a new
+    `CertExpiring` is a change.
+  - Multi-valued fields compare as sets.
+  - An address change within the same ASN is not reported (CDN and round-robin addresses rotate).
+
+With `--db`, a `--monitor` run takes nothing target-facing from the cache: the live probe, enrichment, crawl,
+ports, TLS, JARM, certificates and screenshots are measured afresh, and stored for the next run (passive
+lookups still come from the cache). Otherwise a 7-day-old probe result could hide the change the run is meant to
+catch. `CACHE_FRESH_ACTIVE=0` restores the old behaviour, and `CACHE_FRESH_ACTIVE=1` applies the rule to a run
+without `--monitor`.
+
+The report gets a "Changes since the previous run" section, and the notify message a summary line. The
+same comparison runs offline with `recon-db.sh diff OLD.csv NEW.csv`, and across many runs with
+`recon-db.sh changes` / `history` (§6).
 
 Feed the validated URL set straight into templated scanning (or just use `--nuclei`):
 
@@ -678,6 +772,10 @@ CACHE_TTL=86400 run-recon -i domains.txt -o results.csv --db   # 1-day freshness
 ./recon-db.sh hosts admin       # stored hosts matching a pattern (across ALL runs)
 ./recon-db.sh latest admin      # current state: newest run wins per URL (older data kept)
 ./recon-db.sh import ./old-runs # import historic run CSVs (a dir or files), oldest first
+./recon-db.sh history admin     # per service: first / last seen, runs seen, present or "gone since <run>"
+./recon-db.sh changes --since 20261101-000000   # change events of the later runs: new, removed, field old -> new
+./recon-db.sh changes --csv ./recon-runs        # the same from a directory of run CSVs (no database)
+./recon-db.sh diff old.csv new.csv -o delta.tsv # two runs, field by field (what --monitor writes)
 ./recon-db.sh vulns out.csv --nvd-feed ./nvd --kev-file kev.json --epss-file epss.csv.gz
 ./recon-db.sh clean ./out --dry-run  # preview pruning blank intermediate files (keeps report data)
 ./recon-db.sh fix-collation     # rebuild indexes + refresh collation after a glibc upgrade
@@ -739,6 +837,20 @@ columns left empty. Nothing is overwritten destructively: every run's rows are k
 ./recon-db.sh latest                             # newest-per-URL across everything
 ```
 
+**History and change events (`history`, `changes`).** These use the same comparison as `--monitor`'s
+`.delta.tsv`, between each stored run of a seed and that seed's previous run.
+- **`history [PATTERN]`** prints one row per service: first seen, last seen, the number of runs it was in
+  out of the runs that covered its seed, and its state ("present", or "gone since <run>") with its latest
+  status and title.
+- **`changes [PATTERN] [--since RUN_TS]`** prints each event with the run it was seen in.
+- **PATTERN** matches the service (`example.com:8443` works).
+- **`--csv PATH...`** reads run CSVs instead of the store: files, or directories ordered as `import` orders
+  them. A run's `run.json`, when it is next to it, gives the seeds it covered.
+- **What the store keeps per run (1.20).** Since 1.20 the store keeps the compared fields for each run.
+  `recon_runs` records the seeds each run covered (a seed that returned nothing still ran, so its services
+  are gone) and which columns its CSV had. A store from 1.19 is migrated in place: its old runs are
+  compared on the fields they have.
+
 **Offline vulnerability join (`vulns`, FPV-07).** `vulns` correlates a run CSV's
 `cpe` column with NVD, CISA KEV and FIRST EPSS data **you download yourself** —
 nothing is fetched and nothing is sent to any target, so it's safe to run against a
@@ -797,7 +909,8 @@ sudo sh -c './bench-run-recon.sh hosts >> /etc/hosts'    # once: names for tools
 ./bench-run-recon.sh bench --runs 3 --farm --flags "--tls --ipv6 -t 10"    # load
 ./bench-run-recon.sh bench --runs 3 --flags "--tls --ipv6" --baseline-script old/run-recon.sh   # A/B two versions
 ./bench-run-recon.sh compare run-a.csv run-b.csv --exact # field-by-field identity
-./bench-run-recon.sh checks                              # takeover, zone, origin, http, posture, discovery fixtures
+./bench-run-recon.sh checks                              # takeover, zone, origin, http, posture, discovery, scope,
+                                                         #   resume, history (RECON_DB_DSN=... adds the store)
 ./bench-run-recon.sh down
 ```
 
@@ -827,6 +940,10 @@ needs one httpx run per seed instead of two (farm: 1.14x wall, 24% less CPU, out
 comparisons now ignore fields that differ between runs of the same version (`compare --exact --noise`).
 Batch 3 leaves the default path identical; `--dns-posture` costs under a second on the 50-seed farm, and the
 lab now exercises naabu, alterx, shuffledns, cdncheck, uncover and notify for real (`checks`: six fixtures).
+Batch 4 also leaves the default path's output identical (timing inside the lab's spread); `checks` adds `scope`
+(an address exclusion proved at the origin's own access log), `resume` (a SIGTERM'd run resumed to a CSV
+identical to an uninterrupted one) and `history` (a stopped backend seen field by field, in the delta and in the
+store).
 
 The v1.16 speed-up is from not querying internet archives for special-use names such as `.test`,
 which cannot exist there. The lab also exposed nine accuracy bugs, all fixed in v1.16 (listed in

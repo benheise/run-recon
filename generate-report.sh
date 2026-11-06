@@ -144,7 +144,7 @@ KIND_LABEL = {
     "buckets": "Exposed cloud bucket", "origin": "Exposed origin",
     "zone": "DNS zone exposure", "zonecheck": "DNS zone check", "edgehint": "Edge fingerprint",
     "originprotected": "Protected origin", "dnsposture": "Email / DNS posture", "vulnx": "Product advisory (vulnx)",
-    "cloud": "Cloud inventory", "tld-variants": "TLD variant",
+    "cloud": "Cloud inventory", "tld-variants": "TLD variant", "scope": "Scope",
     "http": "HTTP", "extras": "security.txt", "extrasinfo": "Web server note", "favicon": "Favicon pivot",
     "tls": "TLS / certificate",
     "params": "Parameterized URL", "cms": "CMS / tech", "osint": "OSINT",
@@ -152,7 +152,7 @@ KIND_LABEL = {
     "vuln": "Known CVE (NVD/KEV)",
 }
 # evidence of a check that ran, not a finding: kept out of the severity counts
-EVIDENCE_KINDS = {"zonecheck", "edgehint", "extrasinfo", "originprotected"}
+EVIDENCE_KINDS = {"zonecheck", "edgehint", "extrasinfo", "originprotected", "scope"}
 
 def sev_from_nuclei(text):
     m = re.search(r'\[(critical|high|medium|low|info|unknown)\]', text, re.I)
@@ -250,7 +250,7 @@ ORIGIN_FINDINGS = ("origin-exposed", "origin-alternate", "origin-candidate")
 
 for kind in ["nuclei", "activescan", "takeover", "secrets", "buckets", "zone", "origin", "extras", "favicon",
              "params", "cms", "osint", "virustotal", "urlscan", "social", "dnsposture", "vulnx", "cloud",
-             "tld-variants"]:
+             "tld-variants", "scope"]:
     path = f"{csv_path}.{kind}.txt"
     if not os.path.isfile(path):
         continue
@@ -546,6 +546,19 @@ elif shots_dir and os.path.isdir(shots_dir):
                                "empty image (0 bytes)" if empty else "")
                 break
 
+# --- field-by-field changes vs the previous run (<csv>.delta.tsv, --monitor) ----------
+delta = []
+if os.path.isfile(csv_path + ".delta.tsv"):
+    try:
+        with open(csv_path + ".delta.tsv", encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                f = line.rstrip("\n").split("\t")
+                if i and len(f) >= 6:
+                    delta.append({"change": f[0], "seed": f[1], "service": f[2], "field": f[3],
+                                  "old": clean(f[4]), "new": clean(f[5])})
+    except Exception as e:
+        sys.stderr.write(f"[report] warning: delta: {e}\n")
+
 # --- HTML ------------------------------------------------------------------
 now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 sev_color = {"critical": "#8b0000", "high": "#d7301f", "medium": "#ef8a00",
@@ -636,13 +649,21 @@ if run:
                f'tools: {esc(_tv)} (lab-verified: {esc(run.get("lab_verified", ""))})<br>'
                f'resolvers: {esc(_res.get("file") or "system")} ({esc(_res.get("count", 0))}), check {esc(_res.get("check", "not run"))}'
                + (f' &middot; proxy {esc(run.get("proxy"))}' if run.get("proxy") else "") )
+    _sc = run.get("scope") or {}
+    if _sc:
+        _hb = sum((_sc.get("held_back") or {}).values())
+        out.append(f'<br>scope: <b>{esc(_sc.get("file", ""))}</b> (sha256 {esc((_sc.get("sha256") or "")[:16])}&hellip;,'
+                   f' {esc(_sc.get("entries", 0))} entries) &middot; seeds in scope <b>{esc(_sc.get("seeds_in", 0))}</b>'
+                   + (f', skipped {esc(_sc.get("seeds_out", 0) + _sc.get("seeds_invalid", 0))}' if _sc.get("dropped") else "")
+                   + f' &middot; held back (not contacted) <b>{esc(_hb)}</b>')
     _w = run.get("warnings") or []
     if _w:
         out.append(f'<details><summary>{len(_w)} warning(s) during the run</summary><ul>'
                    + "".join(f"<li>{esc(x)}</li>" for x in _w) + "</ul></details>")
     out.append('</div>')
 out.append("""  <div class="tabs mut" style="margin-top:8px">
-    <a href="#summary">Summary</a><a href="#findings">Findings</a><a href="#names">Names</a><a href="#hosts">Hosts</a>
+    <a href="#summary">Summary</a><a href="#findings">Findings</a>""" + ('<a href="#changes">Changes</a>' if delta else "")
+           + """<a href="#names">Names</a><a href="#hosts">Hosts</a>
   </div>
 </header>""")
 if no_results:
@@ -670,6 +691,12 @@ if top_asns:
 if new_assets:
     out.append(f'<div class="mut" style="margin-top:8px">New assets vs previous run: '
                f'<b style="color:#cdd9e5">{len(new_assets)}</b></div>')
+if delta:
+    _dc = {k: sum(1 for d in delta if d["change"] == k) for k in ("new", "removed")}
+    _ds = len({(d["seed"], d["service"]) for d in delta if d["change"] == "changed"})
+    out.append(f'<div class="mut" style="margin-top:8px">Services vs previous run: <b style="color:#cdd9e5">{_dc["new"]}</b> new,'
+               f' <b style="color:#cdd9e5">{_dc["removed"]}</b> removed, <b style="color:#cdd9e5">{_ds}</b> changed'
+               f' (<a href="#changes">changes</a>)</div>')
 # DNS zones checked (--zone-exposure): each zone's result, findings or not
 zrows = [f for f in findings if f["kind"] in ("zone", "zonecheck")]
 if zrows:
@@ -768,6 +795,20 @@ if ctx:
     out.append('<p class="mut" style="margin-top:14px">Context / OSINT gathered: ' +
                " &middot; ".join(f'{esc(KIND_LABEL.get(k,k))} <b style="color:#cdd9e5">({v})</b>'
                                  for k, v in sorted(ctx.items(), key=lambda kv: -kv[1])) + "</p>")
+
+# ---- Changes vs the previous run -------------------------------------------------
+if delta:
+    out.append('<h2 id="changes">Changes since the previous run</h2>')
+    out.append('<p class="mut">Per service (scheme://host:port): new and removed under the seeds both runs covered, '
+               'and each field that changed. A field is compared only when both runs collected it.</p>')
+    out.append('<table><tr><th>Change</th><th>Service</th><th>Field</th><th>Before</th><th>Now</th></tr>')
+    _ord = {"removed": 0, "changed": 1, "new": 2}
+    for d in sorted(delta, key=lambda d: (_ord.get(d["change"], 3), d["service"], d["field"]))[:500]:
+        out.append(f'<tr><td>{esc(d["change"])}</td><td>{esc(d["service"])}</td><td>{esc(d["field"])}</td>'
+                   f'<td>{esc(d["old"])}</td><td>{esc(d["new"])}</td></tr>')
+    out.append('</table>')
+    if len(delta) > 500:
+        out.append(f'<div class="mut">... and {len(delta) - 500} more in {esc(os.path.basename(csv_path))}.delta.tsv</div>')
 
 # ---- Name inventory --------------------------------------------------------------
 out.append('<h2 id="names">Names</h2>')
@@ -933,12 +974,13 @@ for h in card_names:
 # ---- footer: raw artifact links --------------------------------------------
 arts = []
 for kind in ["nuclei", "activescan", "takeover", "secrets", "buckets", "zone", "origin", "extras", "favicon",
-             "params", "cms", "osint", "virustotal", "urlscan", "social", "new-assets"]:
+             "params", "cms", "osint", "virustotal", "urlscan", "social", "dnsposture", "cloud", "tld-variants",
+             "vulnx", "scope", "new-assets"]:
     p = f"{csv_path}.{kind}.txt"
     if os.path.isfile(p):
         arts.append(f'<a href="{esc(rel_out(p))}">{esc(kind)}</a>')
 for suf, lab in ((".edge.tsv", "edge/origin"), (".cname.tsv", "CNAMEs"), (".zone-names.txt", "zone names"),
-                 (".screenshots.tsv", "screenshot list"), (".run.json", "run record")):
+                 (".screenshots.tsv", "screenshot list"), (".delta.tsv", "changes"), (".run.json", "run record")):
     if os.path.isfile(csv_path + suf):
         arts.append(f'<a href="{esc(rel_out(csv_path + suf))}">{esc(lab)}</a>')
 arts.append(f'<a href="{esc(rel_out(csv_path))}">CSV</a>')

@@ -16,6 +16,12 @@
 #       ./recon-db.sh hosts [PATTERN]   # dump stored hosts (optional host filter)
 #       ./recon-db.sh latest [PATTERN]  # current state: newest run wins per URL
 #       ./recon-db.sh import <csv|dir>  # import historic run CSVs (oldest first)
+#       ./recon-db.sh history [PATTERN] [--csv PATH...]
+#                                       # first / last seen per service, and whether it is gone
+#       ./recon-db.sh changes [PATTERN] [--since RUN_TS] [--csv PATH...]
+#                                       # change events across runs: new, removed, field old -> new
+#       ./recon-db.sh diff OLD.csv NEW.csv [-o OUT.tsv]
+#                                       # two runs, field by field (no DB needed)
 #       ./recon-db.sh vulns <csv> --nvd-feed DIR [--kev-file F] [--epss-file F] [-o OUT]
 #                                       # offline NVD/KEV/EPSS join on the CSV's cpe column (no DB needed)
 #       ./recon-db.sh clean <path>... [--dry-run] [--rows]
@@ -116,6 +122,21 @@ CREATE TABLE IF NOT EXISTS recon_hosts (
 );
 CREATE INDEX IF NOT EXISTS recon_hosts_host_idx ON recon_hosts (host);
 CREATE INDEX IF NOT EXISTS recon_hosts_seed_idx ON recon_hosts (seed_domain);
+-- 1.20: the fields history and change events compare (older rows keep them NULL)
+ALTER TABLE recon_hosts ADD COLUMN IF NOT EXISTS cpe text, ADD COLUMN IF NOT EXISTS redirect_location text,
+  ADD COLUMN IF NOT EXISTS auth text, ADD COLUMN IF NOT EXISTS http_flags text,
+  ADD COLUMN IF NOT EXISTS missing_sec_headers text, ADD COLUMN IF NOT EXISTS ipv6 text,
+  ADD COLUMN IF NOT EXISTS tls_version text, ADD COLUMN IF NOT EXISTS cert_not_after text,
+  ADD COLUMN IF NOT EXISTS cert_issuer text, ADD COLUMN IF NOT EXISTS tls_flags text,
+  ADD COLUMN IF NOT EXISTS favicon_mmh3 text;
+-- the seeds each run covered: a seed that returned nothing still ran (its services are gone)
+CREATE TABLE IF NOT EXISTS recon_runs (
+  run_ts    text PRIMARY KEY,
+  seeds     text,
+  loaded_at timestamptz NOT NULL DEFAULT now()
+);
+-- which of the compared columns the run's CSV had (an empty cell is NULL either way)
+ALTER TABLE recon_runs ADD COLUMN IF NOT EXISTS cols text;
 SQL
 }
 
@@ -182,8 +203,9 @@ SQL
 
 # db_load_csv <csv> <run_ts> : client-side \copy the run CSV into recon_hosts.
 db_load_csv() {
-  local csv="$1" ts norm rc; ts="$(_sql_esc "$2")"
+  local csv="$1" ts norm rc seeds="" sf="${3:-}"; ts="$(_sql_esc "$2")"
   [ -f "$csv" ] || return 1
+  db_schema >/dev/null 2>&1 || true   # adds the 1.20 columns to an existing store
   # Normalize to the canonical 12-column schema first (matching columns by header
   # NAME). The live run CSV now carries extra TLS/enrichment columns (tls_*, ipv6,
   # cloud, rdap_org, geo), and \copy into the fixed 12-column _stage would otherwise
@@ -198,17 +220,38 @@ db_load_csv() {
     [ "$norm" != "$csv" ] && rm -f "$norm"
     return 1;;
   esac
+  # the seeds this run covered: the file given (run-recon passes its seed list), else the
+  # CSV's seed_domain column
+  if [ -n "$sf" ] && [ -f "$sf" ]; then
+    seeds="$(tr 'A-Z' 'a-z' < "$sf" | grep -v '^[[:space:]]*$' | sort -u | paste -sd';' -)"
+  else
+    seeds="$(python3 -c 'import csv,sys
+r = csv.DictReader(open(sys.argv[1], newline="", encoding="utf-8", errors="replace"))
+print(";".join(sorted({(x.get("seed_domain") or "").strip().lower() for x in r} - {""})))' "$norm" 2>/dev/null || true)"
+  fi
+  seeds="$(_sql_esc "$seeds")"
+  local cols; cols="$(python3 -c 'import csv,sys
+h = {(c or "").strip().lower() for c in next(csv.reader(open(sys.argv[1], newline="", encoding="utf-8", errors="replace")), [])}
+print(";".join(c for c in sys.argv[2].split() if c in h))' "$csv" "$_DELTA_FIELDS" 2>/dev/null || true)"
+  cols="$(_sql_esc "$cols")"
   _psql >/dev/null 2>&1 <<SQL
 CREATE TEMP TABLE _stage (
   seed_domain text, url text, host text, sources text, status_code text,
   content_length text, webserver text, title text, technologies text,
-  ip text, asn text, asn_org text
+  ip text, asn text, asn_org text,
+  cpe text, redirect_location text, auth text, http_flags text, missing_sec_headers text, ipv6 text,
+  tls_version text, cert_not_after text, cert_issuer text, tls_flags text, favicon_mmh3 text
 );
 \copy _stage FROM '$norm' WITH (FORMAT csv, HEADER true)
-INSERT INTO recon_hosts (run_ts, seed_domain, url, host, ip, asn, asn_org, status_code, webserver, title, technologies)
-SELECT '$ts', seed_domain, url, host, ip, asn, asn_org, status_code, webserver, title, technologies
+INSERT INTO recon_hosts (run_ts, seed_domain, url, host, ip, asn, asn_org, status_code, webserver, title, technologies,
+  cpe, redirect_location, auth, http_flags, missing_sec_headers, ipv6, tls_version, cert_not_after, cert_issuer,
+  tls_flags, favicon_mmh3)
+SELECT '$ts', seed_domain, url, host, ip, asn, asn_org, status_code, webserver, title, technologies,
+  cpe, redirect_location, auth, http_flags, missing_sec_headers, ipv6, tls_version, cert_not_after, cert_issuer,
+  tls_flags, favicon_mmh3
 FROM _stage
 ON CONFLICT (run_ts, url) DO NOTHING;
+INSERT INTO recon_runs (run_ts, seeds, cols) VALUES ('$ts', '$seeds', '$cols') ON CONFLICT (run_ts) DO NOTHING;
 SQL
   rc=$?
   [ "$norm" != "$csv" ] && rm -f "$norm"
@@ -226,7 +269,9 @@ _import_normalize() {
 import sys, csv
 src, out = sys.argv[1], sys.argv[2]
 CANON = ["seed_domain","url","host","sources","status_code","content_length",
-         "webserver","title","technologies","ip","asn","asn_org"]
+         "webserver","title","technologies","ip","asn","asn_org",
+         "cpe","redirect_location","auth","http_flags","missing_sec_headers","ipv6",
+         "tls_version","cert_not_after","cert_issuer","tls_flags","favicon_mmh3"]
 ALIAS = {"seed":"seed_domain","domain":"seed_domain","status":"status_code",
          "length":"content_length","content-length":"content_length","tech":"technologies",
          "technology":"technologies","server":"webserver","web_server":"webserver",
@@ -304,16 +349,286 @@ db_import_csvs() {
     local norm; norm="$(_import_normalize "$path")" \
       || { echo "[!] skip (unreadable or no 'url' column): $path" >&2; continue; }
     if [ ! -s "$norm" ]; then echo "[!] skip (no data rows): $path" >&2; rm -f "$norm"; continue; fi
-    if db_load_csv "$norm" "$uts"; then
+    local _sf=""
+    if [ -f "$path.run.json" ]; then
+      _sf="$norm.seeds"
+      python3 -c 'import json,sys
+print("\n".join(str(x.get("seed","")) for x in (json.load(open(sys.argv[1])).get("per_seed") or []) if x.get("seed")))' "$path.run.json" > "$_sf" 2>/dev/null || _sf=""
+      [ -s "$_sf" ] || _sf=""
+    fi
+    if db_load_csv "$path" "$uts" "$_sf"; then
       rows="$(( $(wc -l < "$norm") - 1 ))"; [ "$rows" -lt 0 ] && rows=0
       echo "[+] $path -> run_ts=$uts ($rows row(s))"
       n_files=$((n_files + 1)); total=$((total + rows))
     else
       echo "[!] load failed: $path" >&2
     fi
-    rm -f "$norm"
+    rm -f "$norm" "$norm.seeds"
   done <<< "$listing"
   echo "[+] imported $n_files file(s), $total row(s). Newest run_ts wins -- see 'recon-db.sh latest'."
+}
+
+# =============================================================================
+# Run-to-run changes (B4.3) and history (B4.4). One engine, three entry points:
+#   recon-db.sh diff OLD.csv NEW.csv [-o OUT.tsv]      two runs, field by field (no DB)
+#   recon-db.sh changes [PATTERN] [--since TS] [--csv PATH...]   change events across runs
+#   recon-db.sh history [PATTERN] [--csv PATH...]      first/last seen per service
+# changes/history read the stored runs (recon_hosts), or with --csv the run CSVs in
+# PATH (files or directories, ordered like `import`), so they work without the DB.
+#
+# Unit: the service, scheme://host[:port] (default ports dropped), within its seed.
+# Its values come from its root URL's row (else its smallest URL). A service is "new"
+# or "removed" only under a seed both runs covered; a field is compared only when both
+# runs collected it (a stage that was off is not a change); multi-valued fields compare
+# as sets; an address change inside the same ASN is not reported (CDN and round-robin
+# addresses rotate).
+# =============================================================================
+_DELTA_FIELDS="status_code title webserver technologies cpe redirect_location auth http_flags missing_sec_headers ip ipv6 asn tls_version cert_not_after cert_issuer tls_flags favicon_mmh3"
+
+_delta_py() {
+  python3 - "$@" <<'PYDELTA'
+import sys, csv, os, re, json, glob
+csv.field_size_limit(min(sys.maxsize, 1 << 30))
+FIELDS = ["status_code", "title", "webserver", "technologies", "cpe", "redirect_location", "auth", "http_flags",
+          "missing_sec_headers", "ip", "ipv6", "asn", "tls_version", "cert_not_after", "cert_issuer", "tls_flags",
+          "favicon_mmh3"]
+MULTI = {"technologies", "cpe", "http_flags", "missing_sec_headers", "ipv6", "tls_flags"}
+# a field is compared only when the stage that fills it ran in both runs, judged by a field
+# that stage always fills: an empty tls_flags means "no flag" when tls_version is there
+SENTINEL = {f: "status_code" for f in ("status_code", "title", "webserver", "technologies", "cpe",
+                                       "redirect_location", "auth", "http_flags", "missing_sec_headers")}
+SENTINEL.update({"ip": "ip", "asn": "ip", "ipv6": "ipv6", "favicon_mmh3": "favicon_mmh3",
+                 "tls_version": "tls_version", "cert_not_after": "tls_version", "cert_issuer": "tls_version",
+                 "tls_flags": "tls_version"})
+def unguard(v):
+    v = v or ""
+    return v[1:] if v[:1] == "'" and v[1:2] in ("=", "+", "-", "@", "\t", "\r") else v
+def norm(f, v):
+    v = unguard(v).strip()
+    if f in MULTI and v:
+        return ";".join(sorted(set(x.strip() for x in re.split(r"[;,]", v) if x.strip())))
+    return re.sub(r"\s+", " ", v)
+def clean(v):
+    return "".join(ch if ch.isprintable() else " " for ch in (v or "")).replace("\t", " ")[:300]
+def service(url):
+    m = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*)://([^/?#]*)(.*)$", (url or "").strip())
+    if not m:
+        return "", ""
+    sch, auth, rest = m.group(1).lower(), m.group(2).rsplit("@", 1)[-1].lower(), m.group(3)
+    host, port = auth, ""
+    if auth.startswith("["):
+        host, _, p = auth.partition("]")
+        host, port = host + "]", p.lstrip(":")
+    elif auth.count(":") == 1:
+        host, port = auth.split(":")
+    if (sch, port) in (("https", "443"), ("http", "80")):
+        port = ""
+    return "%s://%s%s" % (sch, host, ":" + port if port else ""), (re.split(r"[?#]", rest, maxsplit=1)[0] or "/")
+def seed_of(r):
+    return (r.get("seed_domain") or "").strip().lower()
+def services(rows):
+    best = {}
+    for r in rows:
+        svc, path = service(r.get("url"))
+        if not svc:
+            continue
+        key, rank = (seed_of(r), svc), (0 if path == "/" else 1, r.get("url") or "")
+        if key not in best or rank < best[key][0]:
+            best[key] = (rank, r)
+    return {k: v[1] for k, v in best.items()}
+def ran_fields(rows, cols):
+    filled = {f for f in FIELDS if f in cols and any((r.get(f) or "").strip() for r in rows)}
+    return {f for f in FIELDS if f in cols and SENTINEL[f] in filled}
+def brief(r):
+    return clean(" ".join(x for x in (norm("status_code", r.get("status_code")), norm("title", r.get("title"))[:80]) if x))
+def delta(O, o_ran, N, n_ran, seeds):
+    """O, N: services() of two runs; events (change, seed, service, field, old, new)"""
+    both, ev = o_ran & n_ran, []
+    for key in sorted(set(O) | set(N)):
+        sd, svc = key
+        if sd not in seeds:
+            continue
+        o, n = O.get(key), N.get(key)
+        if o is None:
+            ev.append(("new", sd, svc, "", "", brief(n)))
+        elif n is None:
+            ev.append(("removed", sd, svc, "", brief(o), ""))
+        else:
+            for f in FIELDS:
+                if f not in both:
+                    continue
+                a, b = norm(f, o.get(f)), norm(f, n.get(f))
+                if a == b:
+                    continue
+                if f == "ip" and norm("asn", o.get("asn")) and norm("asn", o.get("asn")) == norm("asn", n.get("asn")):
+                    continue
+                ev.append(("changed", sd, svc, f, clean(a), clean(b)))
+    return ev
+def read_csv(p):
+    with open(p, newline="", encoding="utf-8", errors="replace") as fh:
+        rd = csv.DictReader(fh)
+        rows = [{(k or "").strip().lower(): v for k, v in r.items()} for r in rd]
+        cols = {(k or "").strip().lower() for k in (rd.fieldnames or [])}
+    return rows, cols
+def run_seeds(p, rows):
+    s = {seed_of(r) for r in rows if seed_of(r)}
+    try:
+        for ps in json.load(open(p + ".run.json", encoding="utf-8")).get("per_seed") or []:
+            if ps.get("seed"):
+                s.add(str(ps["seed"]).lower())
+    except Exception:
+        pass
+    return s
+def csv_runs(paths):
+    files = []
+    for p in paths:
+        if os.path.isdir(p):
+            files += [f for f in glob.glob(os.path.join(p, "**", "*.csv"), recursive=True)
+                      if not re.search(r"\.(vulns|cleaned|delta|cloud-assets)\.csv$", f)]
+        elif os.path.isfile(p):
+            files.append(p)
+    runs = []
+    for f in sorted(set(files)):
+        m = re.match(r"^recon-(.+)\.csv$", os.path.basename(f))
+        ts = m.group(1) if m else __import__("time").strftime("%Y%m%d-%H%M%S", __import__("time").localtime(os.path.getmtime(f)))
+        try:
+            rows, cols = read_csv(f)
+        except Exception:
+            continue
+        if "url" not in cols:
+            continue
+        runs.append((ts, f, rows, ran_fields(rows, cols), run_seeds(f, rows)))
+    runs.sort(key=lambda x: (x[0], x[1]))
+    return [(ts, rows, ran, seeds) for ts, f, rows, ran, seeds in runs]
+def db_runs(rows_f, ran_f, seeds_f):
+    rows, _ = read_csv(rows_f)
+    by = {}
+    for r in rows:
+        by.setdefault(r.get("run_ts") or "", []).append(r)
+    # a run loaded before 1.20 has no column list: it had the 1.19 store's columns only
+    LEGACY = {"status_code", "title", "webserver", "technologies", "ip", "asn"}
+    seeds, cols = {}, {}
+    for r in read_csv(seeds_f)[0]:
+        ts = r.get("run_ts") or ""
+        seeds.setdefault(ts, set()).update(x for x in (r.get("seeds") or "").lower().split(";") if x)
+        cols[ts] = set((r.get("cols") or "").split(";")) - {""} if (r.get("cols") or "").strip() else LEGACY
+    ran = {}
+    for r in read_csv(ran_f)[0]:
+        ts = r.get("run_ts") or ""
+        filled = {f for f in FIELDS if (r.get(f) or "").strip().lower() in ("t", "true", "1")}
+        ran[ts] = {f for f in FIELDS if SENTINEL[f] in filled and f in cols.get(ts, LEGACY)}
+    return [(ts, by.get(ts, []), ran.get(ts, set()), seeds.get(ts, set())) for ts in sorted(set(seeds) | set(by))]
+def history(runs):
+    last, events, seen, nruns = {}, [], {}, {}   # nruns: seed -> the runs that covered it
+    for ts, rows, ran, seeds in runs:
+        S = services(rows)
+        for key, r in S.items():
+            v = seen.setdefault(key, [ts, ts, 0, r])
+            v[1], v[2], v[3] = ts, v[2] + 1, r
+        for sd in seeds:
+            nruns.setdefault(sd, []).append(ts)
+            cur = {k: v for k, v in S.items() if k[0] == sd}
+            if sd in last:
+                pts, prev, pran = last[sd]
+                events += [(ts,) + e for e in delta(prev, pran, cur, ran, {sd})]
+            last[sd] = (ts, cur, ran)
+    return events, seen, nruns, {sd: v[0] for sd, v in last.items()}
+def want(pat, svc):
+    return not pat or pat.lower() in svc
+mode = sys.argv[1]
+if mode == "diff":
+    old, new, out, new_seeds = sys.argv[2:6]
+    (orow, ocol), (nrow, ncol) = read_csv(old), read_csv(new)
+    so, sn = run_seeds(old, orow), run_seeds(new, nrow)
+    if new_seeds and os.path.isfile(new_seeds):
+        sn |= {l.strip().lower() for l in open(new_seeds) if l.strip()}
+    ev = delta(services(orow), ran_fields(orow, ocol), services(nrow), ran_fields(nrow, ncol), so & sn)
+    with (open(out, "w", encoding="utf-8") if out else sys.stdout) as o:
+        o.write("change\tseed\tservice\tfield\told\tnew\n")
+        o.write("".join("\t".join(e) + "\n" for e in ev))
+    c = {k: sum(1 for e in ev if e[0] == k) for k in ("new", "removed", "changed")}
+    nchg = len({(e[1], e[2]) for e in ev if e[0] == "changed"})
+    sys.stderr.write("%d\t%d\t%d\t%d\t%s\t%s\n" % (c["new"], c["removed"], nchg, c["changed"],
+                     ",".join(sorted(so - sn)) or "-", ",".join(sorted(sn - so)) or "-"))
+    sys.exit(0)
+# changes / history over many runs
+what, pat, since = sys.argv[2:5]
+runs = csv_runs(sys.argv[6:]) if sys.argv[5] == "csv" else db_runs(*sys.argv[6:9])
+events, seen, nruns, latest = history(runs)
+w = sys.stdout.write
+if what == "changes":
+    w("run_ts\tseed\tservice\tchange\tfield\told\tnew\n")
+    for ts, ch, sd, svc, f, o, n in events:
+        if want(pat, svc) and (not since or ts > since):
+            w("\t".join([ts, sd, svc, ch, f, o, n]) + "\n")
+else:
+    w("seed\tservice\tfirst_seen\tlast_seen\truns_seen\truns_of_seed\tstate\tlatest\n")
+    for (sd, svc), (first, lst, cnt, r) in sorted(seen.items()):
+        if want(pat, svc):
+            after = [t for t in nruns.get(sd, []) if t > lst]
+            state = "gone since " + after[0] if after else "present"
+            w("\t".join([sd, svc, first, lst, str(cnt), str(len(nruns.get(sd, [])) or cnt), state, brief(r)]) + "\n")
+PYDELTA
+}
+
+# db_diff OLD.csv NEW.csv [-o OUT.tsv] [--new-seeds FILE]: field-by-field delta of two runs.
+# Prints a summary line on stderr; the TSV (change seed service field old new) to OUT or stdout.
+db_diff() {
+  local old="" new="" out="" seeds="" sum rc
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -o|--output) out="${2:-}"; shift 2 || shift;;
+      --new-seeds) seeds="${2:-}"; shift 2 || shift;;
+      -h|--help) echo "usage: recon-db.sh diff OLD.csv NEW.csv [-o OUT.tsv]" >&2; return 0;;
+      -*) echo "[!] diff: unknown option: $1" >&2; return 2;;
+      *) if [ -z "$old" ]; then old="$1"; elif [ -z "$new" ]; then new="$1"; else echo "[!] diff: extra argument ignored: $1" >&2; fi; shift;;
+    esac
+  done
+  if [ ! -f "$old" ] || [ ! -f "$new" ]; then echo "usage: recon-db.sh diff OLD.csv NEW.csv [-o OUT.tsv]" >&2; return 2; fi
+  command -v python3 >/dev/null 2>&1 || { echo "[!] diff: python3 is required." >&2; return 1; }
+  { sum="$(_delta_py diff "$old" "$new" "$out" "$seeds" 2>&1 >&3)"; rc=$?; } 3>&1
+  [ "$rc" -eq 0 ] || { echo "[!] diff failed: $(printf '%s' "$sum" | tail -n 3)" >&2; return 1; }
+  sum="$(printf '%s\n' "$sum" | tail -n 1)"
+  # shellcheck disable=SC2034  # read by run-recon (--monitor) after sourcing this file
+  DIFF_SUMMARY="$sum"
+  local n r c f so sn
+  IFS=$'\t' read -r n r c f so sn <<< "$sum"
+  echo "[+] diff: $n new, $r removed, $c changed service(s) ($f field change(s))$([ "$so" != - ] && echo "; seeds only in $old: $so")$([ "$sn" != - ] && echo "; seeds only in $new: $sn")" >&2
+  return 0
+}
+
+# db_history changes|history [PATTERN] [--since TS] [--csv PATH...]
+db_history() {
+  local what="$1"; shift
+  local pat="" since="" csvmode=0 paths=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --since) since="${2:-}"; shift 2 || shift;;
+      --csv) csvmode=1; shift;;
+      -h|--help) echo "usage: recon-db.sh $what [HOST-PATTERN] [--since RUN_TS] [--csv CSV-or-DIR...]" >&2; return 0;;
+      -*) echo "[!] $what: unknown option: $1" >&2; return 2;;
+      *) if [ "$csvmode" = 1 ]; then paths+=("$1"); elif [ -z "$pat" ]; then pat="$1"; else echo "[!] $what: extra argument ignored: $1" >&2; fi; shift;;
+    esac
+  done
+  [ "$what" = changes ] || since=""
+  command -v python3 >/dev/null 2>&1 || { echo "[!] $what: python3 is required." >&2; return 1; }
+  if [ "$csvmode" = 1 ]; then
+    [ "${#paths[@]}" -gt 0 ] || { echo "[!] $what --csv: name the run CSVs or their directory." >&2; return 2; }
+    _delta_py runs "$what" "$pat" "$since" csv "${paths[@]}"
+    return $?
+  fi
+  db_available || { echo "[!] recon DB not reachable (run 'recon-db.sh init', or use --csv DIR)." >&2; return 1; }
+  db_schema >/dev/null 2>&1 || true
+  local d f sel="" agg="" p; d="$(mktemp -d "${TMPDIR:-/tmp}/recon-hist.XXXXXX")" || return 1
+  for f in $_DELTA_FIELDS; do sel="$sel, $f"; agg="$agg, bool_or(coalesce($f,'') <> '') AS $f"; done
+  p="${pat#*://}"; p="${p%%[:/]*}"
+  p="$(_sql_esc "$p")"; p="${p//\\/\\\\}"; p="${p//%/\\%}"; p="${p//_/\\_}"
+  _psql -c "COPY (SELECT run_ts, seed_domain, url$sel FROM recon_hosts WHERE lower(host) LIKE lower('%${p}%') ORDER BY run_ts, url) TO STDOUT WITH (FORMAT csv, HEADER true)" > "$d/rows.csv" 2>"$d/err" \
+    && _psql -c "COPY (SELECT run_ts$agg FROM recon_hosts GROUP BY run_ts) TO STDOUT WITH (FORMAT csv, HEADER true)" > "$d/ran.csv" 2>>"$d/err" \
+    && _psql -c "COPY (SELECT run_ts, seeds, cols FROM recon_runs UNION ALL SELECT run_ts, string_agg(DISTINCT lower(seed_domain), ';'), NULL FROM recon_hosts WHERE run_ts NOT IN (SELECT run_ts FROM recon_runs) GROUP BY run_ts) TO STDOUT WITH (FORMAT csv, HEADER true)" > "$d/seeds.csv" 2>>"$d/err" \
+    || { echo "[!] $what: query failed: $(head -c 300 "$d/err")" >&2; rm -rf "$d"; return 1; }
+  _delta_py runs "$what" "$pat" "$since" db "$d/rows.csv" "$d/ran.csv" "$d/seeds.csv"; local rc=$?
+  rm -rf "$d"; return "$rc"
 }
 
 # --- Metasploit msfdb credential reuse -------------------------------------
@@ -1216,11 +1531,13 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
     schema) db_available || { echo "[!] recon DB not reachable (see connection env)." >&2; exit 1; }
             db_schema && echo "[+] schema ready." || { echo "[!] failed." >&2; exit 1; };;
     stats)  db_available || { echo "[!] recon DB not reachable." >&2; exit 1; }
+            db_schema >/dev/null 2>&1 || true
             _psql <<'SQL'
 SELECT 'cache rows: '||count(*) FROM recon_cache
 UNION ALL SELECT 'cache sources: '||count(DISTINCT source) FROM recon_cache
 UNION ALL SELECT 'host rows: '||count(*) FROM recon_hosts
-UNION ALL SELECT 'runs stored: '||count(DISTINCT run_ts) FROM recon_hosts;
+UNION ALL SELECT 'runs stored: '||count(DISTINCT run_ts) FROM recon_hosts
+UNION ALL SELECT 'runs with a seed list: '||count(*) FROM recon_runs;
 SQL
             ;;
     hosts)  db_available || { echo "[!] recon DB not reachable." >&2; exit 1; }
@@ -1237,8 +1554,11 @@ SQL
             _psql -c "DELETE FROM recon_cache WHERE fetched_at < now() - interval '$days days'" && echo "[+] purged cache older than $days days.";;
     fix-collation|fixcollation) db_fix_collation;;
     vulns)  shift; db_vulns "$@";;
+    diff)    shift; db_diff "$@";;
+    changes) shift; db_history changes "$@";;
+    history) shift; db_history history "$@";;
     clean)  shift; db_clean "$@";;
-    help|-h|--help) sed -n '2,49p' "$0" | sed 's/^# \{0,1\}//';;
-    *) echo "unknown command: $cmd (try: init|schema|stats|hosts|latest|import|vulns|clean|fix-collation|purge)" >&2; exit 2;;
+    help|-h|--help) awk 'NR > 1 && !/^#/ { exit } NR > 1 && !/^# ?=+$/' "$0" | sed 's/^# \{0,1\}//';;
+    *) echo "unknown command: $cmd (try: init|schema|stats|hosts|latest|history|changes|diff|import|vulns|clean|fix-collation|purge)" >&2; exit 2;;
   esac
 fi

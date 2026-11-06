@@ -2616,6 +2616,334 @@ printf '%s ' "$@" >> "$MOCKLOG/curl.args"; echo >> "$MOCKLOG/curl.args"
 exit 0
 EOF
 
+# --- Batch 4 (B4.1): --scope, --list-targets, --drop-out-of-scope ------------------
+section "Batch 4: --scope FILE (fail-closed), --list-targets, --drop-out-of-scope"
+SC="$TMP/scopecase"; mkdir -p "$SC"
+_rc_is(){ if [ "$1" = "$2" ]; then _pass "$3"; else _fail "$3  [exit $1, want $2]"; fi; }
+_none_ran(){ if [ -z "$(ls "$MOCKLOG"/*.args 2>/dev/null)" ]; then _pass "$1"; else _fail "$1  [ran: $(cd "$MOCKLOG" && ls *.args | tr '\n' ' ')]"; fi; }
+# the dry run: the plan on stdout, nothing started, no work dir
+printf 'example.com\nhttps://www.example.com/x\nfoo bar\n10.0.0.1\n' > "$SC/in1.txt"
+rm -f "$MOCKLOG"/*.args; LT="$TMP/out_lt"; rm -rf "$LT"; mkdir -p "$LT"; _rc=0
+env PATH="$TESTPATH" HTTPX_BIN=httpx bash "$RUN_RECON" -i "$SC/in1.txt" -D "$LT" --list-targets > "$LT/plan.txt" 2> "$LT/err.txt" || _rc=$?
+_rc_is "$_rc" 0                                                              "--list-targets without --scope: exit 0"
+assert_grep  "$LT/plan.txt" '^1 +example\.com +domain +in scope'             "--list-targets: each seed with its status"
+assert_grep  "$LT/plan.txt" '^2 +www\.example\.com +domain +in scope'        "--list-targets: a URL line is shown as the seed it becomes"
+assert_grep  "$LT/plan.txt" '^3 +foo bar +- +INVALID +not a domain'          "--list-targets: an invalid line and why"
+assert_grep  "$LT/plan.txt" 'a bare address: write it as 10\.0\.0\.1/32'     "--list-targets: a bare address is invalid, with the fix"
+_none_ran                                                                     "--list-targets: no tool is started (nothing is sent)"
+if compgen -G "$LT/_work-*" >/dev/null; then _fail "--list-targets: no work dir"; else _pass "--list-targets: no work dir"; fi
+# fail closed: an out-of-scope seed, a malformed entry
+printf 'example.com\n!api.example.com\n10.0.0.0/24\n' > "$SC/s1.txt"
+printf 'example.com\nother.net\n' > "$SC/in2.txt"
+rm -f "$MOCKLOG"/*.args; _rc=0
+env PATH="$TESTPATH" HTTPX_BIN=httpx bash "$RUN_RECON" -i "$SC/in2.txt" -D "$LT" -o "$LT/r.csv" --scope "$SC/s1.txt" > /dev/null 2> "$LT/err2.txt" || _rc=$?
+_rc_is "$_rc" 2                                                              "--scope: an out-of-scope seed stops the run (exit 2)"
+assert_grep  "$LT/err2.txt" 'line 2: other\.net: out of scope: no entry covers it' "--scope: the refusal names the seed and the reason"
+_none_ran                                                                     "--scope refusal: nothing is sent (no tool started)"
+assert_absent "$LT/r.csv"                                                     "--scope refusal: no output"
+rm -f "$MOCKLOG"/*.args; _rc=0
+env PATH="$TESTPATH" HTTPX_BIN=httpx bash "$RUN_RECON" -i "$SC/in2.txt" -D "$LT" --scope "$SC/s1.txt" --list-targets > "$LT/plan2.txt" 2>&1 || _rc=$?
+_rc_is "$_rc" 2                                                              "--list-targets: exit 2 when the run would refuse"
+assert_grep  "$LT/plan2.txt" 'would REFUSE to start'                         "--list-targets: says the run would refuse"
+assert_grep  "$LT/plan2.txt" '^scope +: .*s1\.txt \(sha256 [0-9a-f]{16}\): 3 entries \(1 name\(s\), 1 range\(s\), 0 ASN\(s\); 1 exclusion\(s\)\)' "--list-targets: the scope file, its hash and a summary"
+printf 'example.com\nhttps://x.org/a\n10.0.0.1/8\ncom\n' > "$SC/bad.txt"
+_rc=0; env PATH="$TESTPATH" HTTPX_BIN=httpx bash "$RUN_RECON" -i "$SC/in2.txt" -D "$LT" --scope "$SC/bad.txt" > /dev/null 2> "$LT/err3.txt" || _rc=$?
+_rc_is "$_rc" 2                                                              "--scope: a malformed scope file stops the run"
+assert_grep  "$LT/err3.txt" 'line 2: https://x\.org/a: write a bare name'    "--scope: a URL entry is refused, with its line number"
+assert_grep  "$LT/err3.txt" 'line 3: 10\.0\.0\.1/8 has host bits set \(did you mean 10\.0\.0\.0/8\?\)' "--scope: a CIDR with host bits set is refused"
+assert_grep  "$LT/err3.txt" 'line 4: com is a whole top-level domain'        "--scope: a whole TLD is refused"
+# a default run (no --scope) warns about the lines it ignores (they were dropped silently)
+DOMAINS="$SC/in1.txt" run_case ignored --passive-only
+assert_grep  "$ERRLOG" 'input: ignored 2 line\(s\): foo bar, 10\.0\.0\.1'   "default run: the ignored input lines are named (once silent)"
+
+# names: exclusions hold, the crawl stays inside, tools that cannot be held are skipped
+DOMAINS="$SC/in2.txt" run_case scope_names --scope "$SC/s1.txt" --drop-out-of-scope --subs --crawlers-all --nuclei --takeover
+assert_grep  "$ERRLOG" '--scope: skipped line 2: other\.net: out of scope'   "--drop-out-of-scope: the seed is skipped with a warning"
+refute_grep  "$CSV" 'other\.net'                                             "--drop-out-of-scope: the skipped seed is not run"
+refute_grep  "$CSV" 'api\.example\.com'                                      "--scope: an excluded name (subfinder found it) is not probed or listed"
+assert_grep  "$CSV" 'https://www\.example\.com[^,]*,www\.example\.com,'      "--scope: other names under the seed still run"
+_ws="$(ls -d "$OUTDIR"/_work-* 2>/dev/null | head -n 1)"
+assert_grep  "$_ws/raw/example.com/hosts_all.txt" '^www\.example\.com$'      "takeover candidates: the list the check reads"
+refute_grep  "$_ws/raw/example.com/hosts_all.txt" 'api\.example\.com'       "--scope: the excluded name is not a takeover candidate (not probed by subzy/nuclei)"
+assert_fgrep "$MOCKLOG/katana.args" '-cs ^https?://(([^/?#@]*\.)?(example\.com))(:[0-9]+)?([/?#]|$)' "--scope: katana follows links only inside the allowed names (-cs)"
+assert_fgrep "$MOCKLOG/katana.args" '-cos ^https?://(([^/?#@]*\.)?(api\.example\.com))(:[0-9]+)?([/?#]|$)' "--scope: katana never follows a link to an excluded name (-cos)"
+assert_absent "$MOCKLOG/gospider.args"                                       "--scope: gospider (cannot be held to the scope) is skipped"
+assert_grep  "$ERRLOG" '--crawlers-all under --scope'                        "--scope: ...with a warning"
+assert_grep  "$MOCKLOG/nuclei.args" -- ' -dr( |$)'                            "--scope: nuclei follows no redirects (-dr)"
+assert_grep  "$CSV.scope.txt" '^\[scope\] scope-file \[info\] file=.*s1\.txt sha256=[0-9a-f]{64} entries=3 '  "<out>.scope.txt: the scope file and its hash"
+assert_grep  "$CSV.scope.txt" '^\[scope\] seed-in-scope \[info\] seed=example\.com kind=domain line=1 entry=example\.com' "<out>.scope.txt: each seed and the entry that allows it"
+assert_grep  "$CSV.scope.txt" '^\[scope\] seed-skipped \[info\] seed=other\.net line=2 status=out'  "<out>.scope.txt: the skipped seed"
+assert_grep  "$CSV.run.json" '"seeds_out": 1'                                "run.json: the scope record (seeds skipped)"
+assert_grep  "$CSV.run.json" '"sha256": "[0-9a-f]{64}"'                      "run.json: the scope file's SHA-256"
+assert_grep  "$CSV.run.json" '"input": ".*in2\.txt"'                         "run.json: the input is the file given, not the filtered copy"
+
+# addresses: a name resolving into an excluded range is held back; origin candidates
+# outside the allowed ranges are not contacted
+cp "$MOCKBIN/dnsx" "$MOCKBIN/dnsx.base"
+mk dnsx <<'EOF'
+#!/usr/bin/env bash
+"$(dirname "$0")/dnsx.base" "$@" | sed -E 's/^(\{"host":"www\.example\.com","a":\[)"10\.0\.0\.1"/\1"10.9.9.9"/'
+EOF
+# tlsx gets its names in a file: record what each call was given
+cp "$MOCKBIN/tlsx" "$MOCKBIN/tlsx.base"
+mk tlsx <<'EOF'
+#!/usr/bin/env bash
+a=("$@"); for i in "${!a[@]}"; do [ "${a[$i]}" = -l ] && cat "${a[$((i+1))]}" >> "$MOCKLOG/tlsx.lists" 2>/dev/null; done
+exec "$(dirname "$0")/tlsx.base" "$@"
+EOF
+printf 'example.com\n!10.9.9.0/24\n' > "$SC/s2.txt"
+run_case scope_addr --scope "$SC/s2.txt" --subs --certs --origin
+refute_grep  "$CSV" 'www\.example\.com'                                      "--scope: a name resolving into an excluded range is not probed"
+assert_grep  "$CSV.scope.txt" 'scope-held-back \[info\] kind=name target=www\.example\.com address=10\.9\.9\.9 note=not contacted: resolves into an excluded range' "<out>.scope.txt: ...and is listed with its address"
+assert_grep  "$MOCKLOG/tlsx.lists" '^api\.example\.com$'                      "certificate harvest: the names tlsx was given"
+refute_grep  "$MOCKLOG/tlsx.lists" '^www\.example\.com$'                      "--scope: ...not the held-back name (checked before the harvest)"
+assert_fgrep "$MOCKLOG/katana.args" '-cs ^https?://(amass-host\.example\.com|api\.example\.com|asset-host\.example\.com|' "--scope with address exclusions: katana crawls only the live hosts already checked"
+refute_grep  "$MOCKLOG/katana.args" -- '-cs [^ ]*\[\^/'                      "--scope with address exclusions: ...not any name under the allowed domains"
+assert_grep  "$CSV.scope.txt" 'kind=origin-candidate target=10\.0\.0\.1 via=.* note=not contacted: outside the allowed ranges' "--scope: an --origin candidate outside the allowed ranges is held back"
+refute_grep  "$MOCKLOG/curl.args" -- '--resolve [^ ]*:10\.0\.0\.1 '          "--scope: ...and never requested"
+assert_grep  "$CSV.run.json" '"name": 1'                                     "run.json: what was held back, by kind"
+mv "$MOCKBIN/dnsx.base" "$MOCKBIN/dnsx"; mv "$MOCKBIN/tlsx.base" "$MOCKBIN/tlsx"; rm -f "$MOCKLOG/tlsx.lists"
+
+# allowed ranges: candidates inside are verified; internet-scan hits outside are held back;
+# a CIDR seed loses its excluded addresses; range-certificate names outside the scope stay out
+printf 'example.com\n10.0.0.0/24\n192.0.2.0/24\n!192.0.2.5\n' > "$SC/s3.txt"
+printf 'example.com\n192.0.2.0/24\n' > "$SC/in3.txt"
+DOMAINS="$SC/in3.txt" run_case scope_ranges --scope "$SC/s3.txt" --origin --favicon
+assert_grep  "$MOCKLOG/curl.args" -- '--resolve [^ ]*:10\.0\.0\.1 '           "--scope: an --origin candidate inside an allowed range is verified"
+_ws="$(ls -d "$OUTDIR"/_work-* 2>/dev/null | head -n 1)"
+assert_grep  "$_ws/raw/example.com/favicon_ips.txt" '^192\.0\.2\.77$'        "--scope: an internet-scan hit inside an allowed range is cert-scanned"
+assert_grep  "$CSV.scope.txt" 'kind=internet-scan-hit target=198\.51\.100\.20:8443 note=not contacted: outside the allowed ranges' "--scope: a hit outside the allowed ranges is held back"
+refute_grep  "$_ws/raw/example.com/favicon_hits_hp.txt" '198\.51\.100\.20'   "--scope: ...and not cert-scanned"
+assert_grep  "$_ws/cidrs.txt" '^192\.0\.2\.4/32$'                             "--scope: a CIDR seed is swept without its excluded address"
+refute_grep  "$_ws/cidrs.txt" '^192\.0\.2\.0/24$|^192\.0\.2\.5/'              "--scope: ...the excluded address is not in the sweep"
+assert_grep  "$CSV.scope.txt" '^\[ranges\] scope-held-back \[info\] kind=range-certificate-name target=sneaky\.otherdomain\.com ' "--scope: a range-certificate name outside the scope is not made a seed"
+refute_grep  "$CSV" 'sneaky\.otherdomain\.com'                               "--scope: ...and not scanned"
+assert_grep  "$CSV" 'assets\.example\.com'                                   "--scope: a range-certificate name inside the scope is"
+
+# the screenshot browser: held to this seed's names; gowitness cannot be, so it is skipped
+run_case scope_ss --scope "$SC/s1.txt" --screenshots
+assert_grep  "$MOCKLOG/httpx.args" -- '--host-resolver-rules=MAP [^ ]+ 10\.0\.0\.1, .*MAP \* ~NOTFOUND' "--scope: the browser resolves only this seed's names (MAP * ~NOTFOUND for the rest)"
+SCREENSHOT_TOOL=gowitness run_case scope_gw --scope "$SC/s1.txt" --screenshots
+assert_absent "$MOCKLOG/gowitness.args"                                      "--scope: gowitness (no resolver rules) is not used"
+assert_grep  "$ERRLOG" '--screenshots under --scope needs httpx and dnsx'     "--scope: ...with a warning"
+
+# MTA-STS: the policy is fetched only from an in-scope name
+printf 'example.com\n!mta-sts.example.com\n' > "$SC/s4.txt"
+MOCK_POSTURE=bad run_case scope_posture --scope "$SC/s4.txt" --dns-posture
+refute_grep  "$MOCKLOG/curl.args" 'mta-sts\.example\.com'                     "--scope: the MTA-STS policy is not fetched from an excluded name"
+assert_grep  "$CSV.dnsposture.tsv" 'policy not fetched: mta-sts\.example\.com is outside --scope' "--scope: ...the posture table says why"
+
+# --- Batch 4 (B4.2): SHA-256 manifest of the run's outputs --------------------------
+section "Batch 4: <out>.manifest.sha256 (sha256sum -c format, this run's files only)"
+MF="$TMP/out_manifest"; rm -rf "$MF"; mkdir -p "$MF"
+printf 'from an earlier run\n' > "$MF/r.csv.zone.txt"; touch -d '2020-01-01 00:00:00' "$MF/r.csv.zone.txt"
+rm -f "$MOCKLOG"/*.args
+timeout 25 env PATH="$TESTPATH" HTTPX_BIN=httpx SECLISTS="$SECLISTS_TEST" RECON_CLOUD_CACHE="$MF/cloud_ranges.tsv" TLS_CHAIN_CHECK=0 \
+  bash "$RUN_RECON" -i "$DOMAINS" -D "$MF" -o "$MF/r.csv" --tls --screenshots > /dev/null 2> "$MF/stderr.log" || true
+M="$MF/r.csv.manifest.sha256"
+assert_exists "$M"                                                           "the run writes <out>.manifest.sha256"
+assert_grep  "$M" '^[0-9a-f]{64}  r\.csv$'                                   "manifest: the CSV, by a path relative to its directory"
+assert_grep  "$M" '^[0-9a-f]{64}  r\.csv\.run\.json$'                        "manifest: run.json"
+assert_grep  "$M" '^[0-9a-f]{64}  r\.csv\.report\.html$'                     "manifest: the report"
+assert_grep  "$M" '^[0-9a-f]{64}  screenshots-[0-9-]+/'                      "manifest: the screenshots"
+refute_grep  "$M" 'manifest\.sha256'                                         "manifest: not itself"
+refute_grep  "$M" 'r\.csv\.zone\.txt'                                        "manifest: an older file with the same prefix (another run) is left out"
+assert_grep  "$MF/stderr.log" 'manifest: 1 older file\(s\) named like this run.s outputs were left out .*: r\.csv\.zone\.txt' "manifest: ...and named in a warning"
+if ( cd "$MF" && sha256sum --quiet -c r.csv.manifest.sha256 ) >/dev/null 2>&1; then _pass "manifest: sha256sum -c verifies the set"; else _fail "manifest: sha256sum -c verifies the set"; fi
+printf 'x' >> "$MF/r.csv.run.json"
+if ( cd "$MF" && sha256sum --quiet -c r.csv.manifest.sha256 ) >/dev/null 2>&1; then _fail "manifest: a changed file fails the check"; else _pass "manifest: a changed file fails the check"; fi
+
+# --- Batch 4 (B4.3, B4.4): field-by-field changes and history ---------------------
+section "Batch 4: recon-db.sh diff / changes / history, --monitor -> <out>.delta.tsv"
+RDB="$(dirname "$RUN_RECON")/recon-db.sh"
+DL="$TMP/delta"; rm -rf "$DL"; mkdir -p "$DL/runs"
+H='seed_domain,url,host,sources,status_code,content_length,webserver,title,technologies,ip,asn,asn_org,tls_version,cert_not_after,tls_flags,cpe'
+{ echo "$H"
+  echo 'example.com,https://example.com/,example.com,live,200,10,nginx,Home,Nginx;PHP,10.0.0.1,AS1,One,tls13,2030-01-01,,cpe:a'
+  echo 'example.com,https://example.com/a,example.com,katana,200,10,nginx,A,,10.0.0.1,AS1,One,,,,'
+  echo 'example.com,https://old.example.com,old.example.com,subfinder,200,5,apache,Old,,10.0.0.2,AS1,One,tls12,2027-01-01,,'
+  echo 'example.com,https://cdn.example.com,cdn.example.com,subfinder,200,5,cloudflare,CDN,,104.16.0.1,AS13335,Cloudflare,tls13,2027-01-01,,'
+  echo 'example.com,https://moved.example.com,moved.example.com,subfinder,200,5,nginx,M,,10.0.0.3,AS1,One,tls13,2027-01-01,,'
+  echo 'other.org,https://other.org,other.org,live,200,5,iis,O,,10.1.0.1,AS2,Two,,,,'
+} > "$DL/runs/recon-20261101-000000.csv"
+{ echo "$H"
+  echo 'example.com,https://example.com/,example.com,live,200,10,nginx,Home,PHP;Nginx,10.0.0.9,AS1,One,tls13,2031-01-01,CertExpiring,cpe:a'
+  echo 'example.com,https://example.com:8443/,example.com,naabu,401,0,caddy,,,10.0.0.1,AS1,One,tls13,2031-01-01,,'
+  echo 'example.com,https://cdn.example.com,cdn.example.com,subfinder,200,5,cloudflare,CDN,,104.16.0.2,AS13335,Cloudflare,tls13,2027-01-01,,'
+  echo 'example.com,https://moved.example.com,moved.example.com,subfinder,200,5,nginx,M,,203.0.113.7,AS9,Nine,tls13,2027-01-01,,'
+  echo 'new.org,https://new.org,new.org,live,200,5,iis,N,,10.2.0.1,AS2,Two,,,,'
+} > "$DL/runs/recon-20261102-000000.csv"
+env PATH="$TESTPATH" bash "$RDB" diff "$DL/runs/recon-20261101-000000.csv" "$DL/runs/recon-20261102-000000.csv" -o "$DL/d.tsv" 2> "$DL/d.err"
+D="$DL/d.tsv"
+assert_grep  "$D" '^change	seed	service	field	old	new$'                    "diff: a TSV with a header"
+assert_grep  "$D" '^changed	example\.com	https://example\.com	cert_not_after	2030-01-01	2031-01-01$' "diff: a field that changed, old and new (the root URL's row speaks for the service)"
+assert_grep  "$D" '^changed	example\.com	https://example\.com	tls_flags		CertExpiring$' "diff: a TLS flag that appeared (TLS ran in both runs, judged by tls_version)"
+refute_grep  "$D" '	technologies	'                                        "diff: multi-valued fields compare as sets (order is not a change)"
+refute_grep  "$D" 'https://example\.com	ip	|cdn\.example\.com	ip	'           "diff: an address change inside the same ASN is not reported (CDN, round robin)"
+assert_grep  "$D" '^changed	example\.com	https://moved\.example\.com	ip	10\.0\.0\.3	203\.0\.113\.7$' "diff: an address change to another network is"
+assert_grep  "$D" '^changed	example\.com	https://moved\.example\.com	asn	AS1	AS9$' "diff: ...and the ASN change"
+assert_grep  "$D" '^new	example\.com	https://example\.com:8443			401$'     "diff: a new service (scheme://host:port)"
+assert_grep  "$D" '^removed	example\.com	https://old\.example\.com		200 Old	$'   "diff: a removed service"
+refute_grep  "$D" 'other\.org|new\.org'                                     "diff: seeds that only one run covered are not compared"
+refute_grep  "$D" 'https://example\.com/a'                                  "diff: crawled URLs are not services (the unit is scheme://host:port)"
+assert_grep  "$DL/d.err" 'diff: 1 new, 1 removed, 2 changed service\(s\) \(4 field change\(s\)\); seeds only in .*: other\.org; seeds only in .*: new\.org' "diff: the summary"
+# a stage that was off in one run is not a change
+cut -d, -f1-12 "$DL/runs/recon-20261101-000000.csv" > "$DL/notls.csv"
+env PATH="$TESTPATH" bash "$RDB" diff "$DL/notls.csv" "$DL/runs/recon-20261102-000000.csv" -o "$DL/d2.tsv" 2>/dev/null
+refute_grep  "$DL/d2.tsv" '	(tls_version|cert_not_after|tls_flags|cpe)	'     "diff: fields one run did not collect are not compared"
+# history and change events over a directory of run CSVs (no DB)
+sed 's/,Home,/,Home v2,/' "$DL/runs/recon-20261102-000000.csv" > "$DL/runs/recon-20261103-000000.csv"
+env PATH="$TESTPATH" bash "$RDB" changes --csv "$DL/runs" > "$DL/c.tsv" 2>&1
+assert_grep  "$DL/c.tsv" '^run_ts	seed	service	change	field	old	new$'          "changes --csv: a TSV"
+assert_grep  "$DL/c.tsv" '^20261102-000000	example\.com	https://old\.example\.com	removed	'  "changes --csv: each event with the run it was seen in"
+assert_grep  "$DL/c.tsv" '^20261103-000000	example\.com	https://example\.com	changed	title	Home	Home v2$' "changes --csv: events between every pair of consecutive runs"
+env PATH="$TESTPATH" bash "$RDB" changes example.com:8443 --csv "$DL/runs" > "$DL/c2.tsv" 2>&1
+assert_grep  "$DL/c2.tsv" 'https://example\.com:8443	new'                    "changes PATTERN: filters by service (a port works)"
+refute_grep  "$DL/c2.tsv" 'old\.example\.com'                                 "changes PATTERN: ...and leaves the others out"
+env PATH="$TESTPATH" bash "$RDB" changes --since 20261102-000000 --csv "$DL/runs" > "$DL/c3.tsv" 2>&1
+refute_grep  "$DL/c3.tsv" '^20261102-000000'                                  "changes --since TS: only the runs after TS"
+env PATH="$TESTPATH" bash "$RDB" history --csv "$DL/runs" > "$DL/h.tsv" 2>&1
+assert_grep  "$DL/h.tsv" '^example\.com	https://old\.example\.com	20261101-000000	20261101-000000	1	3	gone since 20261102-000000	200 Old$' "history: first/last seen, runs seen of the seed's runs, gone since"
+assert_grep  "$DL/h.tsv" '^example\.com	https://example\.com	20261101-000000	20261103-000000	3	3	present	200 Home v2$' "history: a present service and its latest state"
+# the store: schema migration, the run's seeds and columns, history queries
+mk psql <<'PSQLEOF'
+#!/usr/bin/env bash
+sql="$(cat 2>/dev/null)"; printf 'ARGS: %s\nSQL: %s\n' "$*" "$sql" >> "$MOCKLOG/psql.args"
+case "$*" in
+  *"SELECT 1"*) echo 1;;
+  *"COPY (SELECT run_ts, seed_domain, url"*) cat "$MOCK_PG/rows.csv";;
+  *"bool_or"*) cat "$MOCK_PG/ran.csv";;
+  *"FROM recon_runs UNION ALL"*) cat "$MOCK_PG/seeds.csv";;
+esac
+exit 0
+PSQLEOF
+MOCK_PG="$DL/pg"; mkdir -p "$MOCK_PG"
+F=status_code,title,webserver,technologies,cpe,redirect_location,auth,http_flags,missing_sec_headers,ip,ipv6,asn,tls_version,cert_not_after,cert_issuer,tls_flags,favicon_mmh3
+{ echo "run_ts,seed_domain,url,$F"
+  echo '20261001-000000,example.com,https://example.com/,200,Home,nginx,Nginx,,,,,,10.0.0.1,,AS1,,,,,'
+  echo '20261101-000000,example.com,https://example.com/,200,Home,nginx,Nginx,cpe:a,,,,,10.0.0.1,,AS1,tls13,2030-01-01,,,'
+  echo '20261102-000000,example.com,https://example.com/,200,Home,nginx,Nginx,cpe:a,,,,,10.0.0.1,,AS1,tls13,2031-01-01,,,'
+} > "$MOCK_PG/rows.csv"
+{ echo "run_ts,$F"
+  echo '20261001-000000,t,t,t,t,f,f,f,f,f,t,f,t,f,f,f,f,f'
+  echo '20261101-000000,t,t,t,t,t,f,f,f,f,t,f,t,t,t,f,f,f'
+  echo '20261102-000000,t,t,t,t,t,f,f,f,f,t,f,t,t,t,f,f,f'
+} > "$MOCK_PG/ran.csv"
+{ echo 'run_ts,seeds,cols'
+  echo '20261101-000000,example.com,status_code;title;webserver;technologies;cpe;ip;asn;tls_version;cert_not_after'
+  echo '20261102-000000,example.com,status_code;title;webserver;technologies;cpe;ip;asn;tls_version;cert_not_after'
+  echo '20261001-000000,example.com,'
+} > "$MOCK_PG/seeds.csv"
+rm -f "$MOCKLOG/psql.args"
+env PATH="$TESTPATH" MOCK_PG="$MOCK_PG" RECON_DB_ENV=/nonexistent RECON_DB_DSN=postgresql://mock/recon bash "$RDB" changes > "$DL/dbc.tsv" 2>&1
+assert_grep  "$DL/dbc.tsv" '^20261102-000000	example\.com	https://example\.com	changed	cert_not_after	2030-01-01	2031-01-01$' "changes (store): events from the stored runs"
+refute_grep  "$DL/dbc.tsv" '	cpe	'                                            "changes (store): a run stored before 1.20 had no cpe column, so cpe is not compared with it"
+assert_grep  "$MOCKLOG/psql.args" 'ADD COLUMN IF NOT EXISTS cpe text'            "store: the schema gains the compared columns (existing stores are migrated)"
+rm -f "$MOCKLOG/psql.args"
+printf 'example.com\nexample.net\n' > "$DL/seeds.txt"
+env PATH="$TESTPATH" RECON_DB_ENV=/nonexistent RECON_DB_DSN=postgresql://mock/recon bash -c '. "$1"; db_load_csv "$2" 20261105-000000 "$3"' _ "$RDB" "$DL/runs/recon-20261102-000000.csv" "$DL/seeds.txt" > /dev/null 2>&1
+assert_grep  "$MOCKLOG/psql.args" "INSERT INTO recon_runs \(run_ts, seeds, cols\) VALUES \('20261105-000000', 'example\.com;example\.net', 'status_code;title;webserver;technologies;cpe;ip;asn;tls_version;cert_not_after;tls_flags'\)" "store: each run records the seeds it covered and the columns its CSV had"
+assert_grep  "$MOCKLOG/psql.args" 'tls_flags, favicon_mmh3\)'                   "store: the compared fields are loaded"
+rm -f "$MOCKBIN/psql"
+# --monitor: the delta next to new-assets, in run.json and in the report
+run_case mon_a
+cp "$CSV" "$TMP/mon_prev.csv"
+run_case mon_b --subs --monitor --monitor-prev "$TMP/mon_prev.csv"
+assert_exists "$CSV.delta.tsv"                                               "--monitor: <out>.delta.tsv"
+assert_grep  "$CSV.delta.tsv" '^new	example\.com	https://api\.example\.com	'   "--monitor: a service found this time is new"
+assert_grep  "$ERRLOG" 'Changes +: [0-9]+ new, 0 removed, 0 changed service\(s\) \(0 field change\(s\)\) vs mon_prev\.csv' "--monitor: the change summary"
+assert_grep  "$CSV.run.json" '"delta_changes": [1-9]'                        "run.json: the number of changes"
+assert_grep  "$CSV.report.html" 'id="changes">Changes since the previous run' "report: a Changes section"
+assert_grep  "$CSV.manifest.sha256" '  r\.csv\.delta\.tsv$'                    "manifest: the delta is covered"
+# --monitor with --db: probe results are measured afresh (the cache would hide a change), and stored
+mk psql <<'PSQLEOF'
+#!/usr/bin/env bash
+sql=""; A=("$@"); i=0
+while [ $i -lt ${#A[@]} ]; do case "${A[$i]}" in -c) i=$((i+1)); sql="${A[$i]}";; esac; i=$((i+1)); done
+[ -z "$sql" ] && sql="$(cat 2>/dev/null)"
+printf 'SQL: %s\n' "$sql" >> "$MOCKLOG/psql.args"
+case "$sql" in "SELECT 1") echo 1;; esac
+exit 0
+PSQLEOF
+run_case mon_db --db --monitor --monitor-prev "$TMP/mon_prev.csv"
+refute_grep  "$MOCKLOG/psql.args" "c\.source = 'live_probe'"                   "--monitor --db: the live probe is not read from the cache"
+refute_grep  "$MOCKLOG/psql.args" "c\.source = 'httpx_json_v2'"                "--monitor --db: nor the enrichment records"
+assert_grep  "$MOCKLOG/psql.args" "'live_probe'"                                "--monitor --db: the fresh probe results are still stored"
+assert_grep  "$MOCKLOG/psql.args" "source='urls'"                               "--monitor --db: passive lookups still use the cache"
+run_case nomon_db --db
+assert_grep  "$MOCKLOG/psql.args" "c\.source = 'live_probe'"                   "--db without --monitor: the live probe cache is read (unchanged)"
+rm -f "$MOCKBIN/psql"
+
+# --- Batch 4 (B4.5): an interrupted run keeps its work dir; --resume continues it -----
+section "Batch 4: SIGTERM/SIGINT stop the run and keep its work; --resume skips the finished seeds"
+RS="$TMP/resume"; rm -rf "$RS"; mkdir -p "$RS/out" "$RS/full"
+printf 'example.com\nslow.example.org\n' > "$RS/in.txt"
+cp "$MOCKBIN/gau" "$MOCKBIN/gau.base"
+mk gau <<'EOF'
+#!/usr/bin/env bash
+in="$(cat)"; printf '%s\n' "$in" >> "$MOCKLOG/gau.seeds"
+case "$in" in *slow.example.org*) [ -e "$MOCKLOG/gau.hang" ] && exec sleep 61.5;; esac
+printf '%s\n' "$in" | exec "$(dirname "$0")/gau.base" "$@"
+EOF
+_rr(){ # <outdir> <stderr> [args...]: the run-recon command line the resume tests repeat
+  local o="$1" e="$2"; shift 2
+  env PATH="$TESTPATH" HTTPX_BIN=httpx SECLISTS="$SECLISTS_TEST" RECON_CLOUD_CACHE="$RS/cloud.tsv" TLS_CHAIN_CHECK=0 \
+    bash "$RUN_RECON" -i "$RS/in.txt" -D "$o" -o "$o/r.csv" -t 1 --no-report "$@" > /dev/null 2> "$e"
+}
+_rr_bg(){ # the same, in the background: exec, so $! is run-recon itself
+  local o="$1" e="$2"; shift 2
+  exec env PATH="$TESTPATH" HTTPX_BIN=httpx SECLISTS="$SECLISTS_TEST" RECON_CLOUD_CACHE="$RS/cloud.tsv" TLS_CHAIN_CHECK=0 \
+    bash "$RUN_RECON" -i "$RS/in.txt" -D "$o" -o "$o/r.csv" -t 1 --no-report "$@" > /dev/null 2> "$e"
+}
+_wait_hang(){ local _; for _ in $(seq 1 150); do grep -q slow "$MOCKLOG/gau.seeds" 2>/dev/null && compgen -G "$1/_work-*/done/example.com" >/dev/null && return 0; sleep 0.2; done; return 1; }
+# the reference: the same run, never interrupted
+rm -f "$MOCKLOG/gau.hang"; _rr "$RS/full" "$RS/full.err" || true
+# run 1: stopped by SIGTERM while the second seed runs
+: > "$MOCKLOG/gau.hang"; rm -f "$MOCKLOG/gau.seeds"
+_rr_bg "$RS/out" "$RS/err1.txt" & RP=$!
+_wait_hang "$RS/out" && sleep 0.5
+_rc=0; _rr "$RS/out" "$RS/err0.txt" --resume || _rc=$?
+_rc_is "$_rc" 2                                                             "--resume while the run is still running: refused (its work dir is locked)"
+assert_grep  "$RS/err0.txt" 'is still running \(its lock is held\)'         "--resume while it runs: ...and why"
+kill -TERM "$RP" 2>/dev/null; _rc=0; wait "$RP" || _rc=$?
+_rc_is "$_rc" 143                                                           "SIGTERM: the run stops with exit 143"
+W="$(ls -d "$RS/out"/_work-* 2>/dev/null | head -n 1)"
+assert_grep  "$W/state" '^status=interrupted$'                               "SIGTERM: the work dir is kept and marked interrupted"
+assert_grep  "$W/state" '^args_sha256=[0-9a-f]{64}$'                         "state: a hash of the command line (no values)"
+if [ -e "$W/done/example.com" ] && [ -s "$W/parts/map.example.com.tsv" ]; then _pass "SIGTERM: the finished seed's work is there"; else _fail "SIGTERM: the finished seed's work is there"; fi
+assert_grep  "$RS/err1.txt" 'run the same command again with --resume' "SIGTERM: the message says how to resume"
+sleep 0.5
+if pgrep -f 'sleep 61\.5' >/dev/null; then _fail "SIGTERM: the stages the run started are stopped too"; pkill -f 'sleep 61\.5'; else _pass "SIGTERM: the stages the run started are stopped too"; fi
+assert_absent "$RS/out/r.csv"                                                "SIGTERM: no partial CSV"
+# another command line is not resumed
+_rc=0; _rr "$RS/out" "$RS/err2.txt" --subs --resume || _rc=$?
+_rc_is "$_rc" 2                                                             "--resume with other options: refused (exit 2)"
+assert_grep  "$RS/err2.txt" 'no interrupted run in .* was started with this command line' "--resume with other options: ...and why"
+# run 2: --resume
+rm -f "$MOCKLOG/gau.hang" "$MOCKLOG/gau.seeds"
+_rc=0; _rr "$RS/out" "$RS/err3.txt" --resume || _rc=$?
+_rc_is "$_rc" 0                                                             "--resume: the run finishes"
+assert_grep  "$RS/err3.txt" '--resume \(session 2\): 1 of 2 seed\(s\) had finished'  "--resume: the finished seed is kept"
+refute_grep  "$MOCKLOG/gau.seeds" '^example\.com$'                           "--resume: the finished seed is not run again"
+assert_grep  "$MOCKLOG/gau.seeds" '^slow\.example\.org$'                     "--resume: the interrupted seed runs again"
+if diff <(sort "$RS/full/r.csv") <(sort "$RS/out/r.csv") >/dev/null 2>&1; then _pass "--resume: the CSV equals the uninterrupted run's"; else _fail "--resume: the CSV equals the uninterrupted run's"; fi
+assert_grep  "$RS/out/r.csv.run.json" '"sessions": 2'                        "run.json: two sessions"
+assert_grep  "$RS/out/r.csv.run.json" '"seeds_resumed": 1'                   "run.json: one seed carried over"
+_rc=0; _rr "$RS/out" "$RS/err4.txt" --resume || _rc=$?
+_rc_is "$_rc" 2                                                             "--resume after the run finished: nothing to resume (exit 2)"
+# SIGINT (Ctrl-C) works the same way (here with SIGINT restored to its default: a script's
+# background job starts with it ignored)
+rm -rf "$RS/out2"; mkdir -p "$RS/out2"; : > "$MOCKLOG/gau.hang"; rm -f "$MOCKLOG/gau.seeds"
+env PATH="$TESTPATH" HTTPX_BIN=httpx SECLISTS="$SECLISTS_TEST" RECON_CLOUD_CACHE="$RS/cloud.tsv" TLS_CHAIN_CHECK=0 \
+  python3 -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.execvp("bash", ["bash"] + sys.argv[1:])' \
+  "$RUN_RECON" -i "$RS/in.txt" -D "$RS/out2" -o "$RS/out2/r.csv" -t 1 --no-report > /dev/null 2> "$RS/err5.txt" & RP=$!
+_wait_hang "$RS/out2" && sleep 0.5
+kill -INT "$RP" 2>/dev/null; _rc=0; wait "$RP" || _rc=$?
+_rc_is "$_rc" 130                                                           "SIGINT: the run stops with exit 130"
+assert_grep  "$(ls -d "$RS/out2"/_work-* | head -n 1)/state" '^status=interrupted$' "SIGINT: the work dir is kept"
+sleep 0.5; pkill -f 'sleep 61\.5' 2>/dev/null || true
+rm -f "$MOCKLOG/gau.hang" "$MOCKLOG/gau.seeds"; mv "$MOCKBIN/gau.base" "$MOCKBIN/gau"
+
 # --- 53) service health check: --resolvers catches dead resolvers ----------
 # (placed last: swaps the dig mock for one that reports no reply)
 section "service health check: --resolvers detects unreachable resolvers"
