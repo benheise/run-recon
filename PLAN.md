@@ -8,8 +8,10 @@ justified accuracy fix).
 
 **Status:** Done · In progress · Planned · Blocked (needs something from Ben) · Won't do
 **Last updated:** 2026-11-06, follow-ups F1–F10 done on `followups-v1.18` (PR #3), Batch 3 on
-`batch-3-email-dns` (PR #4) and Batch 4 on `batch-4-evidence` (stacked on #4). Not released: the next release
-follows the rest of the open batch work (B2.8, T1–T2)
+`batch-3-email-dns` (PR #4), Batch 4 on `batch-4-evidence` (PR #5) and Batch 5 on `batch-5-redirects-tls`
+(stacked on #5). That was the last open batch work (B2.8, T1–T2, plus X1): v1.20.0 can be released once the
+pull requests are merged. The V-list (section 2) still needs Ben's Kali VM; section 8 is planned for after
+the release.
 
 ## 0. Source of truth
 
@@ -17,7 +19,7 @@ follows the rest of the open batch work (B2.8, T1–T2)
 |---|---|---|---|
 | R1 | Git repository, `main` = v1.18.0, generated lab files ignored | Done | `git log` |
 | R2 | Push to GitHub (private `benheise/run-recon`) | Done: `main` pushed; releases v1.18.0 and v1.19.0 published. Tags cannot be pushed from Claude's sessions (HTTP 403), so releases/tags are created in the GitHub UI | tags `v1.18.0`, `v1.19.0` on GitHub |
-| R3 | Each batch on its own branch, merged by pull request | Done for Batch 2 (#1, merged); follow-ups #3; Batch 3 #4; Batch 4 on `batch-4-evidence` (stacked on #4) | PR per batch |
+| R3 | Each batch on its own branch, merged by pull request | Done for Batch 2 (#1, merged); follow-ups #3; Batch 3 #4; Batch 4 #5; Batch 5 on `batch-5-redirects-tls` (stacked on #5) | PR per batch |
 
 ## 1. Batch 2: HTTP detail (WebInventory A4, A5, A6, A11)
 
@@ -30,7 +32,7 @@ follows the rest of the open batch work (B2.8, T1–T2)
 | B2.5 | `--extras` (opt-in, WebInventory's "safe extras"): robots.txt (paths become URL rows), security.txt (RFC 9116 Contact/Expires), one random-path 404 probe (catch-all 200, error-page server) → columns + `<out>.extras.txt` | Done (1.19.0) | lab: robots + expired/valid security.txt + catch-all host |
 | B2.6 | Report: HTTP posture on host cards; findings for cleartext auth, expired security.txt, plain HTTP | Done (1.19.0) | suite |
 | B2.7 | Docs, A/B vs v1.18.0, lab checks, PR | Done (#1 merged, v1.19.0 released) | BENCHMARK.md v1.19 section |
-| B2.8 | Followed redirect chain (final URL across hops) and password-form detection | Planned (not in 1.19: per-URL `Location` only) | lab redirect fixture |
+| B2.8 | Followed redirect chain (final URL across hops) and password-form detection | Done (`batch-5-redirects-tls`): `final_url`, `redirect_chain` (same-host hops through the run's records, `--extras` fetches the rest; off-host listed, not followed), `login_form` from httpx `-er` on the enrichment request, `Form` in `auth`, `CleartextAuth` for a form on plain HTTP or posting to `http://` | suite; lab: `bench-run-recon.sh http` (redir.test, plainlogin.redir.test) |
 
 ## 2. Needs a run on Ben's Kali VM (internet required)
 
@@ -85,10 +87,28 @@ follows the rest of the open batch work (B2.8, T1–T2)
 
 | ID | Item | Status | Check |
 |---|---|---|---|
-| T1 | Supported-version matrix and ciphers by version (tlsx `-ve`/`-ce` mapping) | Planned | lab |
-| T2 | Weak key / signature (`WeakKey`, `WeakSig`), `CertNotYetValid`, `DefaultCert` | Planned | lab fixture certs |
+| T1 | Supported-version matrix and ciphers by version | Done (`batch-5-redirects-tls`): `--tls-enum` (`--tls-full` its alias; in `--all`), WebInventory's plan in run-recon's own ClientHellos (tlsx `-ve`/`-ce` dropped: `-ci` cannot offer weak suites) → `tls_supported`, `tls_ciphers`, `tls_weak_cipher` | suite (a local TLS speaker); lab: `bench-run-recon.sh tls`, cross-checked with tlsx per version |
+| T2 | Weak key / signature (`WeakKey`, `WeakSig`), `CertNotYetValid`, `DefaultCert` | Done (`batch-5-redirects-tls`): tlsx `-cert` + a stdlib DER reader → `cert_key`, `cert_sig_alg`, `cert_not_before`; the chain check retries at OpenSSL level 0 | suite (openssl-made certificates); lab fixture certificates (`lab/gen-tls-certs.py`) |
+
+## 7. Cross-checks with WebInventory
+
+| ID | Item | Status | Check |
+|---|---|---|---|
+| X1 | CPE alias groups in the vulns join (the WebInventory 2.4.0 cross-check: run-recon missed Jira Server/Data Center and Varnish's other vendor strings) | Done (`batch-5-redirects-tls`): `cpe-aliases.json` (WebInventory's 184 groups, commit a8383ec) next to `recon-db.sh`; provenance records it | suite (a CVE filed under `jira_server` joins `atlassian:jira`; `CPE_ALIASES_FILE=` off; found through the installed symlink) |
+
+## 8. After the 1.20.0 release: result shipping (recon-platform-plan §11)
+
+The run-recon side of the platform plan (`claude/recon-platform-plan-v0.4.md` in the project). Not started.
+
+| ID | Item | Status | Check |
+|---|---|---|---|
+| P1 | JSONL per record kind (services and hosts, URLs, findings, DNS posture, edge and origin, screenshot classes, warnings), from the code that writes the CSV, same field names | Planned | suite; schema contract test |
+| P2 | `run_id` (UUID v4) and `--engagement ID` in run.json and the manifest | Planned | suite |
+| P3 | `--ship URL` with `--ship-cert`/`--ship-key`/`--ship-ca` (mTLS, signed manifest, `ship-state.json`), its own exit code; `ship-recon.sh` to re-ship, resume and export | Planned | suite against a mock ingest; `bench-run-recon.sh ship` (the shipped run equals the local CSV) |
 
 ## Done (for reference)
+
+- **1.20.0 (unreleased, Batches 3–5 and the follow-ups):** see sections 3–7.
 
 - **1.19.0 (Batch 2):** 17 HTTP columns from the enrichment request (no extra traffic); favicon hashes;
   real favicon-hash pivot feeding `--origin`; `ptr` under `--enrich`; `--extras` (robots.txt, security.txt,

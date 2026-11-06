@@ -577,3 +577,95 @@ applies on top of `-fs`), and `-cos` wins over `-cs`.
   that is still going.
 - **The suite's AAAA test extracts code by a marker** (`-aaaa -json -silent`); the new dnsx call used the same
   argument order and was picked up first. The new calls use another order.
+
+## v1.20.0 (unreleased): Batch 5, redirect chains, login forms and TLS parity
+
+Same lab and method. The baseline is the Batch 4 branch (`batch-4-evidence`, frozen with `git archive`), so the
+A/B isolates Batch 5. New fixtures: the redirect and login-form names in the Caddyfile, and the `tlslab` nginx
+with four TLS fixtures (`lab/tls-nginx.conf`, certificates from `lab/gen-tls-certs.py`).
+
+### A/B: the default path
+
+| Scenario | runs per side | Batch 4 wall s | Batch 5 wall s | Batch 4 CPU s | Batch 5 CPU s | `--exact` |
+|---|---:|---:|---:|---:|---:|---|
+| lab, `--tls --ipv6` (2 sessions, one with the order swapped) | 6 | 22.79 | 22.31 | 10.00 | 10.04 | 2 fields differ, both justified (below) |
+| farm, `--tls --ipv6 -t 10` (2 sessions, one swapped) | 6 | 85.40 | 86.61 | 64.88 | 65.37 | identical (50 rows), both sessions |
+| farm, interleaved run by run (old / new, 4 rounds) | 4 | 85.78 | 86.09 | 65.11 | 65.07 | — |
+
+The timings match within the run-to-run spread. In the farm sessions, the side that ran first was slower in both
+(Batch 5 +1.3 s CPU when it went first, −0.2 s when it went second); run by run, the two are equal. Two fields differ, both on one row:
+`http://wp.test/wp-login.php`, WordPress's login page, served on plain HTTP. It now carries `auth=Form` and
+`http_flags=PlainHttp;CleartextAuth`. That is the new login-form detection reporting a real finding, the one
+WebInventory reports as `Auth=Form` and `CleartextAuth`. The first session's comparison also listed four rows
+"only in" one side. They were crawl variance in the baseline itself: Batch 4's own three runs had 87, 87 and 85
+rows, and against an 87-row Batch 4 run the only differences were the two fields.
+
+The new columns cost no request on the default path. `-er` adds one regex pass over each body inside httpx,
+`-cert` adds the PEM to each tlsx record, and the CSV builder reads it with a stdlib DER parser. None of these
+shows up beyond the noise.
+
+### The opt-in paths
+
+| Scenario | runs per side | without wall s | with wall s | without CPU s | with CPU s | what differs |
+|---|---:|---:|---:|---:|---:|---|
+| lab `--tls --ipv6 --extras`: Batch 4 → Batch 5, interleaved (6 rounds) | 6 | 23.68 | 26.22 | 13.39 | 14.04 | wp.test's two login rows (`Form`, `CleartextAuth`) |
+| lab: `--tls --ipv6` → `--tls-enum --ipv6` (Batch 5) | 3 | 22.48 | 23.09 | 10.22 | 10.57 | `tls_supported`, `tls_ciphers` on every https row (35 rows) |
+| farm: `--tls --ipv6 -t 10` → `--tls-enum --ipv6 -t 10` | 3 | 87.30 | 86.20 | 66.03 | 68.04 | the same two columns, 50 rows |
+
+- **`--extras`** now follows redirects past the hops the run did not probe. That costs one httpx start (about
+  1 s wall and 0.7 s CPU, all of it startup) per seed with such a hop. On the lab only wp.test has one
+  (`/wp-admin/` → `wp-login.php?redirect_to=…`), and wp.test is the slowest seed, so the whole run waits
+  for it. A seed with no redirect in its records starts nothing (a `grep` first), and after the first round
+  a further round runs only when a hop itself redirected. The swapped sessions showed the same order effect
+  as the farm; the interleaved rounds above are the measurement.
+- **`--tls-enum`** costs one Python process per seed and six short handshakes per https host: about 0.35 s
+  of CPU on the lab and 2 s on the 50-seed farm, with no change in wall time on the farm.
+
+### Lab fixture checks (real tools)
+
+| Check | What was run | Result |
+|---|---|---|
+| tls | `--tls-enum` on legacy/future/default/modern`.tls.test` | legacy: `tls_supported=TLS 1.2;TLS 1.1;TLS 1.0`, `tls_weak_cipher=TLS 1.2:TLS_RSA_WITH_NULL_SHA`, `RSA 1024` / `sha1WithRSAEncryption`, `WeakTLS;WeakCipher;WeakKey;WeakSig;SelfSigned`; future: `CertNotYetValid`; default: `DefaultCert`; modern: none, `EC P-256` |
+| tls | the same matrix from tlsx (`-sm ctls -min-version V -max-version V`, one run per version) | agrees on every fixture |
+| tls | the container's openssl, `-cipher NULL-SHA` | `Cipher is NULL-SHA`: legacy really accepts it |
+| tls | legacy's chain | `CertUntrusted` (`self-signed certificate`) from the level-0 retry; Batch 4 gave no verdict |
+| http | `https://redir.test/` (302 → `/login`) | `final_url=https://redir.test/login` through a hop `--extras` fetched; `login_form=http://redir.test/session`, `Form`, `CleartextAuth` on the HTTPS row |
+| http | `https://redir.test/old` (301 → `https://elsewhere.test/`) | listed in `redirect_chain`, not followed |
+| http | `http://redir.test/session` (from the form's action, via the crawl) | `301->https://redir.test/session` followed |
+| http | `http://plainlogin.redir.test/` | `login_form=http://plainlogin.redir.test/login`, `PlainHttp;CleartextAuth` |
+| http | (not a fixture) WordPress | `http://wp.test/wp-admin/` → `wp-login.php` on plain HTTP: `Form`, `CleartextAuth` |
+
+`bench-run-recon.sh checks` → **PASS** on all ten (takeover, zone, origin, http, tls, posture, discovery, scope,
+resume, history), the history check with `RECON_DB_DSN` pointing at a PostgreSQL 16 database. The daemon of
+the lab's containers stopped during the full run, after the first seven had passed; scope, resume and history
+were run again once it was back, and passed.
+
+### Found while building this
+
+- **`--tls-full` produced no CSV with tlsx 1.4.0, in every release since 1.17.** tlsx 1.4's
+  `cipher_enum` holds a dictionary per version (`{"weak": [...], "secure": [...]}`), and the CSV builder
+  passed that dictionary to the cipher-name check, which raised `AttributeError`. Reproduced with the CSV
+  builders of v1.17.0, v1.19.0 and Batch 4 on a real `-ce` record. `--tls-full` is now an alias of
+  `--tls-enum` and no longer calls `-ce`, and the parser flattens the dictionary anyway.
+- **tlsx `-ce` misses suites.** On `legacy.tls.test` it listed the four CBC-SHA suites but not `NULL-SHA`,
+  which the server accepts (the container's openssl negotiates it).
+- **tlsx cannot offer weak suites.** With `-ci`, ctls refuses the names (`TLS_RSA_WITH_RC4_128_MD5 not
+  supported`). ztls accepts them but sends a ClientHello with no cipher suites at all: the lab nginx logged `no
+  ciphers specified`. The openssl mode ignored the list. So the weak-cipher probe, like the version matrix, is
+  run-recon's own ClientHello, stopped at the ServerHello as WebInventory's is. It is independent of the local
+  OpenSSL, which can no longer offer SSL 3.0 or RC4.
+- **tlsx's `expired` is false for a certificate that is not valid yet.** `CertNotYetValid` comes from
+  `not_before`; `CertExpired` now also from `not_after`.
+- **The chain check gave no verdict on the weakest hosts.** The local OpenSSL (security level 2) refused the
+  legacy fixture's handshake before verifying anything, so a self-signed RSA 1024 host went without
+  `CertUntrusted`. One retry at level 0 fixes it; it only runs after such a refusal.
+- **tlsx 1.4.0's default scan mode can hang on an open stdin.** When a handshake fails in `auto` mode, tlsx
+  falls back to `openssl s_client`, which reads stdin: 40 s and more with stdin left open, under a second with
+  `/dev/null`. run-recon already closes stdin at start-up (TOOL-COVERAGE finding 6), so only the bench's own
+  tlsx cross-check was exposed; it now uses `-sm ctls` and a timeout.
+- **Caddy's `redir /login 302` is a matcher.** In the first version of the fixture, `/login` was read as a path
+  matcher and `302` as the target, so `/` answered an empty 200; it is `redir * /login 302`.
+- **The lab image's OpenSSL has no 3DES or RC4.** Debian's OpenSSL 1.1.1n is built without them, so
+  `legacy.tls.test` accepts `NULL-SHA` as its weak suite, which gives the same `WeakCipher`.
+- **A suite file named `enum.py` shadowed Python's `enum` module** for the scripts next to it. The extracted
+  probe is `tlsenum_probe.py` and runs with `-I`.

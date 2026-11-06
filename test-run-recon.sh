@@ -124,7 +124,7 @@ mk httpx <<'EOF'
 printf '%s ' "$@" >> "$MOCKLOG/httpx.args"; echo >> "$MOCKLOG/httpx.args"
 # Reject unknown flags the way ProjectDiscovery httpx (goflags) does -- this is
 # what catches an invalid flag like -a that silently blanks all enrichment.
-__vf=" -timeout -rl -rate-limit -r -resolvers -l -list -o -output -srd -store-response-dir -mc -match-code -t -threads -retries -H -header -p -ports -delay -proxy -http-proxy -ho -headless-options -hash -st -screenshot-timeout -path "
+__vf=" -timeout -rl -rate-limit -r -resolvers -l -list -o -output -srd -store-response-dir -mc -match-code -t -threads -retries -H -header -p -ports -delay -proxy -http-proxy -ho -headless-options -hash -st -screenshot-timeout -path -er -extract-regex "
 __bf=" -silent -json -sc -status-code -cl -content-length -ct -content-type -title -td -tech-detect -server -web-server -ip -cname -asn -cdn -probe -ss -screenshot -system-chrome -nc -no-color -version -h -help -fr -follow-redirects -favicon -location -jarm -method -websocket -nfs -no-fallback-scheme -nf -no-fallback -esb -exclude-screenshot-bytes -ehb -exclude-headless-body -irh -include-response-header -irr -include-response -irrb -include-response-base64 "
 __A=("$@"); __i=0
 while [ $__i -lt ${#__A[@]} ]; do
@@ -239,6 +239,16 @@ if [ "$mode" = json ]; then
       : > "$MOCKLOG/httpx.flaky"; continue
     fi
     [ -n "${MOCK_HTTPX_DEAD:-}" ] && [ "$u" = "$MOCK_HTTPX_DEAD" ] && continue
+    # MOCK_HTTPX_REDIRECT="URL>LOCATION": that URL answers 302 (1.20 redirect hops);
+    # MOCK_HTTPX_LOGIN=URL: that URL is a login page whose form posts over http:// (-er matches)
+    if [ -n "${MOCK_HTTPX_REDIRECT:-}" ] && [ "$u" = "${MOCK_HTTPX_REDIRECT%%>*}" ]; then
+      printf '{"input":"%s","url":"%s","status_code":302,"location":"%s","content_length":0,"webserver":"nginx","title":"","host":"93.184.216.34","header":{"location":"%s"}}\n' "$u" "$u" "${MOCK_HTTPX_REDIRECT#*>}" "${MOCK_HTTPX_REDIRECT#*>}"
+      continue
+    fi
+    if [ -n "${MOCK_HTTPX_LOGIN:-}" ] && [ "$u" = "$MOCK_HTTPX_LOGIN" ]; then
+      printf '{"input":"%s","url":"%s","status_code":200,"content_length":50,"webserver":"nginx","title":"Login","host":"93.184.216.34","content_type":"text/html","header":{"content_type":"text/html"},"extracts":{"re":["<form method=\\"post\\" action=\\"http://example.com/session\\">","<input type=\\"password"]}}\n' "$u" "$u"
+      continue
+    fi
     if [ "$irh" = 1 ]; then   # 1.19 enrichment: the same request's headers, body hash and time
       printf '{"input":"%s","url":"%s","status_code":200,"content_length":100,"webserver":"nginx","title":"Home, %sMain%s","tech":["nginx","PHP"],"host":"93.184.216.34","time":"12.5ms","content_type":"text/html","hash":{"body_sha256":"%064d"},"header":{"server":"nginx","content_type":"text/html; charset=utf-8","x_frame_options":"DENY","set_cookie":"sessionid=abc; Path=/; HttpOnly, theme=dark; Expires=Thu, 01 Jan 2030 00:00:00 GMT; Secure; HttpOnly","alt_svc":"h3=\\\":443\\\"; ma=86400","x_powered_by":"PHP/8.1.2"}}\n' "$u" "$u" "$esc" "$esc" 7
     else
@@ -742,7 +752,7 @@ EOF
 mk httpx-toolkit <<'EOF'
 #!/usr/bin/env bash
 printf '%s ' "$@" >> "$MOCKLOG/httpx-toolkit.args"; echo >> "$MOCKLOG/httpx-toolkit.args"
-__vf=" -timeout -rl -rate-limit -r -resolvers -l -list -o -output -srd -store-response-dir -mc -match-code -t -threads -retries -H -header -p -ports -delay -proxy -http-proxy -ho -headless-options -hash -st -screenshot-timeout -path "
+__vf=" -timeout -rl -rate-limit -r -resolvers -l -list -o -output -srd -store-response-dir -mc -match-code -t -threads -retries -H -header -p -ports -delay -proxy -http-proxy -ho -headless-options -hash -st -screenshot-timeout -path -er -extract-regex "
 __bf=" -silent -json -sc -status-code -cl -content-length -ct -content-type -title -td -tech-detect -server -web-server -ip -cname -asn -cdn -probe -ss -screenshot -system-chrome -nc -no-color -version -h -help -fr -follow-redirects -favicon -location -jarm -method -websocket -nfs -no-fallback-scheme -nf -no-fallback -esb -exclude-screenshot-bytes -ehb -exclude-headless-body -irh -include-response-header -irr -include-response -irrb -include-response-base64 "
 __A=("$@"); __i=0
 while [ $__i -lt ${#__A[@]} ]; do
@@ -1621,10 +1631,12 @@ run_case tls --tls
 assert_grep "$MOCKLOG/tlsx.args" -- '-tls-version'                "tlsx invoked with -tls-version (posture mode)"
 assert_grep "$CSV" ',TLS 1.3,TLS_AES_256_GCM_SHA384,'             "posture joined into the CSV for live https hosts"
 assert_grep "$CSV" 'tls_version,tls_cipher,cert_not_after,cert_issuer,tls_flags' "CSV header carries the 5 TLS columns"
-# --tls-full adds the enumeration flags
+assert_grep "$MOCKLOG/tlsx.args" -- '-wildcard-cert -cert -silent' "posture asks tlsx for the leaf certificate (-cert, 1.20)"
+# --tls-full / --tls-enum: the version matrix is run-recon's own probe (tls_enum_probe), not
+# tlsx -version-enum / -cipher-enum; it only contacts addresses tlsx reported (the mock reports none)
 run_case tlsfull --tls-full
-assert_grep "$MOCKLOG/tlsx.args" -- '-version-enum'               "--tls-full enables -version-enum"
-assert_grep "$MOCKLOG/tlsx.args" -- '-cipher-enum'                "--tls-full enables -cipher-enum"
+refute_grep "$MOCKLOG/tlsx.args" -- '-version-enum|-cipher-enum'  "--tls-full no longer runs tlsx's enumeration"
+assert_grep "$ERRLOG" 'TLS version matrix \+ weak-cipher probe'     "--tls-full runs the version-matrix stage"
 
 # C) report surfaces TLS flags as findings
 section "TLS posture: report surfaces tls_flags as findings"
@@ -2079,9 +2091,9 @@ PSQLEOF
 chmod +x "$MOCKBIN/psql"
 export MOCK_HTTPX_DEAD="https://example.com/katana-path"
 run_case noneg_db --db
-assert_grep   "$MOCKLOG/psql.args" "'httpx_json_v2','https://example\.com/" "--db: enrichment records that came back are cached (key httpx_json_v2: records cached before 1.19 have no headers)"
+assert_grep   "$MOCKLOG/psql.args" "'httpx_json_v3','https://example\.com/" "--db: enrichment records that came back are cached (key httpx_json_v3: records cached before 1.20 have no login-form matches)"
 assert_grep   "$MOCKLOG/psql.args" "'live_probe!neg'|'live_probe','"      "--db: the live probe keeps its cache entries (dead hosts may be negative-cached)"
-refute_grep   "$MOCKLOG/psql.args" "\\('httpx_json_v2!neg','"                  "--db: a URL with no record is NOT negative-cached (retried next run, not blank for NEG_TTL)"
+refute_grep   "$MOCKLOG/psql.args" "\\('httpx_json_v3!neg','"                  "--db: a URL with no record is NOT negative-cached (retried next run, not blank for NEG_TTL)"
 unset MOCK_HTTPX_DEAD
 
 
@@ -2104,7 +2116,7 @@ assert_grep   "$MOCKLOG/katana.args" -- '-proxy http://127.0.0.1:8080' "katana's
 section "Batch 2: HTTP columns from the enrichment request (no extra traffic)"
 run_case http_cols
 assert_grep  "$MOCKLOG/httpx.args" -- '-tech-detect -web-server -irh -hash sha256 -nfs' "enrichment asks for headers and the body hash in the same request"
-assert_grep  "$CSV" '^seed_domain,url,host,.*,cpe,redirect_location,response_ms,body_sha256,content_type,powered_by,auth,cookies,cookie_issues,missing_sec_headers,hsts_max_age,alt_svc,http_flags,favicon_mmh3,favicon_md5,ptr,robots,security_txt.?$' "17 HTTP columns appended after cpe (existing positions unchanged)"
+assert_grep  "$CSV" '^seed_domain,url,host,.*,cpe,redirect_location,response_ms,body_sha256,content_type,powered_by,auth,cookies,cookie_issues,missing_sec_headers,hsts_max_age,alt_svc,http_flags,favicon_mmh3,favicon_md5,ptr,robots,security_txt,final_url,redirect_chain,login_form,tls_supported,tls_ciphers,tls_weak_cipher,cert_key,cert_sig_alg,cert_not_before.?$' "17 HTTP columns appended after cpe, then the 9 of 1.20 (existing positions unchanged)"
 assert_grep  "$CSV" ',https://example\.com/katana-path,.*,12,0{63}7,text/html,PHP/8\.1\.2,,sessionid;theme,sessionid:no-Secure,Content-Security-Policy;X-Content-Type-Options;Strict-Transport-Security,,"h3="":443""; ma=86400",,' "response time, body hash, content type, X-Powered-By, cookies and their flag gaps, missing headers, Alt-Svc"
 refute_grep  "$MOCKLOG/httpx.args" -- '-path |-favicon' "default run sends no favicon or well-known requests"
 
@@ -2154,9 +2166,9 @@ refute_grep  "$CSV" 'bak\$|\*\.bak'                                         "wil
 assert_grep  "$CSV.extras.txt" '^\[example\.com\] security-txt-expired \[low\] host=example\.com path=/\.well-known/security\.txt expires=2021-01-01T00:00:00Z' "expired security.txt -> security-txt-expired [low]"
 assert_grep  "$CSV.extras.txt" 'catch-all-200 \[info\] host=example\.com path=/rr-'  "random path answered 200 -> catch-all-200 [info]"
 assert_grep  "$CSV.extras.txt" 'error-page \[info\] host=example\.com status=200 server="nginx" title="Home" reveals="Apache/2\.4\.41 \(Ubuntu\)"' "error page reveals a version the Server header does not"
-assert_grep  "$CSV" ',-732438843,1e23ac45e53e0bd440ab397425229b87,,200 disallow=2 allow=0 sitemap=1,expired contact=mailto:security@example\.com expires=2021-01-01T00:00:00Z.?$' "favicon, robots and security.txt columns on the host's rows"
+assert_grep  "$CSV" ',-732438843,1e23ac45e53e0bd440ab397425229b87,,200 disallow=2 allow=0 sitemap=1,expired contact=mailto:security@example\.com expires=2021-01-01T00:00:00Z,{9}.?$' "favicon, robots and security.txt columns on the host's rows"
 MOCK_EXTRAS_NOSEC=1 run_case extras_nosec --extras
-assert_grep  "$CSV" ',missing.?$'                                           "no security.txt -> security_txt=missing"
+assert_grep  "$CSV" ',missing,{9}.?$'                                       "no security.txt -> security_txt=missing"
 refute_grep  "$CSV.extras.txt" 'security-txt'                             "a missing security.txt is a column value, not a finding"
 MOCK_EXTRAS_ICON='link' run_case extras_iconlink --extras
 assert_grep  "$MOCKLOG/httpx.args" -- '-l [^ ]*extras_icon_urls\.txt -silent -json -irrb' "an icon declared at another path is fetched in one follow-up pass"
@@ -2867,7 +2879,7 @@ exit 0
 PSQLEOF
 run_case mon_db --db --monitor --monitor-prev "$TMP/mon_prev.csv"
 refute_grep  "$MOCKLOG/psql.args" "c\.source = 'live_probe'"                   "--monitor --db: the live probe is not read from the cache"
-refute_grep  "$MOCKLOG/psql.args" "c\.source = 'httpx_json_v2'"                "--monitor --db: nor the enrichment records"
+refute_grep  "$MOCKLOG/psql.args" "c\.source = 'httpx_json_v3'"                "--monitor --db: nor the enrichment records"
 assert_grep  "$MOCKLOG/psql.args" "'live_probe'"                                "--monitor --db: the fresh probe results are still stored"
 assert_grep  "$MOCKLOG/psql.args" "source='urls'"                               "--monitor --db: passive lookups still use the cache"
 run_case nomon_db --db
@@ -2943,6 +2955,310 @@ _rc_is "$_rc" 130                                                           "SIG
 assert_grep  "$(ls -d "$RS/out2"/_work-* | head -n 1)/state" '^status=interrupted$' "SIGINT: the work dir is kept"
 sleep 0.5; pkill -f 'sleep 61\.5' 2>/dev/null || true
 rm -f "$MOCKLOG/gau.hang" "$MOCKLOG/gau.seeds"; mv "$MOCKBIN/gau.base" "$MOCKBIN/gau"
+
+# --- v1.20 (Batch 5): redirect chains, login forms, the TLS version matrix, the leaf
+# certificate, CPE aliases ---------------------------------------------------------------
+section "Batch 5: redirect chains and login forms (aggregator, no requests)"
+B5D="$TMP/b5"; rm -rf "$B5D"; mkdir -p "$B5D"
+awk "/python3 - .*map.tsv.*<<'PY'/{f=1;next} f&&/^PY\$/{f=0} f" "$RUN_RECON" > "$B5D/agg.py"
+printf 'ex.com\thttp://r.ex.com/\tgau\nex.com\thttps://r.ex.com/\tgau\nex.com\thttps://r.ex.com/old\tgau\nex.com\thttps://loop.ex.com/a\tgau\nex.com\thttps://loop.ex.com/b\tgau\nex.com\thttp://p.ex.com/\tgau\nex.com\thttps://s.ex.com/\tgau\nex.com\thttps://n.ex.com/\tgau\nex.com\thttps://q.ex.com/\tgau\n' > "$B5D/map.tsv"
+python3 - "$B5D" <<'PYB5'
+import json, sys, os
+d = sys.argv[1]
+def rec(u, st, loc="", ex=None):
+    j = {"input": u, "url": u, "status_code": st, "content_type": "text/html", "header": {"content_type": "text/html"}}
+    if loc:
+        j["location"] = loc; j["header"]["location"] = loc
+    if ex is not None:
+        j["extracts"] = {"re": ex}
+    return json.dumps(j)
+pw = '<input type="password'
+with open(os.path.join(d, "httpx.jsonl"), "w") as f:
+    for line in (rec("http://r.ex.com/", 301, "https://r.ex.com/"), rec("https://r.ex.com/", 302, "/login"),
+                 rec("https://r.ex.com/old", 301, "https://other.ex.net/x#frag"),
+                 rec("https://loop.ex.com/a", 302, "/b"), rec("https://loop.ex.com/b", 302, "/a"),
+                 rec("http://p.ex.com/", 200, ex=['<form method="post">', pw]),
+                 rec("https://s.ex.com/", 200, ex=['<form action="/search">', '<FORM method=post action=\'/login?a=1&amp;b=2\'>', pw]),
+                 rec("https://n.ex.com/", 302, "/next"),
+                 rec("https://q.ex.com/", 200, ex=['<form action="/search">'])):
+        f.write(line + "\n")
+with open(os.path.join(d, "hops.jsonl"), "w") as f:   # what --extras fetched
+    f.write(rec("https://r.ex.com/login", 200, ex=['<form method="post" action="http://r.ex.com/session">', pw]) + "\n")
+PYB5
+: > "$B5D/tlsx.jsonl"
+( cd "$B5D" && env PATH="$TESTPATH" HOPS_FILE="$B5D/hops.jsonl" python3 agg.py map.tsv httpx.jsonl out.csv 0 2000 tlsx.jsonl >/dev/null 2>"$B5D/agg.err" )
+b5col(){ python3 - "$1" "$2" "$3" <<'PYCOL'
+import csv, sys
+for r in csv.DictReader(open(sys.argv[1], newline="")):
+    if r["url"] == sys.argv[2]:
+        print(r.get(sys.argv[3], "")); break
+PYCOL
+}
+b5eq(){ local got; got="$(b5col "$B5D/out.csv" "$1" "$2")"; if [ "$got" = "$3" ]; then _pass "$4"; else _fail "$4 (got: $got)"; fi; }
+b5eq http://r.ex.com/ final_url 'https://r.ex.com/login' "http:// -> https:// -> /login: final_url is the last URL that answered (a hop --extras fetched)"
+b5eq http://r.ex.com/ redirect_chain '301->https://r.ex.com/ | 302->https://r.ex.com/login' "redirect_chain: code->absolute URL per hop, joined ' | '"
+b5eq http://r.ex.com/ login_form 'http://r.ex.com/session' "login_form: the password form of the page the chain ends on, made absolute"
+b5eq http://r.ex.com/ http_flags 'CleartextAuth' "a form on an HTTPS page that posts to http:// -> CleartextAuth"
+b5eq http://r.ex.com/ auth 'Form' "auth gains Form for a password form (WebInventory's Auth=Form)"
+b5eq https://r.ex.com/old redirect_chain '301->https://other.ex.net/x' "an off-host hop is listed (fragment dropped) ..."
+b5eq https://r.ex.com/old final_url 'https://r.ex.com/old' "... and not followed: final_url stays the last URL that answered"
+b5eq https://loop.ex.com/a redirect_chain '302->https://loop.ex.com/b | 302->https://loop.ex.com/a' "a redirect loop stops when it comes back"
+b5eq https://n.ex.com/ redirect_chain '302->https://n.ex.com/next' "a hop nobody fetched is listed ..."
+b5eq https://n.ex.com/ final_url 'https://n.ex.com/' "... and the chain ends at the last URL that answered"
+b5eq http://p.ex.com/ login_form 'http://p.ex.com/' "a form without action posts to its own page"
+b5eq http://p.ex.com/ http_flags 'PlainHttp;CleartextAuth' "a password form on a plain-HTTP page -> CleartextAuth (after PlainHttp)"
+b5eq https://s.ex.com/ login_form 'https://s.ex.com/login?a=1&b=2' "the form before the password field wins (not the search form); entities decoded"
+b5eq https://s.ex.com/ http_flags '' "an HTTPS form posting to HTTPS is not cleartext"
+b5eq https://q.ex.com/ auth '' "a form without a password field is not a login form"
+b5eq https://q.ex.com/ final_url '' "a URL that does not redirect has no final_url or chain"
+assert_absent "$B5D/agg.err" "the aggregator ran without errors"
+
+section "Batch 5: --extras fetches same-host redirect hops; the login form joins the redirecting row"
+MOCK_HTTPX_REDIRECT='https://example.com/katana-path>/portal/login' MOCK_HTTPX_LOGIN='https://example.com/portal/login' run_case b5hops --extras
+assert_grep  "$MOCKLOG/httpx.args" -- "-er (\(\?is\)|[^ ]*)<form" "the enrichment request carries the login-form regex (-er)"
+assert_grep  "$ERRLOG" 'redirect hops: 1 same-host target\(s\) fetched' "the one hop the run had not probed is fetched"
+assert_grep  "$CSV" ',https://example\.com/katana-path,.*,https://example\.com/portal/login,302->https://example\.com/portal/login,http://example\.com/session,' "the redirecting row: final_url, redirect_chain, login_form"
+assert_grep  "$CSV" ',https://example\.com/katana-path,.*,Form,.*CleartextAuth' "... with Form in auth and CleartextAuth"
+refute_grep  "$CSV" ',https://example\.com/portal/login,example\.com,' "a hop is evidence for its chain, not a URL row of its own"
+MOCK_HTTPX_REDIRECT='https://example.com/katana-path>https://elsewhere.example.net/' run_case b5offhost --extras
+refute_grep  "$ERRLOG" 'redirect hops:'                              "an off-host target is never fetched"
+assert_grep  "$CSV" ',302->https://elsewhere\.example\.net/,'        "... but it is listed in the chain"
+MOCK_HTTPX_REDIRECT='https://example.com/katana-path>/portal/login' run_case b5nohops
+refute_grep  "$ERRLOG" 'redirect hops'                               "without --extras no hop is fetched"
+
+section "Batch 5: the TLS version matrix (tls_enum_probe) against a local TLS speaker"
+# (not enum.py: a file of that name next to a script shadows the stdlib's enum module)
+awk "/^# TLSENUM-PROBE/{f=1} f&&/^PYENUM\$/{f=0} f" "$RUN_RECON" > "$B5D/tlsenum_probe.py"
+python3 - "$B5D/port" <<'PYTLS' &
+# Answers each ClientHello with a ServerHello and closes: "legacy" on the first port (TLS 1.0-1.2,
+# server preference ECDHE-RSA-AES128-SHA, AES128-SHA, then NULL-SHA), "modern" on the second
+# (TLS 1.2 + 1.3). No key exchange: the probe stops at the ServerHello.
+import socket, struct, sys, os, threading
+def hello(conn):
+    try:
+        h = conn.recv(5)
+        if len(h) < 5: return None
+        body = b""
+        n = (h[3] << 8) | h[4]
+        while len(body) < n:
+            c = conn.recv(n - len(body))
+            if not c: return None
+            body += c
+        d = body[4:]
+        ver = (d[0] << 8) | d[1]; q = 34; q += 1 + d[q]
+        cl = (d[q] << 8) | d[q + 1]; suites = [(d[q + 2 + i] << 8) | d[q + 3 + i] for i in range(0, cl, 2)]; q += 2 + cl
+        q += 1 + d[q]
+        sv = []
+        if q + 2 <= len(d):
+            e = q + 2 + ((d[q] << 8) | d[q + 1]); q += 2
+            while q + 4 <= e:
+                t, l = (d[q] << 8) | d[q + 1], (d[q + 2] << 8) | d[q + 3]
+                if t == 0x002b: sv = [(d[q + 5 + i] << 8) | d[q + 6 + i] for i in range(0, d[q + 4], 2)]
+                q += 4 + l
+        return ver, suites, sv
+    except Exception:
+        return None
+def server_hello(ver, suite, tls13=False):
+    ext = (struct.pack(">HHH", 0x002b, 2, 0x0304)) if tls13 else b""
+    b = struct.pack(">H", 0x0303 if tls13 else ver) + os.urandom(32) + b"\x00" + struct.pack(">H", suite) + b"\x00"
+    b += struct.pack(">H", len(ext)) + ext
+    hs = b"\x02" + struct.pack(">I", len(b))[1:] + b
+    return b"\x16" + struct.pack(">H", 0x0303 if tls13 else ver) + struct.pack(">H", len(hs)) + hs
+ALERT = lambda code: b"\x15\x03\x03\x00\x02\x02" + bytes([code])
+def legacy(ver, suites, sv):
+    if ver < 0x0301: return ALERT(70)
+    v = min(ver, 0x0303)
+    for s in (0xC013, 0x002F, 0x0002):
+        if s in suites: return server_hello(v, s)
+    return ALERT(40)
+def modern(ver, suites, sv):
+    if 0x0304 in sv: return server_hello(0x0303, 0x1301, tls13=True)
+    if ver < 0x0303: return ALERT(70)
+    return server_hello(0x0303, 0xC02F) if 0xC02F in suites else ALERT(40)
+socks = []
+for prof in (legacy, modern):
+    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", 0)); s.listen(16); s.settimeout(20)
+    socks.append((s, prof))
+open(sys.argv[1], "w").write(" ".join(str(s.getsockname()[1]) for s, _ in socks))
+def serve(s, prof):
+    for _ in range(6):
+        try:
+            c, _a = s.accept()
+        except Exception:
+            return
+        r = hello(c)
+        if r: c.sendall(prof(*r))
+        c.close()
+ts = [threading.Thread(target=serve, args=x) for x in socks]
+[t.start() for t in ts]; [t.join() for t in ts]
+PYTLS
+_tsrv=$!
+for _i in $(seq 1 20); do [ -s "$B5D/port" ] && break; sleep 0.2; done
+read -r LPORT MPORT < "$B5D/port"
+printf 'legacy.test:%s\nmodern.test:%s\nnoaddr.test:443\n' "$LPORT" "$MPORT" > "$B5D/keys.txt"
+printf '{"host":"legacy.test","port":"%s","ip":"127.0.0.1"}\n{"host":"modern.test","port":"%s","ip":"127.0.0.1"}\n{"host":"noaddr.test","port":"443"}\n' "$LPORT" "$MPORT" > "$B5D/tlsx_ip.jsonl"
+TLS_ENUM_TIMEOUT=3 python3 -I "$B5D/tlsenum_probe.py" "$B5D/keys.txt" "$B5D/tlsx_ip.jsonl" > "$B5D/enum.jsonl" 2>"$B5D/enum.err"
+kill "$_tsrv" 2>/dev/null; wait "$_tsrv" 2>/dev/null
+assert_grep "$B5D/enum.jsonl" '"host": "legacy\.test".*"tls_supported": \["TLS 1\.2", "TLS 1\.1", "TLS 1\.0"\]' "legacy: TLS 1.2, 1.1, 1.0 (the TLS 1.3 hello answered at 1.2 is not counted; SSL 3.0 refused)"
+assert_grep "$B5D/enum.jsonl" '"host": "legacy\.test".*"TLS 1\.0": "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA"' "legacy: the suite the server chose, per version"
+assert_grep "$B5D/enum.jsonl" '"host": "legacy\.test".*"tls_weak_cipher": "TLS 1\.2:TLS_RSA_WITH_NULL_SHA"' "legacy: the weak-only hello is answered with NULL-SHA -> tls_weak_cipher"
+assert_grep "$B5D/enum.jsonl" '"host": "modern\.test".*"tls_ciphers": \{"TLS 1\.2": "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", "TLS 1\.3": "TLS_AES_128_GCM_SHA256"\}' "modern: TLS 1.3 from the supported_versions extension, TLS 1.2"
+assert_grep "$B5D/enum.jsonl" '"host": "modern\.test".*"tls_weak_cipher": ""' "modern: no weak suite accepted"
+refute_grep "$B5D/enum.jsonl" 'noaddr'                                "a host tlsx gave no address for is not contacted"
+assert_absent "$B5D/enum.err" "the probe ran without errors"
+# joined by the aggregator: columns and the WeakTLS / WeakCipher flags
+printf 'ex.com\thttps://legacy.test:%s/\tgau\nex.com\thttps://modern.test:%s/\tgau\n' "$LPORT" "$MPORT" > "$B5D/map2.tsv"
+printf '{"host":"legacy.test","port":"%s","tls_version":"tls12","cipher":"TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA"}\n{"host":"modern.test","port":"%s","tls_version":"tls13","cipher":"TLS_AES_128_GCM_SHA256"}\n' "$LPORT" "$MPORT" > "$B5D/tlsx2.jsonl"
+: > "$B5D/empty.jsonl"
+( cd "$B5D" && env PATH="$TESTPATH" TLSENUM_FILE="$B5D/enum.jsonl" python3 agg.py map2.tsv empty.jsonl out2.csv 0 2000 tlsx2.jsonl >/dev/null 2>&1 )
+b5eq2(){ local got; got="$(b5col "$B5D/out2.csv" "$1" "$2")"; if [ "$got" = "$3" ]; then _pass "$4"; else _fail "$4 (got: $got)"; fi; }
+b5eq2 "https://legacy.test:$LPORT/" tls_supported 'TLS 1.2;TLS 1.1;TLS 1.0' "tls_supported column"
+b5eq2 "https://legacy.test:$LPORT/" tls_weak_cipher 'TLS 1.2:TLS_RSA_WITH_NULL_SHA' "tls_weak_cipher column"
+b5eq2 "https://legacy.test:$LPORT/" tls_flags 'WeakTLS;WeakCipher' "WeakTLS (TLS 1.0/1.1 accepted) and WeakCipher (NULL-SHA accepted)"
+b5eq2 "https://modern.test:$MPORT/" tls_ciphers 'TLS 1.3=TLS_AES_128_GCM_SHA256;TLS 1.2=TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256' "tls_ciphers in plan order (1.3 first)"
+b5eq2 "https://modern.test:$MPORT/" tls_flags '' "the modern host carries no flag"
+
+section "Batch 5: the leaf certificate (tlsx -cert): cert_key, cert_sig_alg, WeakKey, WeakSig, DefaultCert, CertNotYetValid"
+if command -v openssl >/dev/null 2>&1 \
+   && openssl req -x509 -newkey rsa:1024 -sha1 -nodes -keyout "$B5D/k1.pem" -out "$B5D/weak.pem" -days 2 -subj "/CN=weak.ex.com" >/dev/null 2>&1 \
+   && openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -sha256 -nodes -keyout "$B5D/k2.pem" -out "$B5D/ec.pem" -days 2 -subj "/CN=ec.ex.com" >/dev/null 2>&1 \
+   && openssl req -x509 -newkey rsa:2048 -sha256 -nodes -keyout "$B5D/k3.pem" -out "$B5D/def.pem" -days 2 -subj "/C=AU/ST=Some-State/O=Internet Widgits Pty Ltd/CN=def.ex.com" >/dev/null 2>&1; then
+  python3 - "$B5D" > "$B5D/tlsx3.jsonl" <<'PYCERT'
+import json, sys, os, datetime
+d = sys.argv[1]
+now = datetime.datetime.now(datetime.timezone.utc)
+iso = lambda t: t.strftime("%Y-%m-%dT%H:%M:%SZ")
+pem = lambda n: open(os.path.join(d, n)).read()
+far, past, soon = iso(now + datetime.timedelta(days=300)), iso(now - datetime.timedelta(days=1)), iso(now + datetime.timedelta(days=20))
+for r in [
+    {"host": "weak.ex.com", "port": "443", "tls_version": "tls12", "cipher": "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", "not_before": past, "not_after": far, "certificate": pem("weak.pem")},
+    {"host": "ec.ex.com", "port": "443", "tls_version": "tls13", "cipher": "TLS_AES_128_GCM_SHA256", "not_before": past, "not_after": far, "certificate": pem("ec.pem")},
+    {"host": "def.ex.com", "port": "443", "tls_version": "tls13", "cipher": "TLS_AES_128_GCM_SHA256", "not_before": past, "not_after": far, "certificate": pem("def.pem"),
+     "subject_dn": "CN=def.ex.com, O=Internet Widgits Pty Ltd, ST=Some-State, C=AU", "self_signed": True},
+    {"host": "future.ex.com", "port": "443", "tls_version": "tls13", "cipher": "TLS_AES_128_GCM_SHA256", "not_before": iso(now + datetime.timedelta(days=30)), "not_after": far},
+    {"host": "gone.ex.com", "port": "443", "tls_version": "tls13", "cipher": "TLS_AES_128_GCM_SHA256", "not_before": iso(now - datetime.timedelta(days=90)), "not_after": past},
+    {"host": "esxi.ex.com", "port": "443", "tls_version": "tls12", "cipher": "TLS_AES_128_GCM_SHA256", "not_after": far, "issuer_dn": "CN=localhost.localdomain, OU=VMware Engineering, O=VMware"},
+    {"host": "junk.ex.com", "port": "443", "tls_version": "tls13", "cipher": "TLS_AES_128_GCM_SHA256", "not_after": far, "certificate": "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"},
+]:
+    print(json.dumps(r))
+PYCERT
+  printf 'ex.com\thttps://%s.ex.com/\tgau\n' weak ec def future gone esxi junk > "$B5D/map3.tsv"
+  ( cd "$B5D" && env PATH="$TESTPATH" python3 agg.py map3.tsv empty.jsonl out3.csv 0 2000 tlsx3.jsonl >/dev/null 2>"$B5D/agg3.err" )
+  b5eq3(){ local got; got="$(b5col "$B5D/out3.csv" "$1" "$2")"; if [ "$got" = "$3" ]; then _pass "$4"; else _fail "$4 (got: $got)"; fi; }
+  b5eq3 https://weak.ex.com/ cert_key 'RSA 1024' "cert_key: RSA modulus size from the DER (stdlib parser)"
+  b5eq3 https://weak.ex.com/ cert_sig_alg 'sha1WithRSAEncryption' "cert_sig_alg: the signature algorithm"
+  b5eq3 https://weak.ex.com/ tls_flags 'WeakKey;WeakSig' "RSA 1024 / SHA-1 -> WeakKey;WeakSig"
+  b5eq3 https://ec.ex.com/ cert_key 'EC P-256' "an EC key names its curve"
+  b5eq3 https://ec.ex.com/ tls_flags '' "EC P-256 / SHA-256: no flag"
+  b5eq3 https://def.ex.com/ tls_flags 'SelfSigned;DefaultCert' "OpenSSL's default subject (Internet Widgits) -> DefaultCert"
+  b5eq3 https://esxi.ex.com/ tls_flags 'DefaultCert' "the VMware installer's issuer -> DefaultCert"
+  b5eq3 https://future.ex.com/ tls_flags 'CertNotYetValid' "notBefore in the future -> CertNotYetValid (tlsx reports no expired flag for it)"
+  b5eq3 https://future.ex.com/ cert_not_before "$(python3 -c 'import json,sys; print([json.loads(l) for l in open(sys.argv[1])][3]["not_before"])' "$B5D/tlsx3.jsonl")" "cert_not_before column"
+  b5eq3 https://gone.ex.com/ tls_flags 'CertExpired' "notAfter in the past -> CertExpired even without tlsx's expired field"
+  b5eq3 https://junk.ex.com/ cert_key '' "an unreadable certificate leaves the columns blank"
+  refute_grep "$B5D/agg3.err" 'Traceback' "the aggregator ran without errors"
+else
+  _pass "openssl unavailable: certificate parsing test skipped"
+fi
+
+section "Batch 5: the chain check retries below the local OpenSSL security level"
+if command -v openssl >/dev/null 2>&1 && openssl req -x509 -newkey rsa:1024 -sha1 -nodes -keyout "$B5D/lk.pem" -out "$B5D/lc.pem" -days 2 -subj "/CN=localhost" >/dev/null 2>&1; then
+  # a TLS 1.0-only server (RSA 1024 / SHA-1): the local OpenSSL refuses the protocol before
+  # it gets to the chain, so only the second try (level 0) can reach the verdict
+  python3 - "$B5D/lc.pem" "$B5D/lk.pem" "$B5D/lport" <<'PYLSRV' &
+import ssl, socket, sys, warnings
+warnings.simplefilter("ignore")
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.set_ciphers("DEFAULT:@SECLEVEL=0"); ctx.load_cert_chain(sys.argv[1], sys.argv[2])
+ctx.minimum_version = ssl.TLSVersion.TLSv1; ctx.maximum_version = ssl.TLSVersion.TLSv1
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", 0)); s.listen(5); s.settimeout(20)
+open(sys.argv[3], "w").write(str(s.getsockname()[1]))
+n = 0
+for _ in range(3):
+    try:
+        c, _a = s.accept()
+    except Exception:
+        break
+    n += 1; s.settimeout(2)
+    try:
+        ctx.wrap_socket(c, server_side=True).close()
+    except Exception:
+        pass
+open(sys.argv[3] + ".n", "w").write(str(n))
+PYLSRV
+  _lsrv=$!
+  for _i in $(seq 1 20); do [ -s "$B5D/lport" ] && break; sleep 0.2; done
+  printf '{"host":"localhost","ip":"127.0.0.1","port":"%s"}\n' "$(cat "$B5D/lport")" > "$B5D/lt.jsonl"
+  awk '/^tls_chain_check\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' "$RUN_RECON" > "$B5D/fn.sh"
+  ( . "$B5D/fn.sh"; tls_chain_check "$B5D/lt.jsonl" )
+  for _i in $(seq 1 30); do [ -s "$B5D/lport.n" ] && break; sleep 0.2; done
+  kill "$_lsrv" 2>/dev/null; wait "$_lsrv" 2>/dev/null
+  assert_grep "$B5D/lt.jsonl" '"chain_error": "self-signed certificate", "untrusted": true' "a TLS 1.0-only self-signed host: the second try at level 0 reaches the verdict"
+  if [ "$(cat "$B5D/lport.n" 2>/dev/null)" = 2 ]; then _pass "... after exactly one retry"; else _fail "... after exactly one retry (got $(cat "$B5D/lport.n" 2>/dev/null) connections)"; fi
+else
+  _pass "openssl unavailable: chain retry test skipped"
+fi
+
+section "Batch 5: report findings for the new flags and cleartext login forms"
+R5="$TMP/rpt20"; rm -rf "$R5"; mkdir -p "$R5"
+python3 - "$R5/r.csv" <<'PYR5'
+import csv, sys
+cols = ["seed_domain", "url", "host", "sources", "status_code", "tls_version", "tls_flags", "auth", "http_flags",
+        "final_url", "redirect_chain", "login_form", "tls_supported", "tls_weak_cipher", "cert_key", "cert_sig_alg", "cert_not_before"]
+rows = [
+    ["ex.com", "https://legacy.ex.com/", "legacy.ex.com", "gau", "200", "TLS 1.2", "WeakTLS;WeakCipher;WeakKey;WeakSig;DefaultCert", "", "",
+     "", "", "", "TLS 1.2;TLS 1.1;TLS 1.0;SSL 3.0", "TLS 1.2:TLS_RSA_WITH_NULL_SHA", "RSA 1024", "sha1WithRSAEncryption", ""],
+    ["ex.com", "https://soon.ex.com/", "soon.ex.com", "gau", "200", "TLS 1.3", "CertNotYetValid", "", "",
+     "", "", "", "", "", "EC P-256", "ecdsa-with-SHA256", "2031-02-03T04:05:06Z"],
+    ["ex.com", "http://r.ex.com/", "r.ex.com", "gau", "301", "", "", "Form", "CleartextAuth",
+     "https://r.ex.com/login", "301->https://r.ex.com/ | 302->https://r.ex.com/login", "http://r.ex.com/session", "", "", "", "", ""],
+    ["ex.com", "https://r.ex.com/", "r.ex.com", "gau", "302", "", "", "Form", "CleartextAuth",
+     "https://r.ex.com/login", "302->https://r.ex.com/login", "http://r.ex.com/session", "", "", "", "", ""],
+]
+w = csv.writer(open(sys.argv[1], "w", newline="")); w.writerow(cols); w.writerows(rows)
+PYR5
+env PATH="$TESTPATH" bash "$REPORT_SH" -o "$R5/out.html" "$R5/r.csv" >/dev/null 2>"$R5/e.log"
+assert_grep "$R5/out.html" 'obsolete protocol versions accepted: TLS 1\.1, TLS 1\.0, SSL 3\.0' "WeakTLS names the old versions accepted"
+assert_grep "$R5/out.html" 'weak cipher accepted: TLS_RSA_WITH_NULL_SHA \(TLS 1\.2\)' "WeakCipher names the suite and version"
+assert_grep "$R5/out.html" 'weak certificate key \(RSA 1024\)'      "WeakKey names the key"
+assert_grep "$R5/out.html" 'weak certificate signature \(sha1WithRSAEncryption\)' "WeakSig names the algorithm"
+assert_grep "$R5/out.html" 'certificate not valid yet \(valid from 2031-02-03 04:05 UTC\)' "CertNotYetValid gives the start date"
+assert_grep "$R5/out.html" "default certificate is still in place" "DefaultCert finding"
+assert_grep "$R5/out.html" 'login form sends the password in cleartext: https://r\.ex\.com/login posts to http://r\.ex\.com/session' "a cleartext login form is one finding ..."
+if [ "$(grep -o 'login form sends the password in cleartext' "$R5/out.html" | wc -l)" = "$(grep -o 'weak certificate key (RSA 1024)' "$R5/out.html" | wc -l)" ]; then
+  _pass "... however many rows reach it (counted like any other single finding)"
+else _fail "... however many rows reach it (counted like any other single finding)"; fi
+refute_grep "$R5/out.html" 'credentials sent in cleartext: Form'     "not reported as Basic/Digest auth"
+assert_grep "$R5/out.html" 'sev-high"[^>]*>HIGH</span></td><td>TLS / certificate</td><td>[^\n]*obsolete protocol versions accepted: [^<]*SSL 3\.0' "WeakTLS with SSL 3.0 accepted is graded high (POODLE)"
+
+section "Batch 5: CPE aliases in the vulns join (cpe-aliases.json)"
+X1D="$TMP/x1"; rm -rf "$X1D"; mkdir -p "$X1D/nvd"
+printf 'seed_domain,url,host,status_code,technologies,cpe\nex.com,https://jira.ex.com/,jira.ex.com,200,Jira:9.4.0,cpe:2.3:a:atlassian:jira:9.4.0:*:*:*:*:*:*:*\nex.com,https://cache.ex.com/,cache.ex.com,200,Varnish,cpe:2.3:a:varnish_cache_project:varnish_cache:7.1.0:*:*:*:*:*:*:*\n' > "$X1D/r.csv"
+python3 - "$X1D/nvd/nvdcve-2.0-2026.json" <<'PYX1'
+import json, sys
+def cve(i, crit, **rng):
+    cm = {"vulnerable": True, "criteria": crit}; cm.update(rng)
+    return {"cve": {"id": i, "published": "2026-01-01", "lastModified": "2026-01-02", "vulnStatus": "Analyzed",
+            "descriptions": [{"lang": "en", "value": "test " + i}],
+            "configurations": [{"nodes": [{"operator": "OR", "cpeMatch": [cm]}]}]}}
+json.dump({"vulnerabilities": [
+    cve("CVE-2026-0001", "cpe:2.3:a:atlassian:jira_server:*:*:*:*:*:*:*:*", versionStartIncluding="9.0.0", versionEndExcluding="9.4.5"),
+    cve("CVE-2026-0002", "cpe:2.3:a:varnish-software:varnish_cache:*:*:*:*:*:*:*:*", versionEndExcluding="7.2.0"),
+    cve("CVE-2026-0003", "cpe:2.3:a:atlassian:jira_server:*:*:*:*:*:*:*:*", versionEndExcluding="9.0.0"),
+    cve("CVE-2026-0004", "cpe:2.3:a:atlassian:confluence:*:*:*:*:*:*:*:*", versionEndExcluding="9.0.0"),
+]}, open(sys.argv[1], "w"))
+PYX1
+env PATH="$TESTPATH" bash "$RDB" vulns "$X1D/r.csv" --nvd-feed "$X1D/nvd" -o "$X1D/v.csv" >/dev/null 2>&1
+assert_grep  "$X1D/v.csv" '^ex\.com,jira\.ex\.com,.*,CVE-2026-0001,.*,range,' "a CVE filed under jira_server joins the service CPE'd as atlassian:jira (version range checked)"
+assert_grep  "$X1D/v.csv" '^ex\.com,cache\.ex\.com,.*,CVE-2026-0002,'         "Varnish Cache under another vendor string joins too"
+refute_grep  "$X1D/v.csv" 'CVE-2026-0003|CVE-2026-0004'                       "the version range still decides; other products stay out"
+assert_grep  "$X1D/v.csv.provenance.json" '"cpe_aliases": \{' "provenance records the alias file ..."
+assert_grep  "$X1D/v.csv.provenance.json" '"groups": 184'     "... and its 184 groups"
+env PATH="$TESTPATH" CPE_ALIASES_FILE= bash "$RDB" vulns "$X1D/r.csv" --nvd-feed "$X1D/nvd" -o "$X1D/v0.csv" >/dev/null 2>&1
+if [ "$(wc -l < "$X1D/v0.csv")" = 1 ]; then _pass "CPE_ALIASES_FILE= turns the aliases off (exact names only: no match)"; else _fail "CPE_ALIASES_FILE= turns the aliases off"; fi
+mkdir -p "$X1D/bin"; ln -sf "$RDB" "$X1D/bin/recon-db"
+env PATH="$TESTPATH" bash "$X1D/bin/recon-db" vulns "$X1D/r.csv" --nvd-feed "$X1D/nvd" -o "$X1D/v2.csv" >/dev/null 2>&1
+assert_grep  "$X1D/v2.csv" 'CVE-2026-0001'                    "run through a symlink (the installed command), the alias file is still found"
 
 # --- 53) service health check: --resolvers catches dead resolvers ----------
 # (placed last: swaps the dig mock for one that reports no reply)
