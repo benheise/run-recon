@@ -7,15 +7,15 @@ default path is kept only if it is no slower and its output is identical (or the
 justified accuracy fix).
 
 **Status:** Done · In progress · Planned · Blocked (needs something from Ben) · Won't do
-**Last updated:** 2026-11-05, run-recon 1.19.0 (Batch 2) ready for review on `batch-2-http-fields`
+**Last updated:** 2026-11-05, run-recon 1.19.0 released (Batch 2 merged in #1, tag `v1.19.0` = `938f58e`)
 
 ## 0. Source of truth
 
 | ID | Item | Status | Check |
 |---|---|---|---|
 | R1 | Git repository, `main` = v1.18.0, generated lab files ignored | Done | `git log` |
-| R2 | Push to GitHub (private `benheise/run-recon`) | Done: `main` pushed. Tags cannot be pushed from Claude's sessions (HTTP 403), so releases/tags are created in the GitHub UI | `main` and branches on GitHub; release v1.18.0 |
-| R3 | Each batch on its own branch, merged by pull request | Done for Batch 2 (`batch-2-http-fields`, PR open) | PR per batch |
+| R2 | Push to GitHub (private `benheise/run-recon`) | Done: `main` pushed; releases v1.18.0 and v1.19.0 published. Tags cannot be pushed from Claude's sessions (HTTP 403), so releases/tags are created in the GitHub UI | tags `v1.18.0`, `v1.19.0` on GitHub |
+| R3 | Each batch on its own branch, merged by pull request | Done for Batch 2 (#1, merged) | PR per batch |
 
 ## 1. Batch 2: HTTP detail (WebInventory A4, A5, A6, A11)
 
@@ -27,7 +27,7 @@ justified accuracy fix).
 | B2.4 | Reverse DNS (`ptr` column) under `--enrich`; non-public addresses only via your `--resolvers` | Done (1.19.0) | suite; lab reverse zone |
 | B2.5 | `--extras` (opt-in, WebInventory's "safe extras"): robots.txt (paths become URL rows), security.txt (RFC 9116 Contact/Expires), one random-path 404 probe (catch-all 200, error-page server) → columns + `<out>.extras.txt` | Done (1.19.0) | lab: robots + expired/valid security.txt + catch-all host |
 | B2.6 | Report: HTTP posture on host cards; findings for cleartext auth, expired security.txt, plain HTTP | Done (1.19.0) | suite |
-| B2.7 | Docs, A/B vs v1.18.0, lab checks, PR | Done (PR open; merge = Ben) | BENCHMARK.md v1.19 section |
+| B2.7 | Docs, A/B vs v1.18.0, lab checks, PR | Done (#1 merged, v1.19.0 released) | BENCHMARK.md v1.19 section |
 | B2.8 | Followed redirect chain (final URL across hops) and password-form detection | Planned (not in 1.19: per-URL `Location` only) | lab redirect fixture |
 
 ## 2. Needs a run on Ben's Kali VM (internet required)
