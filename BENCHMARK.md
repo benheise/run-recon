@@ -669,3 +669,57 @@ were run again once it was back, and passed.
   `legacy.tls.test` accepts `NULL-SHA` as its weak suite, which gives the same `WeakCipher`.
 - **A suite file named `enum.py` shadowed Python's `enum` module** for the scripts next to it. The extracted
   probe is `tlsenum_probe.py` and runs with `-I`.
+
+## v1.20.0 (unreleased): Batch 6, JSON output and shipping to Tideline
+
+Same lab and method. The baseline is the Batch 5 branch (`batch-5-redirects-tls`, frozen with `git archive`), so
+the A/B isolates Batch 6. Each comparison ran interleaved: the two sides alternated run by run, and the order
+switched each round. Batch 5 showed this to be the reliable measurement; back-to-back sessions carry an order
+effect.
+
+### A/B
+
+| Scenario | runs per side | A wall s | B wall s | A CPU s | B CPU s | `--exact` (noise floor from A's next run) |
+|---|---:|---:|---:|---:|---:|---|
+| lab `--tls --ipv6`: Batch 5 (A) → Batch 6 (B) | 6 | 23.26 | 22.75 | 10.21 | 10.13 | identical, 87 rows, every round compared |
+| lab: Batch 6 `--tls --ipv6` (A) → the same with `--json` (B) | 6 | 22.25 | 22.79 | 10.07 | 10.18 | identical CSV |
+
+- **Default path.** It is unchanged. The only addition is `run_id` in run.json, one read of
+  `/proc/sys/kernel/random/uuid`, which is within the noise.
+- **The noise floor.** It is needed on the lab. WordPress's oEmbed responses carry a random per-request
+  `secret`, so their `body_sha256` differs between any two runs of the same version: eight fields, set
+  aside by `compare --noise`. One round (the fourth) also had crawl variance in the baseline (85 rows
+  instead of 87) and is not counted; Batch 5 saw the same.
+- **`--json`.** It costs about 0.1 s of CPU on the lab: one `json.dumps` per row in the CSV builder, and
+  one short Python pass over the side files before the manifest. The CSV is byte-identical.
+- **The farm.** The farm A/B was cut short when the lab's Docker daemon reached its time limit after one
+  run (Batch 5 default, 87.40 s wall / 65.24 s CPU, in line with the Batch 5 figures above). `--json`'s
+  per-row cost scales with rows, not seeds.
+
+### Shipping cost
+
+SHIPCOST_PLACEHOLDER
+
+### Lab checks (real tools)
+
+| Check | Result |
+|---|---|
+| ship (new) | PASS. A lab run with `--tls --ipv6 --takeover --dns-posture --screenshots` was shipped to `lab/mock-tideline.py`: 12 parts, all stored byte for byte; 87 URL records equal to the CSV row for row; 4 screenshots as `image/png`; one open (201), 12 PUTs (204), one complete (202). A second delivery: 200 and nothing re-sent. A 503 on part 2: exit 4, then a retry that sends only parts 2–12 |
+| takeover, zone, origin, posture, resume, history | PASS on the final code (history without the PostgreSQL store, whose test cluster had reached its time limit) |
+| http, tls, discovery, scope | not re-run: the Docker daemon reached its time limit. Batch 6 does not touch those paths, and the default-path A/B is identical |
+
+### Found while building this
+
+- **curl's `--cacert` does not pin.** curl still loads the system CA directory: `curl -v` shows
+  `CAfile: <yours>` and `CApath: /etc/ssl/certs`. A request with a CA that has nothing to do with the
+  server succeeded through the agent proxy, whose CA is in the system store. With an empty `--capath` it
+  failed with `self-signed certificate in certificate chain`. ship-recon passes an empty `--capath` and
+  `-q`. The suite proves the pin with `SSL_CERT_DIR` and `CURL_CA_BUNDLE` pointing at a store that would
+  accept the server. This bears on WebInventory's shipper too: plan §5 says the sensor validates
+  against the pinned root, not the machine store.
+- **curl does not retry a connection reset mid-upload** (exit 56) without `--retry-all-errors`. That
+  flag would also retry refusals, so ship-recon exits 4 instead and the next run resumes from
+  `ship-state.json`.
+- **The suite pulls the CSV builder out by a pattern anchored at `^python3 -`.** Exporting the `--json`
+  switch kept that line as it was. A prefix assignment (`RR_JSON=… python3 - …`) would have silently
+  hidden the builder from four test sections.
