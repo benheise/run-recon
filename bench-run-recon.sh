@@ -935,7 +935,9 @@ cmd_history(){
   _ck(){ if grep -qE "$2" "$1" 2>/dev/null; then log "  ok   $3"; else log "  FAIL $3 (see $1)"; fail=1; fi; }
   log "history check -> $t${RECON_DB_DSN:+ (store: \$RECON_DB_DSN)}"
   mkdir -p "$t/runs"
-  ( cd "$t" && bash "$RUN_RECON" -i "$LAB/targets.txt" -D "$t/runs" --resolvers "$RESOLVERS_FILE" --tls "${db[@]}" --no-report >"$t/a.out" 2>"$t/a.err" ) || true
+  # the baseline run measures the lab as it is now: with --db it would otherwise read target results
+  # cached by an earlier run (up to CACHE_TTL old, e.g. the previous history check's stopped spa)
+  ( cd "$t" && CACHE_FRESH_ACTIVE=1 bash "$RUN_RECON" -i "$LAB/targets.txt" -D "$t/runs" --resolvers "$RESOLVERS_FILE" --tls "${db[@]}" --no-report >"$t/a.out" 2>"$t/a.err" ) || true
   sleep 1
   compose -f "$COMPOSE_FILE" stop spa >/dev/null 2>&1
   ( cd "$t" && bash "$RUN_RECON" -i "$LAB/targets.txt" -D "$t/runs" --resolvers "$RESOLVERS_FILE" --tls "${db[@]}" --monitor >"$t/b.out" 2>"$t/b.err" ) || true
