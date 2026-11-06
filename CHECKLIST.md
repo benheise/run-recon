@@ -1525,9 +1525,9 @@ recon-platform-plan §11; the protocol, exit codes, schemas and enrollment are i
       `faults.json` injects a status or a dropped connection. `lab/gen-ship-certs.sh` makes a
       step-ca-shaped PKI and the misfits (another CA, no sensor URI, RSA, a server from another CA).
 - [x] **Lab**: `bench-run-recon.sh ship` (new; in `checks`).
-- [x] **Checks:** suite 831 → **946/946**; `ship`, `takeover`, `zone`, `origin`, `posture`, `resume` and `history`
-      **PASS** on the final code (`http`, `tls`, `discovery`, `scope` not re-run: the lab's Docker daemon reached
-      its time limit; Batch 6 does not touch those paths). A/B vs Batch 5 on the lab: the default path's CSV
+- [x] **Checks:** suite 831 → **946/946**; `bench-run-recon.sh checks` **PASS** on all eleven on the final code
+      (`history` with the PostgreSQL 16 store, after a fix to the check's baseline run: it read a stale `--db`
+      cache). A/B vs Batch 5 on the lab: the default path's CSV
       identical every round (noise floor applied), timing equal; `--json` +0.1 s CPU, CSV identical; shipping
       the lab run 0.9 s (BENCHMARK.md).
 - [x] **Found while building this**: curl's `--cacert` alone still trusts the system CA directory (pinned with an

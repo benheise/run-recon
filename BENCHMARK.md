@@ -711,8 +711,9 @@ touch the scan: shipping starts after the run's manifest is written.
 | Check | Result |
 |---|---|
 | ship (new) | PASS. A lab run with `--tls --ipv6 --takeover --dns-posture --screenshots` was shipped to `lab/mock-tideline.py`: 12 parts, all stored byte for byte; 87 URL records equal to the CSV row for row; 4 screenshots as `image/png`; one open (201), 12 PUTs (204), one complete (202). A second delivery: 200 and nothing re-sent. A 503 on part 2: exit 4, then a retry that sends only parts 2–12 |
-| takeover, zone, origin, posture, resume, history | PASS on the final code (history without the PostgreSQL store, whose test cluster had reached its time limit) |
-| http, tls, discovery, scope | not re-run: the Docker daemon reached its time limit. Batch 6 does not touch those paths, and the default-path A/B is identical |
+| takeover, zone, origin, posture, resume | PASS on the final code |
+| http, tls, discovery, scope | PASS on the final code, after the lab came back in a new session (the first session's Docker daemon reached its time limit) |
+| history, with the PostgreSQL 16 store | PASS after a fix to the check itself (below); then PASS again at once, with the stale cache that had made it fail |
 
 ### Found while building this
 
@@ -726,6 +727,12 @@ touch the scan: shipping starts after the run's manifest is written.
 - **curl does not retry a connection reset mid-upload** (exit 56) without `--retry-all-errors`. That
   flag would also retry refusals, so ship-recon exits 4 instead and the next run resumes from
   `ship-state.json`.
+- **The history check's baseline run read a stale cache.** With `--db`, its first run read target results
+  cached by an earlier run, up to `CACHE_TTL` (7 days) old. The previous history check had stopped the spa
+  backend for its second run, so the cache held spa.test at 502. The check then saw no 200 → 502 change, and
+  certificates cached before a lab restart showed up as `cert_not_after` changes. The baseline run now sets
+  `CACHE_FRESH_ACTIVE=1`, the same re-measuring `--monitor --db` does. run-recon itself was right: this was
+  the check's own isolation.
 - **The suite pulls the CSV builder out by a pattern anchored at `^python3 -`.** Exporting the `--json`
   switch kept that line as it was. A prefix assignment (`RR_JSON=… python3 - …`) would have silently
   hidden the builder from four test sections.
