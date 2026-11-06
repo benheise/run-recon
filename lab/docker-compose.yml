@@ -1,0 +1,82 @@
+# run-recon benchmark lab — web services at PINNED versions behind a vhost-routing
+# TLS ingress, reusing WebInventory's regression-farm composition (nginx, WordPress,
+# a 120 KB single-page app, a TLS CI service) so the products/CPEs run-recon
+# fingerprints line up with what WebInventory's rules expect for the same services.
+#
+#   lab  : nginx.test wp.test spa.test ci.test          -> accuracy (lab/expected.csv)
+#   farm : fNN.farm.test, round-robin over the backends  -> throughput + accuracy under load
+#
+#   ./bench-run-recon.sh up [--farm 50]   generates farm/DNS files, starts, provisions WP
+#   ./bench-run-recon.sh down
+#
+# Loopback only. The `.test` TLD is reserved for testing (RFC 6761). This is a range
+# you own; never point the scanner anywhere else. Config dirs are bind-mounted as
+# DIRECTORIES so regenerated files are seen without recreating containers.
+services:
+  # authoritative DNS for `test.` (Corefile + generated lab.hosts). LAB_DNS_IP picks
+  # another loopback address when 127.0.0.1:53 is taken (e.g. by Pi-hole/dnsmasq).
+  dns:
+    image: coredns/coredns:1.11.1
+    restart: unless-stopped
+    command: ["-conf", "/lab/Corefile"]
+    ports:
+      - "${LAB_DNS_IP:-127.0.0.1}:53:53/udp"
+      - "${LAB_DNS_IP:-127.0.0.1}:53:53/tcp"
+    volumes:
+      - ./:/lab:ro
+
+  ingress:
+    image: caddy:2.7.6
+    restart: unless-stopped
+    command: ["caddy", "run", "--config", "/lab/Caddyfile", "--adapter", "caddyfile"]
+    ports:
+      - "127.0.0.1:80:80"
+      - "127.0.0.1:443:443"
+    volumes:
+      - ./:/lab:ro
+      - caddy_data:/data
+    depends_on: [nginx, wordpress, spa, jenkins]
+
+  # Server: nginx/1.21.6 -> cpe:2.3:a:f5:nginx:1.21.6
+  # Also published DIRECTLY on LAB_ORIGIN_IP:80: the "forgotten origin" that answers for
+  # nginx.test without the Caddy edge. db.test leaks it (direct.nginx.test, SPF), so
+  # --origin must find and verify it; the other backends stay on the container network.
+  nginx:
+    image: nginx:1.21.6
+    restart: unless-stopped
+    ports:
+      - "${LAB_ORIGIN_IP:-127.0.0.5}:80:80"
+
+  # WordPress 6.4.x on Apache/PHP (provisioned by `up`) -> WordPress/Apache/PHP CPEs
+  wordpress:
+    image: wordpress:6.4-apache
+    restart: unless-stopped
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_USER: lab
+      WORDPRESS_DB_PASSWORD: labpass
+      WORDPRESS_DB_NAME: labwp
+    depends_on: [db]
+  db:
+    image: mariadb:10.11
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: labwp
+      MYSQL_USER: lab
+      MYSQL_PASSWORD: labpass
+      MYSQL_RANDOM_ROOT_PASSWORD: "1"
+
+  # the 120 KB single-bundle SPA (generated at `up`), served by nginx
+  spa:
+    image: nginx:1.21.6
+    restart: unless-stopped
+    volumes:
+      - ./spa:/usr/share/nginx/html:ro
+
+  # Jenkins LTS: 403 + X-Jenkins header (locked-down CI) -> cpe:2.3:a:jenkins:jenkins
+  jenkins:
+    image: jenkins/jenkins:2.426.1-lts-jdk17
+    restart: unless-stopped
+
+volumes:
+  caddy_data:

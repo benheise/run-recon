@@ -1,0 +1,4 @@
+nginx.test
+wp.test
+spa.test
+ci.test

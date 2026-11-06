@@ -1,0 +1,5 @@
+host,status,technologies,cpe,tls_flags,ipv6,min_urls
+nginx.test,200,Nginx,cpe:2.3:a:f5:nginx:1.21.6,CertExpiring;CertUntrusted,2001:db8:1::10,1
+wp.test,200,WordPress;PHP;Apache HTTP Server,cpe:2.3:a:wordpress:wordpress:6.4.3;cpe:2.3:a:apache:http_server:2.4.57;cpe:2.3:a:php:php:8.2.17,CertExpiring;CertUntrusted,2001:db8:1::10,80
+spa.test,200,Nginx,cpe:2.3:a:f5:nginx:1.21.6,CertExpiring;CertUntrusted,-,1
+ci.test,403,Jenkins;Jetty,cpe:2.3:a:jenkins:jenkins:2.426.1;cpe:2.3:a:eclipse:jetty:10.0.17,CertExpiring;CertUntrusted,-,1

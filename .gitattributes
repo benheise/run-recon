@@ -1,0 +1,5 @@
+# the scripts run under bash on Kali/WSL: keep LF even when cloned on Windows
+*.sh text eol=lf
+lab/* text eol=lf
+*.md text
+*.ps1 text
