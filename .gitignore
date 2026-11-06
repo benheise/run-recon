@@ -28,3 +28,4 @@ lab/tls/
 lab/targets-tls.txt
 *.tideline.tar
 *.ship-state.json
+__pycache__/
