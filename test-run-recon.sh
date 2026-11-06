@@ -125,7 +125,7 @@ printf '%s ' "$@" >> "$MOCKLOG/httpx.args"; echo >> "$MOCKLOG/httpx.args"
 # Reject unknown flags the way ProjectDiscovery httpx (goflags) does -- this is
 # what catches an invalid flag like -a that silently blanks all enrichment.
 __vf=" -timeout -rl -rate-limit -r -resolvers -l -list -o -output -srd -store-response-dir -mc -match-code -t -threads -retries -H -header -p -ports -delay -proxy -http-proxy -ho -headless-options -hash -st -screenshot-timeout -path "
-__bf=" -silent -json -sc -status-code -cl -content-length -ct -content-type -title -td -tech-detect -server -web-server -ip -cname -asn -cdn -probe -ss -screenshot -system-chrome -nc -no-color -version -h -help -fr -follow-redirects -favicon -location -jarm -method -websocket -nfs -no-fallback-scheme -nf -no-fallback -esb -exclude-screenshot-bytes -ehb -exclude-headless-body -irh -include-response-header -irr -include-response "
+__bf=" -silent -json -sc -status-code -cl -content-length -ct -content-type -title -td -tech-detect -server -web-server -ip -cname -asn -cdn -probe -ss -screenshot -system-chrome -nc -no-color -version -h -help -fr -follow-redirects -favicon -location -jarm -method -websocket -nfs -no-fallback-scheme -nf -no-fallback -esb -exclude-screenshot-bytes -ehb -exclude-headless-body -irh -include-response-header -irr -include-response -irrb -include-response-base64 "
 __A=("$@"); __i=0
 while [ $__i -lt ${#__A[@]} ]; do
   case "${__A[$__i]}" in
@@ -168,25 +168,48 @@ if [ -n "$list" ] && [ -f "$list" ]; then exec < "$list"; fi
 if [ "$mode" = probe ] && [ -n "${MOCK_HTTPX_NOLIVE:-}" ]; then cat >/dev/null; exit 0; fi
 # --origin reference fetch (-irh): a Cloudflare edge in front of nginx; the body hash is
 # that of "ORIGIN-BODY", which the curl mock returns for the leaked origin address
-irh=0; fav=0; paths=""; pa=("$@"); pi=0
+irh=0; fav=0; b64=0; paths=""; pa=("$@"); pi=0
 while [ $pi -lt ${#pa[@]} ]; do case "${pa[$pi]}" in
-  -irh|-include-response-header) irh=1;; -favicon) fav=1;;
+  -irh|-include-response-header) irh=1;; -favicon) fav=1;; -irrb) b64=1;;
   -path) pi=$((pi+1)); paths="${pa[$pi]:-}";; esac; pi=$((pi+1)); done
+# body BODY CT: a response body for -irr (JSON string) or -irrb (base64 of the raw bytes;
+# BODY's escapes such as \n and \000 are expanded first)
+body(){ if [ "$b64" = 1 ]; then printf '%b' "$1" | base64 -w0; else printf '%s' "$1"; fi; }
+rec(){ # URL PATH STATUS CONTENT-TYPE BODY [extra JSON fields]
+  printf '{"input":"%s","url":"%s%s","path":"%s","status_code":%s,"content_type":"%s",%s"body":"%s"}\n' \
+    "$u" "$u" "$2" "$2" "$3" "$4" "${6:-}" "$(body "$5")"; }
 # --extras: robots.txt (a hidden path + a wildcard rule + a sitemap), an EXPIRED security.txt,
 # and a catch-all 200 for the random 404-probe path. MOCK_EXTRAS_NOSEC=1: no security.txt.
+# The root page (/) and /favicon.ico (--extras 1.20, -irrb): MOCK_EXTRAS_ICON=link declares
+# <link rel=icon href=/static/app.ico> (fetched in a follow-up pass), =data an inline data:
+# URI icon, =html serves an HTML soft-404 as /favicon.ico (not an icon: no hash).
 if [ "$mode" = json ] && [ -n "$paths" ]; then
   while IFS= read -r u; do [ -z "$u" ] && continue; u="${u%/}"
     IFS=',' read -ra PL <<< "$paths"
     for pth in "${PL[@]}"; do
       case "$pth" in
-        /robots.txt) printf '{"input":"%s","url":"%s%s","path":"%s","status_code":200,"content_type":"text/plain","body":"User-agent: *\\nDisallow: /hidden-admin/\\nDisallow: /*.bak$\\nSitemap: https://example.com/sitemap.xml\\n"}\n' "$u" "$u" "$pth" "$pth";;
+        /) case "${MOCK_EXTRAS_ICON:-}" in
+             link) rec "$u" / 200 text/html '<html><head><title>Home</title><link rel="shortcut icon" href="/static/app.ico"></head></html>';;
+             data) rec "$u" / 200 text/html '<html><head><link rel=icon href="data:image/png;base64,iVBOR01PQ0stREFUQS1JQ09O"></head></html>';;
+             *)    rec "$u" / 200 text/html '<html><head><title>Home</title></head></html>';;
+           esac;;
+        /favicon.ico) if [ "${MOCK_EXTRAS_ICON:-}" = html ]; then rec "$u" "$pth" 200 text/html '<!doctype html><html>soft 404</html>'
+          else rec "$u" "$pth" 200 image/x-icon '\000\000\001\000MOCK-ICON'; fi;;
+        /robots.txt) rec "$u" "$pth" 200 text/plain 'User-agent: *\nDisallow: /hidden-admin/\nDisallow: /*.bak$\nSitemap: https://example.com/sitemap.xml\n';;
         /.well-known/security.txt) if [ -z "${MOCK_EXTRAS_NOSEC:-}" ]; then
-            printf '{"input":"%s","url":"%s%s","path":"%s","status_code":200,"content_type":"text/plain","body":"Contact: mailto:security@example.com\\nExpires: 2021-01-01T00:00:00Z\\n"}\n' "$u" "$u" "$pth" "$pth"
-          else printf '{"input":"%s","url":"%s%s","path":"%s","status_code":404,"content_type":"text/html","body":"<html>nf</html>"}\n' "$u" "$u" "$pth" "$pth"; fi;;
-        /security.txt) printf '{"input":"%s","url":"%s%s","path":"%s","status_code":404,"content_type":"text/html","body":"<html>nf</html>"}\n' "$u" "$u" "$pth" "$pth";;
-        *) printf '{"input":"%s","url":"%s%s","path":"%s","status_code":200,"content_type":"text/html","webserver":"nginx","title":"Home","content_length":5,"body":"<html><address>Apache/2.4.41 (Ubuntu) Server</address></html>"}\n' "$u" "$u" "$pth" "$pth";;
+            rec "$u" "$pth" 200 text/plain 'Contact: mailto:security@example.com\nExpires: 2021-01-01T00:00:00Z\n'
+          else rec "$u" "$pth" 404 text/html '<html>nf</html>'; fi;;
+        /security.txt) rec "$u" "$pth" 404 text/html '<html>nf</html>';;
+        *) rec "$u" "$pth" 200 text/html '<html><address>Apache/2.4.41 (Ubuntu) Server</address></html>' '"webserver":"nginx","title":"Home","content_length":5,';;
       esac
     done
+  done
+  exit 0
+fi
+# follow-up icon fetch (-irrb, full URLs, no -path): the icon a root page declared
+if [ "$mode" = json ] && [ "$b64" = 1 ]; then
+  while IFS= read -r u; do [ -z "$u" ] && continue
+    printf '{"input":"%s","url":"%s","status_code":200,"content_type":"image/png","body":"%s"}\n' "$u" "$u" "$(printf '\211PNGMOCK-LINKED-ICON' | base64 -w0)"
   done
   exit 0
 fi
@@ -200,7 +223,9 @@ fi
 if [ "$mode" = json ] && [ "$irh" = 1 ] && [ "$fav" = 1 ]; then
   sha="$(printf '%s' 'ORIGIN-BODY' | sha256sum | cut -d' ' -f1)"
   while IFS= read -r u; do [ -z "$u" ] && continue
-    printf '{"input":"%s","url":"%s","status_code":200,"content_length":11,"title":"Origin Test","host_ip":"104.16.1.1","favicon":"-123","hash":{"body_sha256":"%s"},"header":{"server":"cloudflare, nginx/1.25.3","cf_ray":"8a1b2c3d"}}\n' "$u" "$u" "$sha"
+    # MOCK_REF_SERVER: a lone Server header (no CDN headers) instead of Cloudflare -> nginx
+    if [ -n "${MOCK_REF_SERVER:-}" ]; then _hdr="{\"server\":\"$MOCK_REF_SERVER\"}"; else _hdr='{"server":"cloudflare, nginx/1.25.3","cf_ray":"8a1b2c3d"}'; fi
+    printf '{"input":"%s","url":"%s","status_code":200,"content_length":11,"title":"Origin Test","host_ip":"104.16.1.1","favicon":"-123","hash":{"body_sha256":"%s"},"header":%s}\n' "$u" "$u" "$sha" "$_hdr"
   done
   exit 0
 fi
@@ -260,13 +285,14 @@ EOF
 mk dig <<'EOF'
 #!/usr/bin/env bash
 printf '%s ' "$@" >> "$MOCKLOG/dig.args"; echo >> "$MOCKLOG/dig.args"
-q=""; typ=""; comments=0
+q=""; typ=""; comments=0; srv=""
 for a in "$@"; do
   case "$a" in
     +comments) comments=1;;
-    @*|+*) ;;
+    @*) srv="${a#@}";;
+    +*) ;;
     *.cymru.com) q="$a";;
-    TXT|A|AAAA|MX|NS|CNAME|SOA|DNSKEY|AXFR|NSEC|NSEC3PARAM) typ="$a";;
+    TXT|A|AAAA|MX|NS|CNAME|SOA|DNSKEY|DS|AXFR|NSEC|NSEC3PARAM) typ="$a";;
     *.origin.asn.cymru.com|AS*.asn.cymru.com) q="$a";;
     *) [ -z "$q" ] && case "$a" in *.*) q="$a";; esac;;
   esac
@@ -275,20 +301,31 @@ done
 _px=0; for a in "$@"; do if [ "$_px" = 1 ]; then case "$a" in 93.184.216.34) echo "edge-93-184-216-34.example.net.";; 10.0.0.9) echo "db01.corp.example.";; esac; exit 0; fi; [ "$a" = "-x" ] && _px=1; done
 # resolver preflight (+noall +comments): MOCK_DIG_STATUS sets the reply status
 [ "$comments" = 1 ] && echo ";; ->>HEADER<<- opcode: QUERY, status: ${MOCK_DIG_STATUS:-NOERROR}, id: 4242"
-# --zone-exposure fixtures for example.com (MOCK_ZONE=axfr|nsec|nsec3|none)
+# a seed that is a CNAME to a name that does not exist (the resolve-gate warning)
+if [ "$typ" = CNAME ]; then case "$q" in dead.example.com) echo "deleted.herokuapp.com.";; esac; exit 0; fi
+# --zone-exposure fixtures for example.com (MOCK_ZONE=axfr|nsec|nsec3|signed|none).
+# MOCK_ZONE_DS=1: the parent publishes a DS. MOCK_ZONE_V6=1: ns1 also has an IPv6 address,
+# which never answers. MOCK_ZONE_NS2=1: a second name server, ns0 (tried first), that
+# refuses the transfer and answers no NSEC queries.
 if [ -n "${MOCK_ZONE:-}" ]; then
   SOA="example.com. 60 IN SOA ns1.example.com. hostmaster.example.com. 1 7200 3600 1209600 60"
+  [ "$srv" = 2001:db8::53 ] && exit 9                       # unreachable: no reply at all
   case "$typ" in
     SOA) case "$q" in example.com|*.example.com) echo "$SOA";; esac; exit 0;;
-    NS)  [ "$q" = example.com ] && echo "example.com. 60 IN NS ns1.example.com."; exit 0;;
-    A)   if [ "$q" = ns1.example.com ]; then echo "ns1.example.com. 60 IN A 192.0.2.53"; exit 0; fi;;
-    DNSKEY) case "$MOCK_ZONE" in nsec|nsec3) echo "example.com. 60 IN DNSKEY 257 3 13 mdsswUyr3DPW132mOi8V9xESWE8jTo0dxCjjnopKl+GqJxpVXckHAeF+KkxLbxILfDLUT0rAK9iUzy1L53eKGQ==";; esac; exit 0;;
+    NS)  if [ "$q" = example.com ]; then echo "example.com. 60 IN NS ns1.example.com."
+           [ -n "${MOCK_ZONE_NS2:-}" ] && echo "example.com. 60 IN NS ns0.example.com."; fi; exit 0;;
+    A)   if [ "$q" = ns1.example.com ]; then echo "ns1.example.com. 60 IN A 192.0.2.53"; exit 0; fi
+         if [ "$q" = ns0.example.com ]; then echo "ns0.example.com. 60 IN A 192.0.2.52"; exit 0; fi;;
+    AAAA) [ "$q" = ns1.example.com ] && [ -n "${MOCK_ZONE_V6:-}" ] && echo "ns1.example.com. 60 IN AAAA 2001:db8::53"; exit 0;;
+    DS)  [ "$q" = example.com ] && [ -n "${MOCK_ZONE_DS:-}" ] && echo "example.com. 60 IN DS 2371 13 2 1F987CC6583E92DF0890718C42A0A6C0A5D6D9F1B6E5D1C3A4E1C0B7A5D6E4F1"; exit 0;;
+    DNSKEY) case "$MOCK_ZONE" in nsec|nsec3|signed) echo "example.com. 60 IN DNSKEY 257 3 13 mdsswUyr3DPW132mOi8V9xESWE8jTo0dxCjjnopKl+GqJxpVXckHAeF+KkxLbxILfDLUT0rAK9iUzy1L53eKGQ==";; esac; exit 0;;
     NSEC3PARAM) [ "$MOCK_ZONE" = nsec3 ] && echo "example.com. 0 IN NSEC3PARAM 1 0 5 ABCDEF"; exit 0;;
-    AXFR) if [ "$MOCK_ZONE" = axfr ]; then
+    AXFR) if [ "$srv" = 192.0.2.52 ]; then echo "; Transfer failed."
+          elif [ "$MOCK_ZONE" = axfr ]; then
             printf '%s\n' "$SOA" "example.com. 60 IN NS ns1.example.com." "ns1.example.com. 60 IN A 192.0.2.53" \
               "www.example.com. 60 IN A 192.0.2.10" "hidden-zone.example.com. 60 IN A 192.0.2.11" "$SOA"
           else echo "; Transfer failed."; fi; exit 0;;
-    NSEC) if [ "$MOCK_ZONE" = nsec ]; then
+    NSEC) if [ "$MOCK_ZONE" = nsec ] && [ "$srv" != 192.0.2.52 ]; then
             case "$q" in example.com) n=a-secret.example.com;; a-secret.example.com) n=ns1.example.com;;
               ns1.example.com) n=www.example.com;; www.example.com) n=example.com;; *) exit 0;; esac
             echo "$q. 60 IN NSEC $n. A RRSIG NSEC"
@@ -298,7 +335,12 @@ fi
 case "$q" in
   *.origin.asn.cymru.com) echo '"15133 | 93.184.216.0/24 | US | arin | 2008-06-02"';;
   AS15133.asn.cymru.com)  echo '"15133 | US | arin | 2008-06-02 | EDGECAST, US"';;
-  example.com) if [ "$typ" = TXT ]; then echo '"v=spf1 ip4:198.51.100.7 -all"'; elif [ "$typ" = A ]; then echo "93.184.216.34"; fi;;
+  example.com) if [ "$typ" = TXT ]; then
+                 # MOCK_SPF=include: an include: chain, ip6:, a small range and a /24 (too wide)
+                 if [ "${MOCK_SPF:-}" = include ]; then echo '"v=spf1 include:_spf.example.com ip6:2001:db8:5::7 ip4:198.51.100.16/30 ip4:203.0.113.0/24 -all"'
+                 else echo '"v=spf1 ip4:198.51.100.7 -all"'; fi
+               elif [ "$typ" = A ]; then echo "93.184.216.34"; fi;;
+  _spf.example.com) [ "$typ" = TXT ] && echo '"v=spf1 ip4:198.51.100.8 -all"';;
   *) [ "$typ" = "A" ] && echo "93.184.216.34" || true;;
 esac
 EOF
@@ -306,10 +348,11 @@ EOF
 mk dnsx <<'EOF'
 #!/usr/bin/env bash
 printf '%s ' "$@" >> "$MOCKLOG/dnsx.args"; echo >> "$MOCKLOG/dnsx.args"
-args=("$@"); i=0; list=""; wd=""; json=0; aaaa=0; cname=0; rcode=""
+args=("$@"); i=0; list=""; wd=""; json=0; a4=0; aaaa=0; cname=0; rcode=""
 while [ $i -lt ${#args[@]} ]; do
   case "${args[$i]}" in
     -l|-list)              i=$((i+1)); list="${args[$i]:-}";;
+    -a)                    a4=1;;
     -wd|-wildcard-domain)  i=$((i+1)); wd="${args[$i]:-}";;
     -r|-resolver|-resolvers) i=$((i+1));;
     -j|-json)              json=1;;
@@ -346,7 +389,9 @@ while IFS= read -r h; do
   [ -z "$h" ] && continue
   case "$h" in dead.*) continue;; esac                 # simulate NXDOMAIN
   if [ -n "$wd" ]; then case "$h" in wildcard.*) continue;; esac; fi   # -wd strips wildcard
-  if [ "$aaaa" = 1 ]; then                             # AAAA stage (--ipv6): emit IPv6
+  if [ "$aaaa" = 1 ] && [ "$a4" = 1 ]; then              # both families (--origin candidates)
+    [ "$json" = 1 ] && printf '{"host":"%s","a":["10.0.0.1"],"aaaa":["2001:db8::1"]}\n' "$h"
+  elif [ "$aaaa" = 1 ]; then                           # AAAA stage (--ipv6): emit IPv6
     [ "$json" = 1 ] && printf '{"host":"%s","aaaa":["2001:db8::1"]}\n' "$h"
   elif [ "$json" = 1 ]; then printf '{"host":"%s","a":["10.0.0.1"]}\n' "$h"
   else printf '%s\n' "$h"; fi
@@ -360,9 +405,9 @@ EOF
 mk tlsx <<'EOF'
 #!/usr/bin/env bash
 printf '%s ' "$@" >> "$MOCKLOG/tlsx.args"; echo >> "$MOCKLOG/tlsx.args"
-args=("$@"); i=0; list=""; jarm=0; tlsver=0
+args=("$@"); i=0; list=""; jarm=0; tlsver=0; json=0
 while [ $i -lt ${#args[@]} ]; do
-  case "${args[$i]}" in -l|-list) i=$((i+1)); list="${args[$i]:-}";; -jarm) jarm=1;; -tls-version) tlsver=1;; esac; i=$((i+1))
+  case "${args[$i]}" in -l|-list) i=$((i+1)); list="${args[$i]:-}";; -jarm) jarm=1;; -tls-version) tlsver=1;; -json) json=1;; esac; i=$((i+1))
 done
 if [ "$tlsver" = 1 ]; then   # TLS posture mode: emit a JSON record per host:port
   while IFS= read -r a || [ -n "$a" ]; do
@@ -379,6 +424,11 @@ if [ "$jarm" = 1 ]; then   # tlsx 1.4 prints colours even into a pipe unless -nc
   while IFS= read -r a || [ -n "$a" ]; do
     [ -n "$a" ] && printf '%s [\033[35m%s\033[0m]\n' "$a" 28d3ed0032d3ed0032d3ed0032d3edc8a0c9d8e0b7f4f6abcdef0123456789
   done < "${list:-/dev/null}"
+  exit 0
+fi
+# range cert scan (-json, 1.20): the names with the address that presented them
+if [ "$json" = 1 ]; then
+  printf '{"host":"192.0.2.10","ip":"192.0.2.10","port":"443","subject_cn":"cert-sibling.example.com","subject_an":["cert-sibling.example.com","assets.example.com","sneaky.otherdomain.com"]}\n'
   exit 0
 fi
 printf 'cert-sibling.example.com\nassets.example.com\nsneaky.otherdomain.com\n'
@@ -659,7 +709,7 @@ mk httpx-toolkit <<'EOF'
 #!/usr/bin/env bash
 printf '%s ' "$@" >> "$MOCKLOG/httpx-toolkit.args"; echo >> "$MOCKLOG/httpx-toolkit.args"
 __vf=" -timeout -rl -rate-limit -r -resolvers -l -list -o -output -srd -store-response-dir -mc -match-code -t -threads -retries -H -header -p -ports -delay -proxy -http-proxy -ho -headless-options -hash -st -screenshot-timeout -path "
-__bf=" -silent -json -sc -status-code -cl -content-length -ct -content-type -title -td -tech-detect -server -web-server -ip -cname -asn -cdn -probe -ss -screenshot -system-chrome -nc -no-color -version -h -help -fr -follow-redirects -favicon -location -jarm -method -websocket -nfs -no-fallback-scheme -nf -no-fallback -esb -exclude-screenshot-bytes -ehb -exclude-headless-body -irh -include-response-header -irr -include-response "
+__bf=" -silent -json -sc -status-code -cl -content-length -ct -content-type -title -td -tech-detect -server -web-server -ip -cname -asn -cdn -probe -ss -screenshot -system-chrome -nc -no-color -version -h -help -fr -follow-redirects -favicon -location -jarm -method -websocket -nfs -no-fallback-scheme -nf -no-fallback -esb -exclude-screenshot-bytes -ehb -exclude-headless-body -irh -include-response-header -irr -include-response -irrb -include-response-base64 "
 __A=("$@"); __i=0
 while [ $__i -lt ${#__A[@]} ]; do
   case "${__A[$__i]}" in
@@ -969,9 +1019,11 @@ printf '%s ' "$@" >> "$MOCKLOG/curl.args"; echo >> "$MOCKLOG/curl.args"
 out=""; res=""; a=("$@"); i=0
 while [ $i -lt ${#a[@]} ]; do case "${a[$i]}" in -o) i=$((i+1)); out="${a[$i]}";; --resolve) i=$((i+1)); res="${a[$i]}";; esac; i=$((i+1)); done
 [ -n "$out" ] || exit 0
+# -w %{http_code}: the status on stdout; an address with nothing listening is refused
+# (000, exit 7) as curl reports it
 case "$res" in
-  example.com:443:10.0.0.1) printf '%s' "${MOCK_ORIGIN_BODY:-ORIGIN-BODY}" > "$out";;
-  *) : > "$out";;
+  example.com:443:10.0.0.1) printf '%s' "${MOCK_ORIGIN_BODY:-ORIGIN-BODY}" > "$out"; printf '200';;
+  *) : > "$out"; printf '000'; exit 7;;
 esac
 exit 0
 EOF
@@ -988,11 +1040,18 @@ assert_fgrep "$MOCKLOG/curl.args" "--noproxy *"                          "the di
 refute_grep  "$MOCKLOG/curl.args" '104\.16\.1\.1'                       "the edge's own address is never a candidate"
 assert_grep  "$CSV.origin.txt" '^\[example\.com\] origin-exposed \[high\] host=example\.com origin=10\.0\.0\.1 port=443 via=backend\.example\.com,direct\.example\.com,origin\.example\.com match=body-sha256 edge=cloudflare' "verified origin behind an edge -> origin-exposed [high]"
 refute_grep  "$CSV.origin.txt" 'jarm|cdn '                               "JARM/CDN hints are attributes (edge.tsv), not findings (v1.17 false positives)"
+assert_fgrep "$MOCKLOG/curl.args" '--resolve example.com:443:[2001:db8::1] https://example.com:443/' "AAAA of an origin name is a candidate too (IPv6 bracketed)"
+assert_fgrep "$MOCKLOG/curl.args" '--resolve example.com:80:198.51.100.7 http://example.com:80/' "ORIGIN_PORTS: port 80 is tried over plain HTTP"
+refute_grep  "$CSV.origin.txt" 'origin-protected'                       "no origin-protected for a site whose origin another address exposes"
 bash "$(dirname "$RUN_RECON")/generate-report.sh" "$CSV" -o "$OUTDIR/o.html" >/dev/null 2>&1 || true
 if python3 -c 'import sys,re; s=open(sys.argv[1],encoding="utf-8").read(); t=re.sub(r"<[^>]+>"," ",s); sys.exit(0 if re.search(r"HIGH\s+Exposed origin\s+example\.com", t) and "cloudflare &rarr; nginx/1.25.3 &rarr; origin" in s else 1)' "$OUTDIR/o.html" 2>/dev/null
 then _pass "report: exposed origin is a HIGH finding; the host card shows edge -> origin software -> origin"; else _fail "report: exposed origin is a HIGH finding; the host card shows edge -> origin software -> origin"; fi
 MOCK_ORIGIN_BODY='something else' run_case origin_nomatch --origin
-refute_grep  "$CSV.origin.txt" 'origin-'                                 "a candidate serving a different page is not reported"
+refute_grep  "$CSV.origin.txt" 'origin-(exposed|alternate|candidate)'   "a candidate serving a different page is not reported as an origin"
+assert_grep  "$CSV.origin.txt" '^\[example\.com\] origin-protected \[info\] host=example\.com origin=10\.0\.0\.1 via=backend\.example\.com,direct\.example\.com,origin\.example\.com reason=443:status-200-other-content,80:refused ' "an origin name's address that does not serve the site -> origin-protected [info], with the reason per port"
+assert_grep  "$CSV.origin.txt" 'origin-protected \[info\] host=example\.com origin=2001:db8::1 .*reason=443:refused,80:refused' "refused on every port -> origin-protected [info]"
+ORIGIN_PORTS=443 run_case origin_ports --origin
+refute_grep  "$MOCKLOG/curl.args" ':80:'                                 "ORIGIN_PORTS=443: only 443 is tried"
 MOCK_ORIGIN_BODY='<html><title>Origin Test</title>changed</html>' run_case origin_title --origin
 assert_grep  "$CSV.origin.txt" 'origin-candidate \[low\] host=example\.com origin=10\.0\.0\.1 port=443 .*match=title' "same title, different body -> origin-candidate [low] (verify by hand)"
 mk curl <<'EOF'
@@ -1094,6 +1153,13 @@ assert_grep  "$MOCKLOG/tlsx.args" -- '-p 443 '                          "range c
 assert_fgrep "$MOCKLOG/tlsx.args" 'cidrs.txt'                          "tlsx cert-scans the expanded CIDR list"
 assert_grep  "$ERRLOG" 'ASN/CIDR expansion'                           "startup reports ASN/CIDR expansion"
 assert_grep  "$CSV" '^cert-sibling\.example\.com,https://cert-sibling\.example\.com/gau-path' "cert-derived hostname enrolled as a seed and crawled"
+assert_grep  "$MOCKLOG/tlsx.args" -- '-san -cn -json'                   "range cert scan records which address presented each name (-json)"
+assert_fgrep "$OUTDIR"/_work-*/range_certs.tsv $'192.0.2.10\tcert-sibling.example.com' "address/name pairs kept for --origin"
+# --origin: an address in your ranges that presents the site's certificate is a candidate
+OUTDIR="$TMP/out_asn_origin"; rm -rf "$OUTDIR"; mkdir -p "$OUTDIR"; rm -f "$MOCKLOG"/*.args; ERRLOG="$OUTDIR/stderr.log"
+timeout 40 env PATH="$TESTPATH" HTTPX_BIN=httpx HOME="$TMP/asnhome" PDCP_API_KEY=test-key TLS_CHAIN_CHECK=0 \
+  bash "$RUN_RECON" -i "$ASN_INPUT" -D "$OUTDIR" -o "$OUTDIR/r.csv" --keep-work --origin >/dev/null 2>"$ERRLOG" || true
+assert_fgrep "$MOCKLOG/curl.args" '--resolve cert-sibling.example.com:443:192.0.2.10' "--origin tries the range address whose certificate names the site (range-cert)"
 # no key: say so up front and do not call asnmap
 OUTDIR="$TMP/out_asn_nokey"; rm -rf "$OUTDIR"; mkdir -p "$OUTDIR"; rm -f "$MOCKLOG"/*.args; ERRLOG="$OUTDIR/stderr.log"
 timeout 25 env -u PDCP_API_KEY PATH="$TESTPATH" HTTPX_BIN=httpx HOME="$TMP/asnhome" \
@@ -1321,6 +1387,14 @@ env PATH="$TESTPATH" bash "$REPORT_SH" -o "$RPTDIR/out0.html" "$RPTDIR/r.csv" >/
 refute_grep   "$RPTDIR/out0.html" 'src="[^"]*https_admin\.example\.com\.png'  "a 0-byte image is not shown as the host's screenshot"
 assert_grep   "$RPTDIR/out0.html" 'screenshot failed'                "a 0-byte image is shown as a failed capture"
 assert_grep   "$RPTDIR/out.html" 'Known vulnerabilities: not checked' "no vuln join -> the report says vulnerabilities were not checked"
+# versioned and versionless CPEs are counted apart: only a version can be matched to CVEs
+{ printf 'seed_domain,url,host,sources,status_code,content_length,webserver,title,technologies,ip,asn,asn_org,tls_version,tls_cipher,cert_not_after,cert_issuer,tls_flags,ipv6,cloud,rdap_org,geo,cpe\n'
+  printf 'example.com,https://example.com/,example.com,gau,200,10,nginx,Home,Nginx,93.184.216.34,,,,,,,,,,,,cpe:2.3:a:f5:nginx:1.21.6:*:*:*:*:*:*:*\n'
+  printf 'example.com,https://ci.example.com/,ci.example.com,gau,200,10,Jetty,CI,Jenkins,93.184.216.35,,,,,,,,,,,,cpe:2.3:a:jenkins:jenkins:*:*:*:*:*:*:*:*\n'
+} > "$RPTDIR/cpe.csv"
+env PATH="$TESTPATH" bash "$REPORT_SH" -o "$RPTDIR/cpe.html" "$RPTDIR/cpe.csv" >/dev/null 2>&1
+assert_grep   "$RPTDIR/cpe.html" '1 versioned CPE\(s\) on 1 host\(s\) would be checked' "versioned CPEs: the ones a CVE join can use"
+assert_grep   "$RPTDIR/cpe.html" '1 CPE\(s\) on 1 host\(s\) carry no version'           "versionless CPEs counted apart (the product, not its version)"
 # wiring: a normal run auto-builds the report; --no-report suppresses it
 run_case report_auto
 assert_exists "$CSV.report.html"                                  "run-recon auto-generates <out>.report.html at end of run"
@@ -2029,18 +2103,32 @@ assert_grep  "$HD/out2.csv" ',https://db\.ex\.com/,.*,db01\.corp\.example,' "PTR
 assert_grep  "$MOCKLOG/dig.args" '@10\.0\.0\.53 \+time=2 \+tries=1 -x 10\.0\.0\.9' "private PTR goes to the --resolvers address"
 
 section "Batch 2: --extras (robots.txt, security.txt, 404 probe, favicon hashes)"
+# the mock icon is the bytes 00 00 01 00 "MOCK-ICON": Shodan mmh3 -732438843, MD5 1e23ac45...
 run_case extras --extras
-assert_grep  "$MOCKLOG/httpx.args" -- '-path /robots\.txt,/\.well-known/security\.txt,/security\.txt,/rr-[0-9a-f]+\.html -silent -json -irr' "one httpx pass for the well-known paths and a random 404 probe"
-assert_grep  "$MOCKLOG/httpx.args" -- '-json -favicon -nfs'                  "favicon hashes fetched for live roots"
+assert_grep  "$MOCKLOG/httpx.args" -- '-path /,/favicon\.ico,/robots\.txt,/\.well-known/security\.txt,/security\.txt,/rr-[0-9a-f]+\.html -silent -json -irrb' "one httpx pass: root, favicon, well-known paths and a random 404 probe (bodies base64)"
+refute_grep  "$MOCKLOG/httpx.args" -- '-favicon'                            "no separate favicon pass: the icon is hashed from the same responses"
+assert_fgrep "$OUTDIR"/_work-*/parts/favhash.example.com.tsv $'example.com\t-732438843\t1e23ac45e53e0bd440ab397425229b87\t/favicon.ico' "favicon mmh3 and MD5 computed locally from /favicon.ico"
 assert_grep  "$CSV" ',https://example\.com/hidden-admin/,example\.com,robots,' "robots.txt Disallow path becomes a URL row (source robots)"
 refute_grep  "$CSV" 'bak\$|\*\.bak'                                         "wildcard robots rules are not turned into URLs"
 assert_grep  "$CSV.extras.txt" '^\[example\.com\] security-txt-expired \[low\] host=example\.com path=/\.well-known/security\.txt expires=2021-01-01T00:00:00Z' "expired security.txt -> security-txt-expired [low]"
 assert_grep  "$CSV.extras.txt" 'catch-all-200 \[info\] host=example\.com path=/rr-'  "random path answered 200 -> catch-all-200 [info]"
 assert_grep  "$CSV.extras.txt" 'error-page \[info\] host=example\.com status=200 server="nginx" title="Home" reveals="Apache/2\.4\.41 \(Ubuntu\)"' "error page reveals a version the Server header does not"
-assert_grep  "$CSV" ',-123456,0123456789abcdef0123456789abcdef,,200 disallow=2 allow=0 sitemap=1,expired contact=mailto:security@example\.com expires=2021-01-01T00:00:00Z.?$' "favicon, robots and security.txt columns on the host's rows"
+assert_grep  "$CSV" ',-732438843,1e23ac45e53e0bd440ab397425229b87,,200 disallow=2 allow=0 sitemap=1,expired contact=mailto:security@example\.com expires=2021-01-01T00:00:00Z.?$' "favicon, robots and security.txt columns on the host's rows"
 MOCK_EXTRAS_NOSEC=1 run_case extras_nosec --extras
 assert_grep  "$CSV" ',missing.?$'                                           "no security.txt -> security_txt=missing"
 refute_grep  "$CSV.extras.txt" 'security-txt'                             "a missing security.txt is a column value, not a finding"
+MOCK_EXTRAS_ICON='link' run_case extras_iconlink --extras
+assert_grep  "$MOCKLOG/httpx.args" -- '-l [^ ]*extras_icon_urls\.txt -silent -json -irrb' "an icon declared at another path is fetched in one follow-up pass"
+assert_fgrep "$OUTDIR"/_work-*/raw/example.com/extras_icon_urls.txt 'https://example.com/static/app.ico' "<link rel=\"shortcut icon\"> href resolved against the root"
+assert_fgrep "$OUTDIR"/_work-*/parts/favhash.example.com.tsv $'example.com\t997645422\t5efb3ec8359469339d84389e1257dc4a\t/static/app.ico' "the declared icon is hashed, not /favicon.ico (WebInventory's order)"
+MOCK_EXTRAS_ICON='data' run_case extras_icondata --extras
+assert_fgrep "$OUTDIR"/_work-*/parts/favhash.example.com.tsv $'example.com\t-634531059\t1af556a006bb28e4f735986a835366aa\tdata:' "an inline data: icon is decoded and hashed, with no request"
+refute_grep  "$MOCKLOG/httpx.args" 'extras_icon_urls'                      "no follow-up pass for a data: icon"
+MOCK_EXTRAS_ICON='html' run_case extras_iconhtml --extras
+refute_grep  "$OUTDIR"/_work-*/parts/favhash.example.com.tsv 'example\.com'  "an HTML page served as /favicon.ico is not an icon: no hash"
+run_case extras_favicon --extras --favicon
+refute_grep  "$MOCKLOG/httpx.args" -- '-favicon'                            "--extras --favicon: the pivot reuses the hashes --extras computed"
+assert_grep  "$MOCKLOG/uncover.args" -- 'http\.favicon\.hash:-732438843'     "the locally computed mmh3 drives the favicon pivot"
 
 section "Batch 2: --favicon pivots on the favicon hash (uncover), hits feed --origin"
 run_case favpivot --favicon --origin
@@ -2103,6 +2191,18 @@ refute_grep  "$MOCKLOG/dig.args" ' NSEC a-secret'                       "an NSEC
 MOCK_ZONE=none run_case zone_none --zone-exposure
 assert_grep  "$CSV.zone.txt" 'zone-checked \[info\] host=example\.com zone=example\.com signed=no axfr=refused\(1/1\) nsec=n/a' "nothing exposed -> zone-checked [info] (evidence the check ran)"
 assert_absent "$CSV.zone-names.txt"                                    "no names harvested from a closed zone"
+MOCK_ZONE=nsec MOCK_ZONE_NS2=1 MOCK_ZONE_V6=1 run_case zone_multi --zone-exposure
+assert_grep  "$MOCKLOG/dig.args" 'AAAA ns1\.example\.com'                "the name servers' IPv6 addresses are looked up too"
+assert_grep  "$MOCKLOG/dig.args" 'AXFR example\.com @2001:db8::53'        "AXFR tried on the IPv6 address of a name server"
+assert_grep  "$MOCKLOG/dig.args" 'NSEC example\.com @192\.0\.2\.52'      "the walk starts on the first name server..."
+assert_grep  "$CSV.zone.txt" 'nsec-zone-walkable \[medium\] host=example\.com zone=example\.com names=3' "...and moves on to the next when it gives no chain (v1.19 asked only the first)"
+refute_grep  "$MOCKLOG/dig.args" 'NSEC [a-z0-9.]+ @2001:db8::53'         "an address that never answered is not walked"
+assert_grep  "$CSV.zone.txt" '^\[example\.com\] dnssec-unanchored \[low\] host=example\.com zone=example\.com ds=no' "signed without a DS in the parent -> dnssec-unanchored [low]"
+MOCK_ZONE=none MOCK_ZONE_V6=1 run_case zone_v6dead --zone-exposure
+assert_grep  "$CSV.zone.txt" 'zone-checked \[info\] .*axfr=refused\(1/1\) nsec=n/a unreachable=1$' "an address with no reply is counted apart, not as a refusal"
+MOCK_ZONE=signed MOCK_ZONE_DS=1 run_case zone_ds --zone-exposure
+assert_grep  "$CSV.zone.txt" 'zone-checked \[info\] host=example\.com zone=example\.com signed=yes axfr=refused\(1/1\) nsec=not-walkable ds=yes$' "signed, anchored, not walkable -> zone-checked with ds=yes"
+refute_grep  "$CSV.zone.txt" 'dnssec-unanchored'                       "a DS in the parent: no dnssec-unanchored"
 bash "$(dirname "$RUN_RECON")/generate-report.sh" "$TMP/out_zone_axfr/r.csv" -o "$OUTDIR/z.html" >/dev/null 2>&1 || true
 if python3 -c 'import sys,re; s=open(sys.argv[1],encoding="utf-8").read(); t=re.sub(r"<[^>]+>"," ",s); sys.exit(0 if re.search(r"HIGH\s+DNS zone exposure\s+example\.com", t) and "DNS zones checked" in s else 1)' "$OUTDIR/z.html" 2>/dev/null
 then _pass "report: zone transfer is a HIGH finding and the zones table lists it"; else _fail "report: zone transfer is a HIGH finding and the zones table lists it"; fi
@@ -2119,6 +2219,10 @@ assert_grep  "$ERRLOG" 'the first seed example\.com does not exist \(NXDOMAIN'  
 _DOMS="$DOMAINS"; DOMAINS="$TMP/deadseed.txt"; printf 'dead.example.com\n' > "$DOMAINS"
 run_case deadseed --resolve
 assert_grep  "$ERRLOG" '\[dead\.example\.com\] none of 1 candidate name\(s\) resolved' "per-seed warning when nothing resolves"
+assert_grep  "$ERRLOG" 'the seed is a CNAME to deleted\.herokuapp\.com, which does not resolve \(dangling; --takeover checks it\)' "a seed that is a dangling CNAME is called out as one"
+printf 'dead.other.org\n' > "$DOMAINS"
+run_case deadseed2 --resolve
+assert_grep  "$ERRLOG" '\[dead\.other\.org\] none of 1 candidate name\(s\) resolved, not even the seed' "no CNAME: the plain warning"
 DOMAINS="$_DOMS"
 MOCK_HTTPX_NOLIVE=1 run_case nolive
 assert_grep  "$ERRLOG" '\[example\.com\] no live web host: [0-9]+ name\(s\) probed' "per-seed warning when nothing answers the probe"
@@ -2152,27 +2256,34 @@ import ssl, socket, sys
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(sys.argv[1], sys.argv[2])
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", 0)); s.listen(5); s.settimeout(20)
 open(sys.argv[3], "w").write(str(s.getsockname()[1]))
+n = 0
 for _ in range(3):
     try:
         c, _a = s.accept()
     except Exception:
         break
+    n += 1; s.settimeout(2)       # after the first handshake, wait briefly for duplicates
     try:
         ctx.wrap_socket(c, server_side=True).close()
     except Exception:
         pass
+open(sys.argv[3] + ".n", "w").write(str(n))
 PYSRV
   _srv=$!
   for _i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$TC/port" ] && break; sleep 0.3; done
   TPORT="$(cat "$TC/port" 2>/dev/null)"
   CPORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
-  printf '{"host":"localhost","ip":"127.0.0.1","port":"%s"}\n{"host":"localhost","ip":"127.0.0.1","port":"%s"}\nnot-json\n' "$TPORT" "$CPORT" > "$TC/t.jsonl"
+  # the same (address, port, name) three times, as when seeds share a host: one handshake
+  printf '{"host":"localhost","ip":"127.0.0.1","port":"%s"}\n{"host":"localhost","ip":"127.0.0.1","port":"%s"}\nnot-json\n{"host":"localhost","ip":"127.0.0.1","port":"%s","seed":"b"}\n{"host":"localhost","ip":"127.0.0.1","port":"%s","seed":"c"}\n' "$TPORT" "$CPORT" "$TPORT" "$TPORT" > "$TC/t.jsonl"
   awk '/^tls_chain_check\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' "$RUN_RECON" > "$TC/fn.sh"
   ( . "$TC/fn.sh"; tls_chain_check "$TC/t.jsonl" )
+  for _i in $(seq 1 30); do [ -s "$TC/port.n" ] && break; sleep 0.2; done   # the server's own count
   kill "$_srv" 2>/dev/null; wait "$_srv" 2>/dev/null
   assert_grep "$TC/t.jsonl" "\"port\": \"$TPORT\", \"chain_trusted\": false, \"chain_error\": \"[^\"]*self[- ]signed[^\"]*\", \"untrusted\": true" "self-signed chain -> untrusted, with the verifier's reason"
   assert_grep "$TC/t.jsonl" "\"port\": \"$CPORT\"}\$"                      "no handshake -> record left as it was (no flag)"
   assert_grep "$TC/t.jsonl" '^not-json$'                                  "a non-JSON line is preserved"
+  if [ "$(grep -c '"chain_trusted": false' "$TC/t.jsonl")" = 3 ]; then _pass "every duplicate record gets the verdict"; else _fail "every duplicate record gets the verdict"; fi
+  if [ "$(cat "$TC/port.n" 2>/dev/null)" = 1 ]; then _pass "duplicate (address, port, name) records share one handshake"; else _fail "duplicate (address, port, name) records share one handshake (got $(cat "$TC/port.n" 2>/dev/null) connections)"; fi
 else
   _pass "openssl unavailable: chain validation test skipped"
 fi
@@ -2267,6 +2378,90 @@ env PATH="$TESTPATH" bash "$REPORT_SH" -o "$R8/empty.html" "$R8/empty.csv" >/dev
 assert_grep  "$R8/empty.html" 'This run produced no results'               "0-row run -> banner"
 assert_grep  "$R8/empty.html" 'none of 1 candidate name'                    "banner quotes the warnings that explain it"
 
+# --- v1.20: the v1.18 follow-ups (F1-F10) --------------------------------------------
+section "v1.20 follow-ups: origin candidates (SPF include/ip6/ranges, history), edges, screenshots, chains"
+mk curl <<'EOF'
+#!/usr/bin/env bash
+printf '%s ' "$@" >> "$MOCKLOG/curl.args"; echo >> "$MOCKLOG/curl.args"
+case " $* " in
+  *"virustotal.com/api/v3/domains/example.com/subdomains"*) printf '{"data":[]}'; exit 0;;
+  *"virustotal.com/api/v3/domains/example.com"*)
+    printf '{"data":{"attributes":{"reputation":0,"categories":{},"last_dns_records":[{"type":"A","value":"203.0.113.10"},{"type":"AAAA","value":"2001:db8:7::10"},{"type":"MX","value":"mx.example.com"}]}}}'; exit 0;;
+  *"urlscan.io/api/v1/search"*)
+    printf '{"results":[{"task":{"time":"2024-03-01T00:00:00Z"},"page":{"url":"https://example.com/","ip":"203.0.113.9"}},{"task":{"time":"2024-03-02T00:00:00Z"},"page":{"url":"https://other.org/","ip":"203.0.113.99"}}]}'; exit 0;;
+esac
+out=""; a=("$@"); i=0
+while [ $i -lt ${#a[@]} ]; do case "${a[$i]}" in -o) i=$((i+1)); out="${a[$i]}";; esac; i=$((i+1)); done
+[ -n "$out" ] && : > "$out"
+printf '000'; exit 7
+EOF
+MOCK_SPF=include VT_API_KEY=test-vt run_case f2_cands --origin --virustotal --urlscan
+assert_fgrep "$MOCKLOG/curl.args" '--resolve example.com:443:198.51.100.8 '      "SPF include: followed: its ip4: is a candidate"
+assert_fgrep "$MOCKLOG/curl.args" '--resolve example.com:443:[2001:db8:5::7] '   "SPF ip6: is a candidate (bracketed)"
+assert_fgrep "$MOCKLOG/curl.args" '--resolve example.com:443:198.51.100.17 '     "a small SPF range (/30) is expanded"
+refute_grep  "$MOCKLOG/curl.args" 'example\.com:443:203\.0\.113\.[0-9]+ .*203\.0\.113\.0/24|example\.com:443:203\.0\.113\.200 ' "a wide SPF range (/24) is not swept"
+assert_fgrep "$MOCKLOG/curl.args" '--resolve example.com:443:203.0.113.10 '      "VirusTotal's DNS history: a past A record is a candidate"
+assert_fgrep "$MOCKLOG/curl.args" '--resolve example.com:443:[2001:db8:7::10] '  "VirusTotal's DNS history: a past AAAA record too"
+assert_fgrep "$MOCKLOG/curl.args" '--resolve example.com:443:203.0.113.9 '       "urlscan.io: an address a past scan of the site saw"
+refute_grep  "$MOCKLOG/curl.args" '203\.0\.113\.99'                             "urlscan.io: a scan of another site is not a candidate"
+OP_CAND="$(find "$OUTDIR" -name origin_pairs.tsv | head -1)"
+assert_grep  "$OP_CAND" '203\.0\.113\.9	.*history:urlscan'                       "the candidate list says where each address came from"
+MOCK_REF_SERVER=Caddy run_case f7_caddy --origin
+assert_grep  "$CSV.edge.tsv" '^example\.com	example\.com			'                  "a lone Server: Caddy is not an edge (v1.19 called Caddy one)"
+MOCK_REF_SERVER=AkamaiGHost run_case f7_akamai --origin
+assert_grep  "$CSV.edge.tsv" '^example\.com	example\.com	AkamaiGHost		edge-server	' "a lone CDN Server header still names the edge"
+
+# F5: the screenshot browser resolves names as --resolvers did
+SSR="$TMP/ss-resolvers.txt"; printf '10.0.0.53\n' > "$SSR"
+mk chromium <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+run_case f5_rules --screenshots --resolvers "$SSR"
+assert_grep  "$MOCKLOG/httpx.args" -- '-ho --host-resolver-rules=MAP example\.com 10\.0\.0\.1( |,|$)' "--resolvers: the browser gets the probe's addresses (--host-resolver-rules)"
+run_case f5_norules --screenshots
+refute_grep  "$MOCKLOG/httpx.args" 'host-resolver-rules'                       "no --resolvers: the browser resolves as the system does"
+
+# F6: gowitness 3, with its JSON lines as the capture evidence
+mk gowitness <<'EOF'
+#!/usr/bin/env bash
+printf '%s ' "$@" >> "$MOCKLOG/gowitness.args"; echo >> "$MOCKLOG/gowitness.args"
+f=""; sp=""; jl=""; a=("$@"); i=0
+while [ $i -lt ${#a[@]} ]; do case "${a[$i]}" in
+  -f) i=$((i+1)); f="${a[$i]}";; --screenshot-path) i=$((i+1)); sp="${a[$i]}";;
+  --write-jsonl-file) i=$((i+1)); jl="${a[$i]}";; esac; i=$((i+1)); done
+cp "$f" "$MOCKLOG/gowitness.targets"
+mkdir -p "$sp"
+while IFS= read -r u; do
+  fn="$(printf '%s' "$u" | sed -E 's#://#---#; s#:([0-9]+)$#-\1#').jpeg"
+  printf 'JPEGDATA' > "$sp/$fn"
+  printf '{"url":"%s","final_url":"%s/","response_code":200,"title":"Home","file_name":"%s","failed":false}\n' "$u" "$u" "$fn" >> "$jl"
+done < "$f"
+exit 0
+EOF
+SCREENSHOT_TOOL=gowitness run_case f6_gw --screenshots
+assert_grep  "$MOCKLOG/gowitness.args" -- '--write-jsonl --write-jsonl-file [^ ]+ .*--driver gorod' "gowitness records each capture (JSON lines) with the go-rod driver"
+assert_grep  "$MOCKLOG/gowitness.args" -- '--chrome-path [^ ]*(chromium|chrome)' "gowitness uses the installed Chrome/Chromium (no download)"
+assert_fgrep "$MOCKLOG/gowitness.targets" 'https://example.com:443'              "explicit URLs: https on 443..."
+assert_fgrep "$MOCKLOG/gowitness.targets" 'http://example.com:80'                "...and http on 80 (no four-way expansion)"
+assert_grep  "$CSV.screenshots.tsv" '^example\.com	https---example\.com-443\.jpeg	ok'   "one capture per host, https first, validated from its JSON line"
+if find "$OUTDIR"/screenshots-* -name 'http---example.com-80.jpeg' 2>/dev/null | grep -q .; then _fail "the http capture of a host shot over https is dropped"; else _pass "the http capture of a host shot over https is dropped"; fi
+SCREENSHOT_TOOL=bogus run_case f6_bad --screenshots
+assert_grep  "$ERRLOG" 'SCREENSHOT_TOOL must be auto, httpx or gowitness'       "an unknown SCREENSHOT_TOOL is rejected"
+ORIGIN_PORTS='443;80' run_case f1_badports --origin
+assert_grep  "$ERRLOG" 'ORIGIN_PORTS must be a space-separated port list'       "a malformed ORIGIN_PORTS is rejected"
+rm -f "$MOCKBIN/gowitness" "$MOCKBIN/chromium"
+
+# F8: one chain-check pass over every seed's records, one handshake per (address, port, name)
+assert_grep  "$RUN_RECON" '^  tls_chain_check "\$WORKDIR/tlsx\.jsonl"$'         "the chain check runs once, on the merged TLS records"
+if [ "$(grep -c 'tls_chain_check "' "$RUN_RECON")" = 1 ]; then _pass "no per-seed chain-check call is left"; else _fail "no per-seed chain-check call is left"; fi
+mk curl <<'EOF'
+#!/usr/bin/env bash
+printf '%s ' "$@" >> "$MOCKLOG/curl.args"; echo >> "$MOCKLOG/curl.args"
+exit 0
+EOF
+
+
 # --- 53) service health check: --resolvers catches dead resolvers ----------
 # (placed last: swaps the dig mock for one that reports no reply)
 section "service health check: --resolvers detects unreachable resolvers"
@@ -2328,6 +2523,7 @@ assert_grep "$AGGDIR/e2.log" 'the URL join failed'                     "join fai
 printf 'example.com\thttps://x.example.com/\tgau\n' > "$AGGDIR/m3.tsv"; : > "$AGGDIR/h3.jsonl"
 ( cd "$AGGDIR" && env PATH="$TESTPATH" python3 agg.py m3.tsv h3.jsonl o3.csv 0 100 >/dev/null 2>e3.log )
 assert_grep "$AGGDIR/e3.log" 'httpx produced 0 JSON records'           "empty httpx output is diagnosed (not silent)"
+
 
 
 
