@@ -698,7 +698,13 @@ effect.
 
 ### Shipping cost
 
-SHIPCOST_PLACEHOLDER
+`ship-recon.sh ship` of the lab run (12 parts: 6 JSONL files, the manifest, 4 screenshots; 1.7 MB raw,
+1.34 MB gzip, mostly the PNGs) to the mock ingest on loopback, three times under new `run_id`s:
+**0.87–0.90 s wall, 0.24–0.26 s CPU** (ship-recon, curl, openssl), all three delivered and verified. The cost is
+one curl process and one TLS handshake per part, about 70 ms each. A seed-heavy run with hundreds of
+screenshots pays that per image, sequentially. Reusing connections (curl `--next`, or one HTTP/2
+connection) is the obvious improvement once a real Tideline exists to measure against. It does not
+touch the scan: shipping starts after the run's manifest is written.
 
 ### Lab checks (real tools)
 
