@@ -11,7 +11,7 @@
 #
 # Installs system-wide under /opt/recon, with binaries/shims on PATH via
 # /usr/local/bin:
-#   - apt/dnf/pacman base packages (git, python3-venv, build tools, jq, libpcap, postgresql-client...)
+#   - apt/dnf/pacman base packages (git, python3-venv, build tools, jq, ldnsutils for the lab's signed zones, libpcap, postgresql-client...)
 #   - Go toolchain (pinned) -> /usr/local/go
 #   - Go tools -> /usr/local/bin: gau, waybackurls, httpx, katana, subfinder,
 #     dnsx, tlsx, alterx, nuclei, hakrawler, gospider, ffuf, subjs, getJS,
@@ -276,7 +276,7 @@ install_base_packages(){
       as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         git curl wget unzip zip ca-certificates build-essential pkg-config \
         python3 python3-venv python3-pip pipx \
-        jq dnsutils whois libpcap-dev gcc make \
+        jq dnsutils ldnsutils whois libpcap-dev gcc make \
         ruby ruby-dev whatweb \
         postgresql-client \
         || warn "some apt packages failed to install"
@@ -286,7 +286,7 @@ install_base_packages(){
       log "dnf: installing base packages..."
       as_root dnf install -y \
         git curl wget unzip zip ca-certificates pkgconf-pkg-config \
-        python3 python3-pip pipx jq bind-utils whois libpcap-devel gcc make postgresql \
+        python3 python3-pip pipx jq bind-utils ldns-utils whois libpcap-devel gcc make postgresql \
         ruby ruby-devel \
         || warn "some dnf packages failed to install"
       as_root dnf groupinstall -y "Development Tools" 2>/dev/null || true
@@ -295,7 +295,7 @@ install_base_packages(){
       log "pacman: installing base packages..."
       as_root pacman -Sy --noconfirm --needed \
         git curl wget unzip zip ca-certificates base-devel pkgconf \
-        python python-pip python-pipx jq bind whois libpcap gcc make \
+        python python-pip python-pipx jq bind ldns whois libpcap gcc make \
         ruby whatweb \
         || warn "some pacman packages failed to install"
       ;;

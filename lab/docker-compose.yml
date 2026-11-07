@@ -22,8 +22,24 @@ services:
     ports:
       - "${LAB_DNS_IP:-127.0.0.1}:53:53/udp"
       - "${LAB_DNS_IP:-127.0.0.1}:53:53/tcp"
+      # BIND (below) listens on :5353 in this container's network: ns.nsec3.test
+      - "${LAB_NSEC3_IP:-127.0.0.7}:53:5353/udp"
+      - "${LAB_NSEC3_IP:-127.0.0.7}:53:5353/tcp"
     volumes:
       - ./:/lab:ro
+
+  # BIND 9.18, authoritative for the NSEC3-signed nsec3.test (CoreDNS's file plugin cannot
+  # serve NSEC3). It shares the dns container's network, so CoreDNS forwards the zone to
+  # 127.0.0.1:5353 and the host reaches it as ns.nsec3.test on LAB_NSEC3_IP:53.
+  bind:
+    image: internetsystemsconsortium/bind9:9.18
+    restart: unless-stopped
+    network_mode: "service:dns"
+    # the image's entrypoint is "named -u bind"; these are its arguments
+    command: ["-g", "-c", "/lab/named.conf"]
+    volumes:
+      - ./:/lab:ro
+    depends_on: [dns]
 
   ingress:
     image: caddy:2.7.6
@@ -32,6 +48,9 @@ services:
     ports:
       - "127.0.0.1:80:80"
       - "127.0.0.1:443:443"
+      # the protected origin (origin.spa.test): every request gets 403, as an origin
+      # locked to its CDN's addresses would answer anyone else
+      - "${LAB_PROTECTED_IP:-127.0.0.6}:80:8080"
     volumes:
       - ./:/lab:ro
       - caddy_data:/data

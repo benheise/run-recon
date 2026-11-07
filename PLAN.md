@@ -7,7 +7,8 @@ default path is kept only if it is no slower and its output is identical (or the
 justified accuracy fix).
 
 **Status:** Done · In progress · Planned · Blocked (needs something from Ben) · Won't do
-**Last updated:** 2026-11-05, run-recon 1.19.0 released (Batch 2 merged in #1, tag `v1.19.0` = `938f58e`)
+**Last updated:** 2026-11-06, follow-ups F1–F10 done on `followups-v1.18` (not released: the next release
+follows Batch 3 and the rest of the open batch work)
 
 ## 0. Source of truth
 
@@ -15,7 +16,7 @@ justified accuracy fix).
 |---|---|---|---|
 | R1 | Git repository, `main` = v1.18.0, generated lab files ignored | Done | `git log` |
 | R2 | Push to GitHub (private `benheise/run-recon`) | Done: `main` pushed; releases v1.18.0 and v1.19.0 published. Tags cannot be pushed from Claude's sessions (HTTP 403), so releases/tags are created in the GitHub UI | tags `v1.18.0`, `v1.19.0` on GitHub |
-| R3 | Each batch on its own branch, merged by pull request | Done for Batch 2 (#1, merged) | PR per batch |
+| R3 | Each batch on its own branch, merged by pull request | Done for Batch 2 (#1, merged); follow-ups on `followups-v1.18` | PR per batch |
 
 ## 1. Batch 2: HTTP detail (WebInventory A4, A5, A6, A11)
 
@@ -46,16 +47,16 @@ justified accuracy fix).
 
 | ID | Item | Status | Check |
 |---|---|---|---|
-| F1 | `origin-protected`: record candidates that refuse the direct request | Planned | lab fixture: a backend that drops non-edge traffic |
-| F2 | More origin candidates: SPF `include:`, IPv6 (AAAA, `ip6:`), ports beyond 80/443, ASN-seed ranges, historical DNS | Planned (favicon hits arrive with B2.3) | suite |
-| F3 | Zone check: AAAA of name servers, walk from every name server, DS / DNSSEC chain status | Planned | suite |
-| F4 | NSEC3 lab fixture (a BIND or Knot container; CoreDNS cannot serve NSEC3) | Planned | `bench-run-recon.sh zone` covers nsec3 |
-| F5 | Screenshots use the probe's addresses (`--host-resolver-rules`), so the browser resolves like httpx | Planned | lab names without /etc/hosts |
-| F6 | Validate gowitness captures like httpx's | Planned | suite |
-| F7 | Report: a lone `Server: Caddy` is not an edge; versionless CPEs counted apart; "did not resolve" warning mentions a dangling CNAME | Planned | suite |
-| F8 | Chain check in one pass for all hosts (cuts ~5 s CPU on the farm) | Planned | farm A/B |
-| F9 | Setup scripts install ldnsutils (lab) | Planned | fresh Kali |
-| F10 | `--extras` in one httpx pass per seed (hash `/favicon.ico` locally, parse `<link rel=icon>` from the root body): saves ~0.85 s CPU per seed, the main cost on seed-heavy runs (farm: +40 s wall today) | Planned | farm A/B |
+| F1 | `origin-protected`: record candidates that refuse the direct request | Done (`followups-v1.18`) | lab: `origin.spa.test` → 403 → `origin-protected [info]` with per-port reasons; suite |
+| F2 | More origin candidates: SPF `include:`, IPv6 (AAAA, `ip6:`), ports beyond 80/443, ASN-seed ranges, historical DNS | Done: AAAA, SPF `ip6:`/`include:`/`redirect=`, `ORIGIN_PORTS`, `range-cert`, VirusTotal/urlscan history | suite |
+| F3 | Zone check: AAAA of name servers, walk from every name server, DS / DNSSEC chain status | Done: + `unreachable=N`, `dnssec-unanchored [low]`, `ds=yes/no` | suite; lab zone check |
+| F4 | NSEC3 lab fixture (a BIND or Knot container; CoreDNS cannot serve NSEC3) | Done: `nsec3.test` on BIND 9.18 | `bench-run-recon.sh zone` PASS |
+| F5 | Screenshots use the probe's addresses (`--host-resolver-rules`), so the browser resolves like httpx | Done | lab: `secret-admin.walk.test` 0-byte capture in 1.19.0 → `ok` |
+| F6 | Validate gowitness captures like httpx's | Done: gowitness 3 JSON lines, explicit URLs, go-rod driver, `SCREENSHOT_TOOL` | lab (real gowitness 3); suite |
+| F7 | Report: a lone `Server: Caddy` is not an edge; versionless CPEs counted apart; "did not resolve" warning mentions a dangling CNAME | Done | suite |
+| F8 | Chain check in one pass for all hosts (cuts ~5 s CPU on the farm) | Done: once on the merged records, one handshake per (address, port, name) | suite; farm A/B: 1.14x wall, −24% CPU with `--extras`, output identical |
+| F9 | Setup scripts install ldnsutils (lab) | Done (apt `ldnsutils`, dnf `ldns-utils`, pacman `ldns`) | fresh Kali (V-list) |
+| F10 | `--extras` in one httpx pass per seed (hash `/favicon.ico` locally, parse `<link rel=icon>` from the root body): saves ~0.85 s CPU per seed, the main cost on seed-heavy runs (farm: +40 s wall today) | Done | lab: Jenkins favicon 81586312 (same as httpx); farm A/B: 1.14x wall, −24% CPU with `--extras`, output identical |
 
 ## 4. Batch 3: email and DNS posture, more discovery
 

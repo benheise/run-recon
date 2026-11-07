@@ -83,7 +83,7 @@ arrive behind a switch, as WebInventory's opt-in probes do.
 | Version advisories (A13) | offline NVD/KEV/EPSS join (`recon-db.sh vulns`) | covered by the join |
 | JARM (B1) | tlsx `-jarm` under `--origin`, **v1.18: a host attribute in `<out>.edge.tsv`, no longer reported as an "exposed origin"** | parity; JA4S not planned (FoxIO licence) |
 | SMB / RDP / SNMP identity (B2–B4) | none | not planned: internal-network probes. For EASM, port-level exposure of 445/3389/161 from naabu is the finding |
-| Screenshots (B5) | httpx `-ss` / gowitness; **v1.18: the browser gets `--proxy-server` / a `NO_PROXY` bypass list, and each capture is validated (`<out>.screenshots.tsv`)** | parity in routing and evidence; no per-page scope proxy |
+| Screenshots (B5) | httpx `-ss` / gowitness; **v1.18: the browser gets `--proxy-server` / a `NO_PROXY` bypass list, and each capture is validated (`<out>.screenshots.tsv`)**; **v1.20: `--host-resolver-rules` from `--resolvers`; gowitness 3 validated from its JSON lines (go-rod driver, explicit URLs)** | parity in routing and evidence; no per-page scope proxy |
 | Jump-host proxy (B6) | `--proxy` | parity |
 | Pace, retries, resilience (C1) | rate, threads, retries, late retry; no resume | partial |
 | Outputs (C2): JSONL with evidence, delta, run.json, SHA-256 manifest | CSV, HTML report, side artifacts, `--monitor` new-asset diff; **v1.18: `<out>.run.json` (version, command line, tool versions, resolvers, per-seed counts, warnings, exit status); exit 3 for a run with no results** | partial (batch 4: SHA-256 manifest, field-level delta) |

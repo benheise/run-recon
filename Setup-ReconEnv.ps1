@@ -148,7 +148,7 @@ apt-get update -y || warn "apt-get update reported errors"
 apt-get install -y --no-install-recommends \
   git curl wget unzip zip ca-certificates build-essential pkg-config \
   python3 python3-venv python3-pip pipx \
-  jq dnsutils whois libpcap-dev gcc make \
+  jq dnsutils ldnsutils whois libpcap-dev gcc make \
   ruby ruby-dev whatweb \
   || warn "some apt packages failed to install"
 update-ca-certificates 2>/dev/null || true

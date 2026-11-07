@@ -141,6 +141,7 @@ KIND_LABEL = {
     "takeover": "Subdomain takeover", "secrets": "Exposed secret",
     "buckets": "Exposed cloud bucket", "origin": "Exposed origin",
     "zone": "DNS zone exposure", "zonecheck": "DNS zone check", "edgehint": "Edge fingerprint",
+    "originprotected": "Protected origin",
     "http": "HTTP", "extras": "security.txt", "extrasinfo": "Web server note", "favicon": "Favicon pivot",
     "tls": "TLS / certificate",
     "params": "Parameterized URL", "cms": "CMS / tech", "osint": "OSINT",
@@ -148,7 +149,7 @@ KIND_LABEL = {
     "vuln": "Known CVE (NVD/KEV)",
 }
 # evidence of a check that ran, not a finding: kept out of the severity counts
-EVIDENCE_KINDS = {"zonecheck", "edgehint", "extrasinfo"}
+EVIDENCE_KINDS = {"zonecheck", "edgehint", "extrasinfo", "originprotected"}
 
 def sev_from_nuclei(text):
     m = re.search(r'\[(critical|high|medium|low|info|unknown)\]', text, re.I)
@@ -275,6 +276,9 @@ for kind in ["nuclei", "activescan", "takeover", "secrets", "buckets", "zone", "
                     sev = sev_from_nuclei(line)
                 elif kind == "nuclei":
                     sev = sev_from_nuclei(line)
+                elif kind == "origin" and tok0 == "origin-protected":
+                    # the origin exists and refuses the site: good news, kept as evidence
+                    kind_eff, sev = "originprotected", "info"
                 elif kind == "origin" and tok0 not in ORIGIN_FINDINGS:
                     # older runs listed JARM/CDN hints here: attributes, not exposed origins
                     kind_eff, sev = "edgehint", "info"
@@ -699,14 +703,29 @@ else:
                '--zone-exposure/--origin/--tls to look).</p>')
 # known vulnerabilities: say when the check did not run, so the gap is visible
 if not (vulns_path and os.path.isfile(vulns_path)):
+    # A CPE without a version (cpe:2.3:a:vendor:product:*:...) names the product only: a
+    # join would match every CVE ever filed against it, so those are counted apart
+    def _versioned(c):
+        f = c.split(":")
+        return len(f) > 5 and f[5] not in ("", "*", "-")
     cpes = sorted(set(c for d in hosts.values() for c in d["cpe"]))
-    ncpe_hosts = sum(1 for d in hosts.values() if d["cpe"])
+    vcpes = [c for c in cpes if _versioned(c)]
+    ucpes = [c for c in cpes if not _versioned(c)]
+    nv_hosts = sum(1 for d in hosts.values() if any(_versioned(c) for c in d["cpe"]))
+    nu_hosts = sum(1 for d in hosts.values() if any(not _versioned(c) for c in d["cpe"]))
+    pills = lambda xs: '<div style="margin-top:6px">' + "".join(f'<span class="pill cpe">{esc(c)}</span>' for c in xs) + '</div>'
+    msg = ""
+    if vcpes:
+        msg += f'{len(vcpes)} versioned CPE(s) on {nv_hosts} host(s) would be checked:' + pills(vcpes)
+    if ucpes:
+        msg += ('<div style="margin-top:8px">' if vcpes else '<div>') + \
+               f'{len(ucpes)} CPE(s) on {nu_hosts} host(s) carry no version, so they cannot be matched to ' \
+               'specific CVEs (the product was identified, its version was not):' + pills(ucpes) + '</div>'
+    if not cpes:
+        msg = 'No CPEs were identified either (enrichment off, or no versioned products seen).'
     out.append('<div class="note"><b>Known vulnerabilities: not checked.</b> No NVD/KEV/EPSS join was supplied '
                f'(<code>{esc(os.path.basename(csv_path))}.vulns.csv</code>, written by <code>recon-db.sh vulns</code>). '
-               + (f'{len(cpes)} CPE(s) on {ncpe_hosts} host(s) would be checked:<div style="margin-top:6px">'
-                  + "".join(f'<span class="pill cpe">{esc(c)}</span>' for c in cpes) + '</div>'
-                  if cpes else 'No CPEs were identified either (enrichment off, or no versioned products seen).')
-               + '</div>')
+               + msg + '</div>')
 
 # context findings summary (osint/vt/urlscan/social/cms/params) by count
 ctx = {k: kind_counts[k] for k in kind_counts if k not in highlight_kinds}

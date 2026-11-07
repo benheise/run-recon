@@ -406,3 +406,56 @@ hashed locally is listed in `PLAN.md` (F10).
 - **dockerd started with `nohup … &` does not survive the end of a turn in this environment**, which looked
   like the lab "breaking" between sessions. Started as a tracked background process it stays up. The new
   run-integrity checks reported it correctly: "no resolver answered", per-seed "none resolved", exit 3.
+
+## v1.20.0 (unreleased): the v1.18 follow-ups (F1–F10)
+
+Same lab and method; baseline v1.19.0 frozen from its tag (`938f58e`). The lab gained three fixtures for
+this work (`origin.spa.test` → a 403-only address, `nsec3.test` on BIND 9.18, nothing else changed), and
+both versions ran against the same lab.
+
+### A/B: v1.19.0 vs v1.20.0-dev
+
+| Scenario | v1.19.0 wall s | v1.20 wall s | v1.19.0 CPU s | v1.20 CPU s | accuracy | `--exact` |
+|---|---:|---:|---:|---:|---|---|
+| lab, `--tls --ipv6` | 24.15 | 22.55 | 12.70 | 12.89 | 3/3 / 3/3 | identical (87 rows; 8 `body_sha256` noise) |
+| farm, `--tls --ipv6 --extras -t 10` | 128.75 | 113.05 | 174.42 | 132.37 | 3/3 / 3/3 | identical (50 rows; 3 `robots` noise) |
+
+The lab is within run-to-run spread, as it should be: nothing on the default path changed except the chain
+check, which now runs once on the merged records (F8). On the farm, `--extras` now costs one httpx run per
+seed instead of two (F10): 42 s of CPU saved over 50 seeds, 0.84 s each, exactly one httpx start-up per
+seed, and 1.14x on wall time. The favicon hashes it computes in Python are the values httpx's `-favicon`
+gave (Jenkins: `81586312`), so the `favicon_*` columns are identical.
+
+**The noise floor.** `compare --exact` now takes `--noise OTHER-RUN`, and `bench` passes the baseline's other
+runs: a field that already differs between runs of the **same** version is noise, not a difference between
+versions, and is listed instead of compared. On the lab that is 8 `body_sha256` values of WordPress oEmbed
+responses, which embed a random secret per request (two v1.20 runs differ on the same 8 fields); on the farm,
+the `robots` column of 3 WordPress vhosts, whose robots.txt fetch is occasionally slow enough to time out.
+Before this, the lab A/B reported "DIFFERENT (8 fields)" for two identical builds.
+
+### Lab fixture checks (real tools)
+
+`bench-run-recon.sh checks` → **PASS** on all four. New in the zone and origin checks:
+
+| Fixture | Result |
+|---|---|
+| nsec3.test (BIND 9.18, NSEC3 1 0 5 1A2B3C4D) | `nsec3-hashes-exposed [low] params="1 0 5 1A2B3C4D"`, names not walked, `dnssec-unanchored [low]` |
+| walk.test | as before, plus `dnssec-unanchored [low]` (no DS in `test.`) |
+| origin.spa.test → 127.0.0.6 (403 to everything, 443 closed) | `origin-protected [info] ... reason=443:refused,80:status-403-other-content` |
+| ci.test favicon, now hashed locally | mmh3 `81586312` |
+
+Screenshots, checked by hand against the lab (no bench check yet): `secret-admin.walk.test`, which only the lab
+DNS knows, was a 0-byte capture with v1.19.0 and is `ok` with v1.20 (`--host-resolver-rules`). gowitness 3
+(latest, built from source) captured the lab with explicit URLs and the go-rod driver, 4 of 4 in two runs; with
+its default chromedp driver, 4 of 5 runs got no image at all (the screenshot step timed out; status and title
+were recorded).
+
+### Found while building this
+
+- **The origin verifier dropped fields after an empty one.** It split candidate lines with `IFS=tab read`, and
+  tab is IFS whitespace, so an empty title collapsed into the next field and shifted the body hash, length and
+  edge. A site without a title was compared on the wrong values. Lines are now split on `\x1f`. The protected
+  origin fixture (`origin.spa.test`, a 403 page without a title) exposed it: its status code read as empty.
+- **An awk `NR == FNR` idiom misfires when the first file is empty**: every line of the second file is taken as
+  part of the first. It suppressed every `origin-protected` line until the test with no exposed origin caught it.
+- **dnsx `-a -aaaa`** answers both families in one record; the mock answered only the last flag it saw.

@@ -15,9 +15,10 @@ control; never point the scanner anywhere else.
 
 | file | what it is |
 |---|---|
-| `docker-compose.yml` | the range: `dns` (CoreDNS), `ingress` (Caddy TLS vhost router), `nginx`, `wordpress` + `db`, `spa`, `jenkins` — all pinned. `nginx` is also published directly on `LAB_ORIGIN_IP:80` (default `127.0.0.5`): the "forgotten origin" fixture |
+| `docker-compose.yml` | the range: `dns` (CoreDNS), `bind` (BIND 9.18, for the NSEC3 zone), `ingress` (Caddy TLS vhost router), `nginx`, `wordpress` + `db`, `spa`, `jenkins` — all pinned. `nginx` is also published directly on `LAB_ORIGIN_IP:80` (default `127.0.0.5`): the "forgotten origin" fixture. The ingress also answers `403` to everything on `LAB_PROTECTED_IP:80` (default `127.0.0.6`): the "protected origin". BIND answers as `ns.nsec3.test` on `LAB_NSEC3_IP:53` (default `127.0.0.7`) |
 | `Caddyfile` | vhost routing; serves every name on both `http://` and `https://` with certificates from Caddy's local CA, plus the HTTP-detail fixtures below |
-| `Corefile` | CoreDNS: authoritative for `test.`, `walk.test.` and `xfr.test.` from the generated zone files |
+| `Corefile` | CoreDNS: authoritative for `test.`, `walk.test.` and `xfr.test.` from the generated zone files; forwards `nsec3.test.` to BIND |
+| `named.conf` | BIND: authoritative only, for `nsec3.test.`, transfers refused; shares the `dns` container's network and listens on `:5353` |
 | `resolvers.txt` | the lab DNS server, passed to run-recon as `--resolvers` (dnsx/tlsx/httpx use it) |
 | `targets.txt` | lab seeds: `nginx.test wp.test spa.test ci.test` |
 | `expected.csv` | ground truth for the lab seeds (status, technologies, CPEs, TLS flags, IPv6) |
@@ -28,9 +29,10 @@ control; never point the scanner anywhere else.
 | `db.test` | the `test.` zone: every A/AAAA record plus the takeover and origin fixtures below. Zone files use BIND's `db.<zone>` naming: files ending in `.zone` did not survive some synced folders |
 | `db.walk.test`, `db.walk.test.signed` | `walk.test.`, DNSSEC-signed with NSEC by `ldns-signzone` (throwaway keys in `dnssec/`) |
 | `db.xfr.test` | `xfr.test.`, unsigned, zone transfers allowed to anyone |
+| `db.nsec3.test`, `db.nsec3.test.signed` | `nsec3.test.`, signed with NSEC3 (1 0 5 1A2B3C4D) by `ldns-signzone -n`, served by BIND |
 | `db.127` | reverse zone for `127.0.0.0/8`: PTR fixtures for `--enrich` |
 | `targets-takeover.txt` | seeds for the takeover check: `nginx.test alias.test orphan.test` |
-| `targets-zone.txt` | seeds for the zone check: `walk.test xfr.test nginx.test` |
+| `targets-zone.txt` | seeds for the zone check: `walk.test xfr.test nsec3.test nginx.test` |
 | `targets-origin.txt` | seeds for the origin check: `nginx.test spa.test wp.test` |
 | `targets-http.txt` | seeds for the HTTP-detail check: the four sites, `vpn-legacy.walk.test`, `www.walk.test` |
 | `targets-farm.txt`, `expected-farm.csv` | farm seeds and their ground truth |
@@ -69,9 +71,10 @@ sudo sh -c './bench-run-recon.sh hosts >> /etc/hosts'   # once: names for tools 
 ./bench-run-recon.sh down                # tear down and remove volumes
 ```
 
-`up` needs **ldnsutils** (`sudo apt install ldnsutils`) to sign `walk.test`; without it the
-zone is served unsigned and `zone` skips the NSEC case. If `127.0.0.5` is taken, set
-`LAB_ORIGIN_IP` to another loopback address for `up` and the checks.
+`up` needs **ldnsutils** (`sudo apt install ldnsutils`; the setup scripts install it) to sign
+`walk.test` and `nsec3.test`; without it the zones are served unsigned and `zone` skips the NSEC and
+NSEC3 cases. If `127.0.0.5`, `127.0.0.6` or `127.0.0.7` is taken, set `LAB_ORIGIN_IP`,
+`LAB_PROTECTED_IP` or `LAB_NSEC3_IP` to another loopback address for `up` and the checks.
 
 First boot takes a minute or two (WordPress install, Jenkins start). `up`
 installs WordPress with a throwaway admin password that is generated, used once
@@ -116,16 +119,19 @@ suite's mocks rather than the lab.
 | zone | setup | `--zone-exposure` must report |
 |---|---|---|
 | `xfr.test` | unsigned; `transfer { to * }` | `zone-transfer-open [high]` naming `ns.xfr.test(127.0.0.1)`, and the names `hidden-ops` and `staging-api-2019`, which no wordlist or passive source would find |
-| `walk.test` | signed with NSEC | `nsec-zone-walkable [medium]` with 5 names, including `secret-admin`, `vpn-legacy` and `q7-billing-replica` |
+| `walk.test` | signed with NSEC | `nsec-zone-walkable [medium]` with 5 names, including `secret-admin`, `vpn-legacy` and `q7-billing-replica`; `dnssec-unanchored [low]` (no DS in `test.`) |
+| `nsec3.test` | signed with NSEC3, on BIND (`ns.nsec3.test` = `LAB_NSEC3_IP`); transfers refused | `nsec3-hashes-exposed [low]` with `params="1 0 5 1A2B3C4D"`, its names **not** walked; `dnssec-unanchored [low]` |
 | `test.` | unsigned; transfers refused | `zone-checked [info]` only |
 
 Names found under a seed are probed like any other candidate, so `secret-admin.walk.test`
-appears in the CSV. There is **no NSEC3 fixture**: CoreDNS's file plugin cannot serve an
-NSEC3-signed zone (a failed reload also keeps the previous configuration live), so the
-`nsec3-hashes-exposed [low]` case is covered by the test suite's mocks. CoreDNS answers
-denials so that `ldns-walk` stops at the apex; run-recon walks by asking for each owner
-name's NSEC record (`dig +dnssec +norec NSEC <name>`), which works against CoreDNS, BIND
-and Knot alike.
+appears in the CSV. CoreDNS's file plugin cannot serve an NSEC3-signed zone (a failed reload
+also keeps the previous configuration live), so `nsec3.test` is served by BIND, which runs in
+the `dns` container's network: CoreDNS forwards the zone to it, and the zone check reaches it
+directly as the zone's name server. CoreDNS answers denials so that `ldns-walk` stops at the
+apex; run-recon walks by asking for each owner name's NSEC record
+(`dig +dnssec +norec NSEC <name>`), which works against CoreDNS, BIND and Knot alike. Neither
+signed zone has a DS in its parent (CoreDNS answers a zone's DS query from the zone itself), so
+the `ds=yes` case is covered by the suite's mocks.
 
 ## Origin fixture
 
@@ -134,8 +140,13 @@ and Knot alike.
 records leak that address: `direct.nginx.test A 127.0.0.5` and nginx.test's SPF record
 `v=spf1 ip4:127.0.0.5 -all`. `./bench-run-recon.sh origin` checks that `--origin` reports
 `origin-exposed [high] host=nginx.test origin=127.0.0.5 port=80 match=body-sha256`, that
-`spa.test` and `wp.test` (origins only on the container network) are not reported, and that
-`<out>.edge.tsv` names the edge and the origin software.
+`spa.test` and `wp.test` (origins only on the container network) are not reported as exposed, and
+that `<out>.edge.tsv` names the edge and the origin software.
+
+`origin.spa.test` points to `LAB_PROTECTED_IP`, where the ingress answers every request with
+`403 direct access denied` (an origin locked to its CDN), and nothing listens on 443. The check
+expects `origin-protected [info] host=spa.test origin=127.0.0.6 via=origin.spa.test
+reason=443:refused,80:status-403-other-content`, and nothing at all for `wp.test`.
 
 ## HTTP-detail fixtures (run-recon 1.19)
 

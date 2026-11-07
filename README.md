@@ -208,10 +208,10 @@ Active stages (5–8) are skipped under `--passive-only`; enrichment (7) is skip
 | `--fuzz` | content discovery | feroxbuster/ffuf | URL rows |
 | `--vhost` | vhost bruteforce | ffuf | host rows (`vhost`) |
 | `--takeover` | dangling CNAME / takeover | dnsx (CNAMEs of every candidate) + subzy + nuclei `-tags takeover` | `.takeover.txt`, `.cname.tsv` |
-| `--extras` | robots.txt, security.txt, 404 probe, favicon hashes | httpx `-path` / `-favicon` | URL rows (`robots`), cols `robots`, `security_txt`, `favicon_*`, `.extras.txt` |
+| `--extras` | robots.txt, security.txt, 404 probe, favicon hashes | httpx `-path -irrb` (one pass) | URL rows (`robots`), cols `robots`, `security_txt`, `favicon_*`, `.extras.txt` |
 | `--zone-exposure` | DNS zone exposure | dig: SOA/NS, AXFR per name server, NSEC walk, NSEC3PARAM | `.zone.txt`, `.zone-names.txt`; names join the candidates |
 | `--screenshots` | visual triage | httpx -ss (browser routed like httpx) / gowitness | `screenshots-<ts>/`, `.screenshots.tsv` (status per host) |
-| `--origin` | edge detection + origin search | httpx (headers, body hash, favicon), tlsx -jarm, cdncheck, dnsx, dig (SPF/MX), curl `--resolve` | `.origin.txt` (verified only), `.edge.tsv` |
+| `--origin` | edge detection + origin search | httpx (headers, body hash, favicon), tlsx -jarm, cdncheck, dnsx (A+AAAA), dig (SPF/MX), curl `--resolve` | `.origin.txt` (verified, and protected origins), `.edge.tsv` |
 | `--tls` | TLS posture | tlsx + chain validation (Python `ssl`, system trust store) | CSV cols `tls_version`..`tls_flags` (joined to https rows) |
 | `--tls-full` | TLS + version/cipher enum | tlsx -version-enum -cipher-enum | adds `WeakTLS`/`WeakCipher` (noisier) |
 | `--ipv6` | AAAA resolution | dnsx -aaaa | CSV col `ipv6` (`;`-joined v6 addrs per host) |
@@ -351,12 +351,20 @@ Side files next to the CSV, by flag: `.takeover.txt` + `.cname.tsv` (`--takeover
 | `zone-transfer-open [high]` | a name server hands the whole zone to anyone (AXFR); one line per open server |
 | `nsec-zone-walkable [medium]` | the zone is signed with NSEC, so following the chain lists every name (capped at `ZONE_WALK_MAX`, default 5000) |
 | `nsec3-hashes-exposed [low]` | NSEC3: hashed names can be collected and cracked offline; the parameters (iterations, salt, opt-out) are recorded, nothing is cracked |
-| `zone-checked [info]` | none of the above: evidence that the check ran (signed or not, transfers refused on n/n servers) |
+| `dnssec-unanchored [low]` | the zone is signed but its parent publishes no DS record, so validating resolvers cannot check the signatures |
+| `zone-checked [info]` | none of the above: evidence that the check ran (signed or not, transfers refused on n/n servers, `ds=yes/no` when signed, `unreachable=N` for addresses that never answered) |
 
-**Extras findings** (`.extras.txt`, `--extras`). One `httpx -path` pass per seed requests `/robots.txt`,
-`/.well-known/security.txt` (then `/security.txt`) and one random path on every live root, as WebInventory's
-"safe extras" do. robots.txt `Disallow`/`Allow` paths (without wildcards) and sitemaps become URL rows with
-source `robots`, so they are probed and enriched like crawled URLs.
+Every address of every name server is tried, IPv4 and IPv6, and the NSEC walk moves on to the next name
+server when one gives no chain (a lame or unreachable server no longer hides a walkable zone).
+
+**Extras findings** (`.extras.txt`, `--extras`). One `httpx -path` pass per seed requests the root page,
+`/favicon.ico`, `/robots.txt`, `/.well-known/security.txt` (then `/security.txt`) and one random path on every
+live root, as WebInventory's "safe extras" do. robots.txt `Disallow`/`Allow` paths (without wildcards) and
+sitemaps become URL rows with source `robots`, so they are probed and enriched like crawled URLs. The favicon
+is the icon the root page declares (`<link rel="icon">`; an inline `data:` icon is decoded, one at another
+path on the same host is fetched in a single follow-up run), else `/favicon.ico`; an HTML page served as
+`/favicon.ico` does not count. Its Shodan-compatible mmh3 and MD5 are computed from the bytes, so
+`--extras --favicon` pivots on them without another request.
 
 | Finding | Meaning |
 |---|---|
@@ -365,23 +373,39 @@ source `robots`, so they are probed and enriched like crawled URLs.
 | `catch-all-200 [info]` | the random path answered 200: every crawled or fuzzed path on this host looks real (soft 404) |
 | `error-page [info]` | status, Server header and title of the 404 page; `reveals=` names a server version the page shows and the Server header does not |
 
-A missing security.txt is recorded in the `security_txt` column, not as a finding. Cost: two short httpx
-runs per seed (about 0.85 s of CPU each, mostly start-up), so seed-heavy runs pay most: +40 s on the
-50-seed farm (`BENCHMARK.md`).
+A missing security.txt is recorded in the `security_txt` column, not as a finding. Cost: one short httpx
+run per seed (about 0.85 s of CPU, mostly start-up; v1.19 needed two), plus one only for hosts whose icon
+lives elsewhere (`BENCHMARK.md`).
 
 **Origin findings** (`.origin.txt`). For each live host, `--origin` records the edge in `.edge.tsv`
 (several `Server` headers such as `Caddy, nginx/1.21.6`, `Via`, CDN headers such as `cf-ray`, the cdncheck
-tag, JARM, favicon mmh3, title). It then collects candidate origin addresses: A records of `direct.`,
-`origin.` and `backend.` names, the seed's SPF `ip4:` ranges (up to 16 addresses) and MX hosts, and names
-from `--zone-exposure`. Each candidate gets the site's own request, sent straight to it with
-`curl --resolve host:port:ip` (so the Host header and SNI carry the site's name), and the answer is compared
-with the edge's: body SHA-256, then title + length, then title alone. Only matches are reported:
+tag, JARM, favicon mmh3, title). A lone `Server` header names the edge only for products that exist to sit
+in front of origins (Cloudflare, Akamai, CloudFront, Sucuri, Imperva, Fastly, AWS ELB, BIG-IP, DDoS-Guard,
+Edgecast); a general web server such as Caddy or HAProxy alone proves nothing (behind one, the origin still
+shows as a second `Server` value). It then collects candidate origin addresses:
+
+| Source (`via=`) | Addresses |
+|---|---|
+| `direct.`/`origin.`/`backend.`/`origin-` names | their A **and AAAA** records |
+| `spf` | the seed's SPF `ip4:`/`ip6:` entries (ranges up to 16 addresses), following `include:` and `redirect=` (depth 3, at most 10 lookups, as RFC 7208 allows) |
+| `mx` | the seed's MX hosts |
+| `range-cert` | in ASN/CIDR seed mode, addresses in your ranges whose certificate names the site |
+| `history:virustotal`, `history:urlscan` | past A/AAAA records from VirusTotal (`--virustotal`) and addresses urlscan.io saw the site on (`--urlscan`) |
+| `favicon` | hosts sharing the site's favicon (`--favicon`) |
+| `zone` | names from `--zone-exposure` |
+
+Each candidate gets the site's own request on every port in `ORIGIN_PORTS` (default `443 80`; 80, 8080,
+8000, 8008 and 8888 over plain HTTP), sent straight to it with `curl --resolve host:port:ip` (so the Host
+header and SNI carry the site's name), and the answer is compared with the edge's: body SHA-256, then
+title + length, then title alone. Matches are reported, and so is an origin-style name whose address does
+not serve the site:
 
 | Finding | Meaning |
 |---|---|
 | `origin-exposed [high]` | the site behind a detected edge answers directly at this address: the edge's protections can be bypassed |
 | `origin-alternate [low]` | no edge detected, and the same site is also served at this address |
 | `origin-candidate [low]` | same title, different body: verify by hand |
+| `origin-protected [info]` | a `direct.`/`origin.`/`backend.` name exists, but its address does not serve the site (`reason=` per port: `refused`, `timeout`, `tls-refused`, `reset`, `status-403-other-content`...): the origin is there and locked down. Not reported when another address of the same site was found |
 
 At most `ORIGIN_MAX_CHECKS` (default 200) host/address pairs are tried per seed. With `--proxy`, the
 comparison request goes through httpx and the proxy instead.
@@ -390,10 +414,19 @@ comparison request goes through httpx and the proxy instead.
 use httpx's `-r` or `-proxy`, and it ignores `NO_PROXY`: names meant to be reached directly went to the
 proxy, and the "screenshot" was the proxy's error page. run-recon now passes the browser `--proxy-server`
 (from `--proxy`) and a `--proxy-bypass-list` built from `NO_PROXY`, and uses an installed Chrome or
-Chromium. Each capture is then checked: `ok`; `blank` (the page itself is empty); `failed` (no image, or an
-empty image of a page with content); `suspect` (the browser rendered a different title than the probe saw,
-or the image is identical to that of a host with a different page). The report never shows a failed or
-blank capture as a screenshot, and marks suspect ones.
+Chromium. The browser also resolves names with the system resolver, not `--resolvers`: with `--resolvers`,
+it gets `--host-resolver-rules` mapping each host to the address your resolvers gave, so a name only they
+know (split horizon, the lab) renders, and renders the host httpx probed. Each capture is then checked:
+`ok`; `blank` (the page itself is empty); `failed` (no image, or an empty image of a page with content);
+`suspect` (the browser rendered a different title than the probe saw, or the image is identical to that of
+a host with a different page). The report never shows a failed or blank capture as a screenshot, and marks
+suspect ones.
+
+Without httpx (or with `SCREENSHOT_TOOL=gowitness`), gowitness 3 takes the captures: explicit
+`https://host:443` and `http://host:80` URLs (a bare name would be shot four ways), the go-rod driver (the
+default chromedp driver timed out taking screenshots under concurrency in the lab), and its JSON lines as
+the evidence for each capture; one capture is kept per host, https first. Its browser takes the
+environment proxy and `NO_PROXY` itself but has no equivalent of `--host-resolver-rules`.
 
 ---
 
@@ -435,7 +468,8 @@ vulnerabilities, weaknesses and misconfigurations up front:
   secrets and buckets, TLS findings, and **known CVEs from the vuln join**) ordered most-severe-first, each
   linked to the host it affects. Certificate expiry is graded by days left at the time of the run: expired
   = High, under 7 days = Medium, under 30 days = Low. Without a vuln join the report says
-  **"Known vulnerabilities: not checked"** and lists the CPEs that would be checked;
+  **"Known vulnerabilities: not checked"** and lists the versioned CPEs that would be checked, and apart
+  from them the CPEs with no version (the product was identified, its version was not, so no CVE match);
 - a **name inventory**: every name seen, live or not, with its DNS state (resolves, dangling CNAME,
   zone record, seed that does not resolve), HTTP status and CNAME; aliases are listed under their target;
 - **per-host cards** with the page title, IP and IPv6, ASN and network, server, edge → origin software →
@@ -720,6 +754,10 @@ and origin fixtures end to end.
 **v1.19.0** (Batch 2): the 17 HTTP columns come from the request the enrichment pass already sends, so
 the default path stays as fast as v1.18.0 and every existing column is identical (lab and farm).
 `./bench-run-recon.sh checks` now also runs the `http` fixtures.
+
+**v1.20.0** (unreleased, the v1.18 follow-ups): the default path is unchanged in speed and output; `--extras`
+needs one httpx run per seed instead of two (farm: 1.14x wall, 24% less CPU, output identical). `bench` A/B
+comparisons now ignore fields that differ between runs of the same version (`compare --exact --noise`).
 
 The v1.16 speed-up is from not querying internet archives for special-use names such as `.test`,
 which cannot exist there. The lab also exposed nine accuracy bugs, all fixed in v1.16 (listed in

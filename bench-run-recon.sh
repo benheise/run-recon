@@ -29,9 +29,11 @@
 #   takeover               --takeover against the CNAME fixtures (orphan.test must be
 #                          flagged as a dangling CNAME, alias.test must not)
 #   zone                   --zone-exposure against the zone fixtures (xfr.test: open AXFR,
-#                          walk.test: walkable NSEC chain, test.: neither) -- needs ldnsutils
-#   origin                 --origin against the forgotten-origin fixture (nginx.test must be
-#                          origin-exposed at LAB_ORIGIN_IP; spa.test and wp.test must not)
+#                          walk.test: walkable NSEC chain, nsec3.test: NSEC3 on BIND,
+#                          test.: none of these) -- needs ldnsutils
+#   origin                 --origin against the origin fixtures (nginx.test must be
+#                          origin-exposed at LAB_ORIGIN_IP; spa.test origin-protected at
+#                          LAB_PROTECTED_IP; wp.test not reported)
 #   http                   HTTP detail (1.19): security headers, HSTS, cookies, cleartext auth,
 #                          robots.txt / security.txt / 404 probe (--extras), favicon, PTR (--enrich)
 #   checks                 takeover + zone + origin + http; non-zero if any fails
@@ -53,6 +55,12 @@ LAB_DNS_IP="${LAB_DNS_IP:-127.0.0.1}"
 # the "forgotten origin": nginx's backend published directly on this loopback address,
 # leaked through direct.nginx.test and nginx.test's SPF record (origin-identification fixture)
 LAB_ORIGIN_IP="${LAB_ORIGIN_IP:-127.0.0.5}"
+# the "protected origin": origin.spa.test points here, where the ingress answers every
+# request with 403 (an origin locked to its CDN): --origin must say origin-protected
+LAB_PROTECTED_IP="${LAB_PROTECTED_IP:-127.0.0.6}"
+# BIND, authoritative for the NSEC3-signed nsec3.test (CoreDNS's file plugin cannot serve
+# NSEC3): ns.nsec3.test answers on this address, CoreDNS forwards the zone to it
+LAB_NSEC3_IP="${LAB_NSEC3_IP:-127.0.0.7}"
 LAB_HOSTS="nginx.test wp.test spa.test ci.test"
 FARM_N_DEFAULT=50
 FARM_BACKENDS=(nginx wordpress spa jenkins)
@@ -87,7 +95,10 @@ gen_lab(){ # <farm_n>
     done
     printf '</script></body></html>\n'
   } > "$LAB/spa/index.html"
-  case "$LAB_DNS_IP" in 127.*) ;; *) die "LAB_DNS_IP must be a loopback (127.0.0.0/8) address: $LAB_DNS_IP";; esac
+  local _v
+  for _v in LAB_DNS_IP LAB_ORIGIN_IP LAB_PROTECTED_IP LAB_NSEC3_IP; do
+    case "${!_v}" in 127.*) ;; *) die "$_v must be a loopback (127.0.0.0/8) address: ${!_v}";; esac
+  done
   printf '%s\n' "$LAB_DNS_IP" > "$RESOLVERS_FILE"
   : > "$LAB/farm.caddy"; : > "$LAB/targets-farm.txt"
   printf 'host,status,technologies,cpe,tls_flags,ipv6,min_urls\n' > "$LAB/expected-farm.csv"
@@ -122,7 +133,8 @@ gen_lab(){ # <farm_n>
   #   takeover: alias.test -> nginx.test (healthy, must not be flagged) and orphan.test ->
   #             gone.cloud.test, a name that does not exist (a dangling CNAME)
   #   origin:   direct.nginx.test and nginx.test's SPF record leak $LAB_ORIGIN_IP, where the
-  #             nginx backend answers directly, bypassing the Caddy edge
+  #             nginx backend answers directly, bypassing the Caddy edge; origin.spa.test
+  #             points to $LAB_PROTECTED_IP, which refuses the site (403): origin-protected
   #   zone:     test. itself is unsigned and refuses AXFR (the negative case)
   {
     printf '$ORIGIN test.\n$TTL 60\n'
@@ -132,27 +144,31 @@ gen_lab(){ # <farm_n>
     printf 'alias IN CNAME nginx.test.\norphan IN CNAME gone.cloud.test.\n'
     printf 'direct.nginx.test. IN A %s\n' "$LAB_ORIGIN_IP"
     printf 'nginx.test. IN TXT "v=spf1 ip4:%s -all"\n' "$LAB_ORIGIN_IP"
+    printf 'origin.spa.test. IN A %s\n' "$LAB_PROTECTED_IP"
   } > "$LAB/db.test"
   rm -f "$LAB/test.zone"
   # zone-exposure fixtures: names that no wordlist or passive source would find
   #   walk.test   DNSSEC-signed with NSEC  -> the chain can be walked
   #   xfr.test    unsigned, AXFR allowed   -> the whole zone in one query
-  # (No NSEC3 zone: CoreDNS's file plugin cannot serve NSEC3; the suite covers it.)
-  local z
-  for z in walk.test xfr.test; do
+  #   nsec3.test  signed with NSEC3, served by BIND on $LAB_NSEC3_IP (CoreDNS forwards
+  #               to it): the hashed chain is reported, not walked
+  local z ns
+  for z in walk.test xfr.test nsec3.test; do
+    ns=127.0.0.1; [ "$z" = nsec3.test ] && ns="$LAB_NSEC3_IP"
     {
       printf '$ORIGIN %s.\n$TTL 60\n' "$z"
       printf '@ IN SOA ns.%s. hostmaster.%s. %s 7200 3600 1209600 60\n' "$z" "$z" "$serial"
-      printf '@ IN NS ns.%s.\nns IN A 127.0.0.1\n@ IN A 127.0.0.1\nwww IN A 127.0.0.1\n' "$z"
+      printf '@ IN NS ns.%s.\nns IN A %s\n@ IN A 127.0.0.1\nwww IN A 127.0.0.1\n' "$z" "$ns"
       case "$z" in
         walk.test)  printf 'secret-admin IN A 127.0.0.1\nvpn-legacy IN A 127.0.0.1\nq7-billing-replica IN A 127.0.0.1\n';;
         xfr.test)   printf 'hidden-ops IN A 127.0.0.1\nstaging-api-2019 IN A 127.0.0.1\n';;
+        nsec3.test) printf 'hashed-only IN A 127.0.0.1\n';;
       esac
     } > "$LAB/db.$z"
   done
   sign_zone walk.test 0
-  rm -f "$LAB"/db.nsec3.test* "$LAB"/dnssec/Knsec3.test.*
-  printf 'walk.test\nxfr.test\nnginx.test\n' > "$LAB/targets-zone.txt"
+  sign_zone nsec3.test 1
+  printf 'walk.test\nxfr.test\nnsec3.test\nnginx.test\n' > "$LAB/targets-zone.txt"
   printf 'nginx.test\nalias.test\norphan.test\n' > "$LAB/targets-takeover.txt"
   printf 'nginx.test\nspa.test\nwp.test\n' > "$LAB/targets-origin.txt"
   # reverse zone for 127.0.0.0/8: the PTR fixtures for --enrich's ptr column
@@ -165,7 +181,7 @@ gen_lab(){ # <farm_n>
   # HTTP-detail check (bench-run-recon.sh http): the four sites, the cleartext-auth VPN and a
   # catch-all name from the walk.test zone
   printf 'nginx.test\nspa.test\nwp.test\nci.test\nvpn-legacy.walk.test\nwww.walk.test\n' > "$LAB/targets-http.txt"
-  log "generated: SPA (120 KB), farm of $n vhosts, zones db.test db.walk.test db.xfr.test db.127, targets and ground truth"
+  log "generated: SPA (120 KB), farm of $n vhosts, zones db.test db.walk.test db.xfr.test db.nsec3.test db.127, targets and ground truth"
 }
 
 # sign_zone ZONE NSEC3(0|1): DNSSEC-sign lab/db.ZONE into lab/db.ZONE.signed with
@@ -228,8 +244,8 @@ cmd_up(){
   while [ "$#" -gt 0 ]; do case "$1" in --farm) farm="${2:-$FARM_N_DEFAULT}"; shift 2 || shift;; *) shift;; esac; done
   have docker || die "docker not found. Install Docker + compose, then re-run on your lab host."
   gen_lab "$farm"
-  log "starting the range (lab DNS on $LAB_DNS_IP:53, exposed origin on $LAB_ORIGIN_IP:80)..."
-  export LAB_DNS_IP LAB_ORIGIN_IP
+  log "starting the range (lab DNS on $LAB_DNS_IP:53, exposed origin on $LAB_ORIGIN_IP:80, protected origin on $LAB_PROTECTED_IP:80, BIND on $LAB_NSEC3_IP:53)..."
+  export LAB_DNS_IP LAB_ORIGIN_IP LAB_PROTECTED_IP LAB_NSEC3_IP
   compose -f "$COMPOSE_FILE" up -d \
     || die "compose up failed (if $LAB_DNS_IP:53 is in use, retry with LAB_DNS_IP=127.0.0.2)"
   if ! grep -q 'nginx\.test' /etc/hosts 2>/dev/null; then
@@ -240,7 +256,7 @@ cmd_up(){
   log "then:  $0 bench --runs 3            (lab accuracy)"
   log "       $0 bench --runs 3 --farm     (farm load)"
 }
-cmd_down(){ export LAB_DNS_IP LAB_ORIGIN_IP; compose -f "$COMPOSE_FILE" down -v 2>/dev/null; log "range down."; }
+cmd_down(){ export LAB_DNS_IP LAB_ORIGIN_IP LAB_PROTECTED_IP LAB_NSEC3_IP; compose -f "$COMPOSE_FILE" down -v 2>/dev/null; log "range down."; }
 cmd_hosts(){
   printf '127.0.0.1 %s\n' "$LAB_HOSTS"
   [ -f "$LAB/targets-farm.txt" ] && while IFS= read -r h; do [ -n "$h" ] && printf '127.0.0.1 %s\n' "$h"; done < "$LAB/targets-farm.txt"
@@ -282,11 +298,14 @@ cmd_run(){
 
 # ---- compare: accuracy vs expected, or field-by-field A/B ---------------------
 cmd_compare(){
-  local exact=0 a="" b=""
+  local exact=0 a="" b="" noise=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --exact) exact=1; shift;;
-      -h|--help) echo "usage: $0 compare EXPECTED ACTUAL [--exact]" >&2; return 0;;
+      # --noise RUN: another run of A's version; fields that differ between A and it are
+      # run-to-run noise (a page with a per-request nonce), not a difference between versions
+      --noise) [ -f "${2:-}" ] && noise="${noise:+$noise:}$2"; shift 2 || shift;;
+      -h|--help) echo "usage: $0 compare EXPECTED ACTUAL [--exact [--noise OTHER-RUN-OF-EXPECTED]...]" >&2; return 0;;
       -*) die "compare: unknown option: $1";;
       *) if [ -z "$a" ]; then a="$1"; elif [ -z "$b" ]; then b="$1"; fi; shift;;
     esac
@@ -295,7 +314,7 @@ cmd_compare(){
   [ -f "$a" ] || die "compare: not found: $a"
   [ -f "$b" ] || die "compare: not found: $b"
   have python3 || die "compare: python3 required"
-  BENCH_EXACT="$exact" python3 -I - "$a" "$b" <<'PYCMP'
+  BENCH_EXACT="$exact" BENCH_NOISE="$noise" python3 -I - "$a" "$b" <<'PYCMP'
 import sys, os, csv, re
 
 a_path, b_path = sys.argv[1], sys.argv[2]
@@ -318,6 +337,18 @@ if EXACT:
     am = {key(r): r for r in ar}
     bm = {key(r): r for r in br}
     cols = [c for c in (ar[0].keys() if ar else []) if c in (br[0].keys() if br else []) and c not in VOLATILE]
+    # the noise floor: (row, column) pairs that already differ between runs of A's version
+    noisy = set()
+    for npath in [x for x in os.environ.get("BENCH_NOISE", "").split(":") if x]:
+        nm = {key(r): r for r in rows(npath)}
+        for k in set(am) & set(nm):
+            for c in cols:
+                if (am[k].get(c) or "") != (nm[k].get(c) or ""):
+                    noisy.add((k, c))
+    if noisy:
+        from collections import Counter
+        print("noise: %d field(s) differ between runs of A's own version, not compared (%s)"
+              % (len(noisy), ", ".join("%s x%d" % kv for kv in sorted(Counter(c for _, c in noisy).items()))))
     diffs = 0
     only_a = sorted(set(am) - set(bm))
     only_b = sorted(set(bm) - set(am))
@@ -325,7 +356,7 @@ if EXACT:
     for k in only_b: print("only in B: %s %s" % k); diffs += 1
     for k in sorted(set(am) & set(bm)):
         for c in cols:
-            if (am[k].get(c) or "") != (bm[k].get(c) or ""):
+            if (k, c) not in noisy and (am[k].get(c) or "") != (bm[k].get(c) or ""):
                 print("differ %s %s [%s]: %r != %r" % (k[0], k[1], c, am[k].get(c), bm[k].get(c)))
                 diffs += 1
     a_cols = set(ar[0].keys()) if ar else set()
@@ -453,7 +484,9 @@ cmd_bench(){
     [ -f "$bs" ] || die "baseline script not found: $bs"
     log "baseline ($( [ -n "$base_script" ] && echo "script $bs" || echo "flags: $bf"))"
     local w0 c0 r0 a0; read -r w0 c0 r0 a0 < <(_one base "$bs" "$bf")
-    local ident; if cmd_compare "$tdir/base.csv" "$tdir/cand.csv" --exact >"$tdir/ab.log" 2>&1; then ident="identical"
+    # runs 1..N-1 of the baseline give the noise floor (base.csv is run N)
+    local _nz=() _k; for _k in $(seq 1 $((runs - 1))); do _nz+=(--noise "$tdir/base.$_k.csv"); done
+    local ident; if cmd_compare "$tdir/base.csv" "$tdir/cand.csv" --exact "${_nz[@]}" >"$tdir/ab.log" 2>&1; then ident="identical"
       else ident="DIFFERENT ($(grep -c '^differ\|^only' "$tdir/ab.log") field(s); see $tdir/ab.log)"; fi
     local sp csp
     sp="$(awk -v a="$w0" -v b="$w1" 'BEGIN{ if(b>0) printf "%.2fx", a/b; else print "n/a"}')"
@@ -509,6 +542,14 @@ cmd_zone(){
   else
     log "  skip walk.test is unsigned (install ldnsutils, then rerun up)"
   fi
+  if grep -q 'NSEC3PARAM' "$LAB/db.nsec3.test.signed" 2>/dev/null; then
+    _ck "$f" '^\[nsec3\.test\] nsec3-hashes-exposed \[low\] host=nsec3\.test zone=nsec3\.test params="1 0 5 1A2B3C4D"' "nsec3.test: NSEC3 on BIND reported [low] with its parameters"
+    if grep -qE '^nsec3\.test	hashed-only\.nsec3\.test	nsec$' "$n" 2>/dev/null; then log "  FAIL nsec3.test: an NSEC3 zone was walked like NSEC"; fail=1
+    else log "  ok   nsec3.test: hashed names not walked"; fi
+    _ck "$f" '^\[nsec3\.test\] dnssec-unanchored \[low\] host=nsec3\.test' "nsec3.test: signed without a DS in the parent -> dnssec-unanchored [low]"
+  else
+    log "  skip nsec3.test is unsigned (install ldnsutils, then rerun up)"
+  fi
   _ck "$f" '^\[test\] zone-checked \[info\] host=test zone=test signed=no axfr=refused' "test.: transfer refused, unsigned -> zone-checked [info]"
   if grep -qE 'zone-transfer-open.*zone=test |nsec-zone-walkable.*zone=test ' "$f" 2>/dev/null; then log "  FAIL test. reported as exposed"; fail=1; fi
   _ck "$t/z.csv" ',http[s]?://secret-admin\.walk\.test,|,http[s]?://hidden-ops\.xfr\.test,' "harvested names are probed and inventoried"
@@ -531,8 +572,14 @@ cmd_origin(){
   if grep -qE "origin-exposed \[high\] host=nginx\.test origin=$ip port=80 via=[^ ]*(direct\.nginx\.test|spf)" "$f" 2>/dev/null; then
     log "  ok   nginx.test: origin $LAB_ORIGIN_IP verified behind the edge"
   else log "  FAIL nginx.test origin not found (see $f, $t/run.err)"; fail=1; fi
-  if grep -qE 'host=(spa|wp)\.test' "$f" 2>/dev/null; then log "  FAIL spa.test/wp.test reported (no exposed origin there)"; fail=1
-  else log "  ok   spa.test and wp.test not reported"; fi
+  if grep -qE 'origin-(exposed|alternate|candidate)[^ ]* \[[a-z]+\] host=(spa|wp)\.test' "$f" 2>/dev/null; then log "  FAIL spa.test/wp.test reported as exposed (no exposed origin there)"; fail=1
+  else log "  ok   spa.test and wp.test not reported as exposed"; fi
+  ip="$(printf '%s' "$LAB_PROTECTED_IP" | sed 's/\./\\./g')"
+  if grep -qE "origin-protected \[info\] host=spa\.test origin=$ip via=[^ ]*origin\.spa\.test reason=[^ ]*status-403" "$f" 2>/dev/null; then
+    log "  ok   spa.test: origin.spa.test ($LAB_PROTECTED_IP) refuses the site -> origin-protected [info]"
+  else log "  FAIL spa.test origin-protected not reported (see $f)"; fail=1; fi
+  if grep -qE 'host=wp\.test' "$f" 2>/dev/null; then log "  FAIL wp.test reported (no origin name there)"; fail=1
+  else log "  ok   wp.test not reported"; fi
   if grep -qE '^nginx\.test	nginx\.test	Caddy	nginx/' "$e" 2>/dev/null; then log "  ok   edge.tsv: nginx.test edge Caddy, origin software nginx"
   else log "  FAIL edge.tsv incomplete ($e)"; fail=1; fi
   if grep -q $'\033' "$f" "$e" 2>/dev/null; then log "  FAIL terminal colour codes in the artifacts"; fail=1; fi
