@@ -1385,3 +1385,61 @@ tests; B3.1, B3.2, B3.3 and B3.5 were checked against the lab with the real tool
 - [x] **Setup**: cloudlist 1.5.1, tldfinder 0.0.2, vulnx 2.0.2 (`github.com/projectdiscovery/vulnx/v2`) pinned.
 - [x] **Checks:** suite 590 → **635/635**; `bench-run-recon.sh checks` **PASS** on all six fixtures; A/B vs the
       follow-ups: lab identical; `--dns-posture` on the farm +0.8 s wall, +2.5 s CPU, CSV identical.
+
+## v1.20.0 (unreleased) — Batch 4: evidence and history (scope, manifest, delta, history, resume)
+
+Tracked in `PLAN.md` (B4.1–B4.5), on `batch-4-evidence` (stacked on Batch 3). Every item has suite tests; B4.1,
+B4.3, B4.4 and B4.5 were checked against the lab with the real tools, and B4.4 against a real PostgreSQL 16.
+
+- [x] **B4.1 `--scope FILE`** (WebInventory `-Scope`), fail-closed. Entries: `name` (it and below), `*.name`
+      (below only), IPv4/IPv6 addresses and CIDRs, `AS<n>`; `!`/`-` exclusions win. Before anything is sent:
+      a malformed entry (URL, host bits set, a whole TLD), an out-of-scope seed or an invalid input line
+      (bare address, `host:port`) stops the run with exit 2; `--drop-out-of-scope` skips them with a warning.
+      CIDR seeds lose their excluded addresses (and the allowed ASNs' ranges theirs).
+      - names: every discovered name and URL passes `scope_filter`'s exclusions (zone names too);
+      - address exclusions: names resolving into them are dropped (dnsx) before the certificate harvest,
+        the takeover list and the probe; fail-closed when the check cannot run (no dnsx: refused up front);
+      - addresses run-recon picks itself: `--origin` candidates, `--favicon`/certificate-search hits and
+        range-certificate names (also needing a name entry) only inside the allowed ranges;
+      - crawl: katana `-cs` (allowed names; with address exclusions the live hosts already checked) and
+        `-cos` (exclusions), verified on a loopback server: `-cs` applies on top of `-fs rdn`, `-cos` first;
+      - browser: Chrome host-resolver rules map the seed's names and `MAP * ~NOTFOUND` the rest (proxy host
+        excluded); gowitness, which cannot take them, is not used under `--scope`;
+      - redirects: nuclei `-dr`, whatweb `--follow-redirect=never`, cmseek without `--follow-redirect`;
+        gospider/hakrawler skipped; xnLinkFinder fetches only JS on the seed's live hosts; the MTA-STS policy
+        only from an in-scope name.
+      → `<out>.scope.txt` (scope file and SHA-256, each seed and its entry, everything held back and why);
+      run.json `scope`; the report's run header. Without `--scope`, ignored input lines are now named in a
+      warning (they were dropped silently).
+- [x] **`--list-targets`** (WebInventory `-ListTargets`): the plan on stdout (each seed: in scope and by which
+      entry, or why not), exit 0 if the run would start and 2 if it would refuse; no tool is started, no work
+      dir is made.
+- [x] **B4.2 `<out>.manifest.sha256`**: written last, `sha256sum -c` format, paths relative to the CSV's
+      directory; the CSV, every `<out>.*` file the run wrote, run.json, the report and the screenshots. A file
+      with the same prefix older than the run is left out and named in a warning.
+- [x] **B4.3 field-by-field delta** (WebInventory `_delta.csv`): `--monitor` also writes `<out>.delta.tsv`
+      (`change seed service field old new`), per service (`scheme://host:port`) within its seed: new and
+      removed only under seeds both runs covered; 17 fields compared, each only when the stage filling it ran
+      in both runs (judged by a field that stage always fills), multi-valued fields as sets, an address change
+      inside the same ASN not reported. Report: "Changes since the previous run"; notify: a summary line;
+      run.json `delta_changes`. Offline: `recon-db.sh diff OLD.csv NEW.csv`.
+- [x] **B4.4 history in recon-db**: `recon-db.sh history [PATTERN]` (first/last seen, runs seen of the seed's
+      runs, present or "gone since <run>") and `changes [PATTERN] [--since TS]` (events between each run of a
+      seed and its previous run), from the store or, with `--csv`, from run CSVs. The store keeps the compared
+      fields per run (schema migrated in place) and `recon_runs` (the seeds each run covered, the columns its
+      CSV had: a 1.19 run is not compared on fields it never had).
+- [x] **B4.5 resume**: the work dir's `state` (status; SHA-256 of the command line, the input and the scope
+      file; no values) and an `flock` held while the run lives. SIGINT/SIGTERM freeze, list and stop the whole
+      process tree, mark the run interrupted and keep the work dir (exit 130/143). The same command with
+      `--resume` keeps the finished seeds (done markers, parts, raw dirs) and reruns the rest and the
+      main-process stages; a run still holding its lock, another command line or a finished run is refused.
+      run.json `sessions`, `seeds_resumed`.
+- [x] **`--monitor --db` re-measures**: under `--monitor`, every target-facing result (probe, enrichment, crawl,
+      ports, TLS, JARM, certificates, screenshots) is measured afresh and only stored (`CACHE_FRESH_ACTIVE`);
+      before, the cache's 7-day TTL could hide a change. Passive lookups still come from the cache.
+- [x] **Lab**: `bench-run-recon.sh scope`, `resume`, `history` (all in `checks`).
+- [x] **Checks:** suite 635 → **762/762**; `bench-run-recon.sh checks` **PASS** on all nine; A/B vs Batch 3:
+      output identical on the lab and the farm, timing inside the lab's spread (BENCHMARK.md).
+- [x] **Found while building this**: see BENCHMARK.md (`--monitor --db` hiding changes, a pipefail abort in a
+      new screenshot pipeline, the heartbeat's `sleep` holding the lock, children forked during the kill, a
+      resume racing a live run).

@@ -508,3 +508,72 @@ in `-dm tld` mode it resolves through public DNS whatever `-r` says.
   answer read as NOERROR and NXDOMAIN-based checks could not fire. The posture fixtures now answer first.
 - **`cloudlist` writes a default provider config on first run**, so "no config" could not be tested against
   `$HOME`; the test runs with an empty `HOME`.
+
+## v1.20.0 (unreleased): Batch 4, evidence and history
+
+Same lab and method. The baseline is the Batch 3 branch (`batch-3-email-dns`, frozen with `git archive`), so the
+A/B isolates Batch 4. No lab fixture changed; the three new checks use the existing names.
+
+### A/B: the default path
+
+| Scenario | runs per side | Batch 3 wall s | Batch 4 wall s | Batch 3 CPU s | Batch 4 CPU s | `--exact` |
+|---|---:|---:|---:|---:|---:|---|
+| lab, `--tls --ipv6` (3 sessions, one with the order swapped) | 9 | 24.42 | 25.09 | 15.23 | 15.68 | identical (87 rows), all sessions |
+| farm, `--tls --ipv6 -t 10` (2 sessions, one swapped) | 6 | 97.6 | 99.4 | 93.4 | 95.6 | identical (50 rows), both sessions |
+| lab, interleaved run by run (old / new, 4 rounds) | 4 | 24.67 | 24.07 | 14.81 | 14.43 | — |
+| 6 farm seeds without WordPress, 2 interleaved blocks of 5 | 10 | 18.00 | 17.95 | 10.95 | 10.85 | — |
+| farm, `--passive-only` (framework cost only), 2 blocks of 5 | 10 | 2.39 | 2.55 | 4.34 | 4.55 | — |
+
+The output of the default path is identical. The session medians differ by 2–3 %, which is inside the lab's spread
+(one run of either version reached 29–31 s), and the difference disappears when the versions are interleaved run
+by run. The 6-seed control shows Batch 4 0.1 s lower in CPU. The only cost that shows up consistently is a fixed
+one, measured on `--passive-only` runs. It comes from what a run now does once, at the start and the end: two
+short hashes for the state file, and the manifest. On a 50-seed run that is about 0.2 s of CPU. The check for
+ignored input lines was then changed to start Python only when a line does not count as a seed.
+
+One farm run of Batch 4 (1 of 12) lost WordPress's version on f06: httpx's technology detection saw a page
+without the version marker under load. The enrichment code did not change in this batch.
+
+### Lab fixture checks (real tools)
+
+`bench-run-recon.sh checks` → **PASS** on all nine (takeover, zone, origin, http, posture, discovery, scope,
+resume, history), with `RECON_DB_DSN` pointing at a PostgreSQL 16 database for the history check.
+
+| Check | What was run | Result |
+|---|---|---|
+| scope | `--list-targets`, ci.test outside the scope | exit 2; `ci.test` OUT OF SCOPE, no work dir |
+| scope | `--origin --screenshots`, names only | no origin contacted; `127.0.0.5` in `.scope.txt` as held back; the browser (Chrome rules with `MAP * ~NOTFOUND`) still renders nginx.test |
+| scope | the two origin addresses allowed | `origin-exposed` nginx.test → 127.0.0.5 and `origin-protected` spa.test, as without `--scope` |
+| scope | `!127.0.0.5`, `!backup-db.nginx.test`, brute wordlist finding both | neither name in the CSV; `direct.nginx.test` held back with its address. **The origin's own access log: unchanged during the run (31 → 31, and 39 → 39 in the full `checks` run)**; the same run without `--scope`: +5 |
+| scope | `!mta-sts.posture.test` | the MTA-STS policy was not fetched ("outside --scope" in the posture table) |
+| resume | 4 lab seeds, `-t 1 --tls`, SIGTERM after 2 | exit 143, state `interrupted`; `--resume` ran the other 2; **CSV `--exact` equal to an uninterrupted run** (87 rows; body hashes of wp.test as the noise floor) |
+| history | spa backend stopped between two runs | `.delta.tsv`: spa.test status 200 → 502, title, server, technologies, CPE; nothing for the three other hosts; the report's Changes section |
+| history | `recon-db.sh changes` / `history` | the same events from the run CSVs (`--csv`) and from the PostgreSQL store (`--db`); nginx.test present with first/last seen |
+
+The store was also checked by hand against PostgreSQL 16: a 1.19-shaped `recon_hosts` table with one row was
+migrated in place by the first import, three runs imported, and `changes` did not compare `cpe` against the old
+run (its CSV never had the column).
+
+katana's crawl-scope flags were checked on a loopback server before relying on them: with `-fs rdn`, a page
+linking to two siblings and an outside name; `-cos` kept a sibling out, `-cs` restricted the crawl further (it
+applies on top of `-fs`), and `-cos` wins over `-cs`.
+
+### Found while building this
+
+- **`--monitor --db` could not see a change.** The cache served the live probe and enrichment records from the
+  previous run (7-day TTL), so the history check's stopped backend still read 200. Under `--monitor`, every
+  target-facing result is now measured afresh and only stored (`CACHE_FRESH_ACTIVE`); passive lookups still
+  come from the cache.
+- **A pipeline in the new screenshot code aborted the worker.** `{ ...; [ scope ] && cat; } | sort` ends with a
+  false test when there is no scope, and under `pipefail` + `set -e` that killed the seed's worker before the
+  CMS and active scans. The suite's `--all` case caught it.
+- **The heartbeat's `sleep` kept the work-dir lock.** Killing the heartbeat subshell orphaned its `sleep`, which
+  still held the inherited lock descriptor, so an immediate `--resume` saw the run as still running. The
+  heartbeat now starts without the descriptor and is killed after the process tree.
+- **Children forked during the kill.** Killing a worker's children first let the worker start its next stage
+  before it was killed itself. The tree is now frozen (SIGSTOP), listed again, terminated and continued.
+- **A resume racing the live run** (found by the first version of the suite test, which signalled a subshell
+  instead of run-recon) deleted the live run's seed directory. The work-dir lock makes `--resume` refuse a run
+  that is still going.
+- **The suite's AAAA test extracts code by a marker** (`-aaaa -json -silent`); the new dnsx call used the same
+  argument order and was picked up first. The new calls use another order.

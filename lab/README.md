@@ -72,7 +72,10 @@ sudo sh -c './bench-run-recon.sh hosts >> /etc/hosts'   # once: names for tools 
 ./bench-run-recon.sh http                                                      # headers, cookies, auth, robots/security.txt, favicon, PTR
 ./bench-run-recon.sh posture                                                   # SPF/DMARC/MTA-STS/CAA, dangling MX/NS, lame NS, cloudlist
 ./bench-run-recon.sh discovery                                                 # naabu, alterx, shuffledns, cdncheck, uncover, notify
-./bench-run-recon.sh checks                                                    # all six; non-zero if any fails
+./bench-run-recon.sh scope                                                     # --scope / --list-targets; proved at the origin's access log
+./bench-run-recon.sh resume                                                    # SIGTERM mid-run, --resume, CSV equals an uninterrupted run
+RECON_DB_DSN=postgresql://... ./bench-run-recon.sh history                     # --monitor delta + recon-db history (store with RECON_DB_DSN)
+./bench-run-recon.sh checks                                                    # all nine; non-zero if any fails
 
 ./bench-run-recon.sh down                # tear down and remove volumes
 ```
@@ -191,6 +194,35 @@ second with `--ports --port-spec 80,443,8443 --permute --brute --origin --monito
 
 The baseline run must not have the alterx or wordlist names. massdns has no package on most systems; the
 setup scripts build it from source (`github.com/blechschmidt/massdns`).
+
+## Scope, resume and history checks (run-recon 1.20)
+
+These need no new fixtures; they use the lab's names and the origin fixture.
+
+`bench-run-recon.sh scope`:
+1. `--list-targets` with `ci.test` outside the scope: exit 2, and `ci.test` is shown as out of scope.
+2. A scope with names only, and `--origin --screenshots`: the origin candidates (`127.0.0.5`, `127.0.0.6`)
+   are listed in `<out>.scope.txt` and not contacted. The browser, held to the seed's names, still
+   renders `nginx.test`.
+3. The same with the two origin addresses allowed: `origin-exposed` for nginx.test and `origin-protected`
+   for spa.test, as without `--scope`.
+4. `!127.0.0.5` and `!backup-db.nginx.test`, with a wordlist that finds `direct.nginx.test` (127.0.0.5) and
+   `backup-db.nginx.test`: neither name is in the CSV. The proof is the nginx container's own log. A
+   request to `LAB_ORIGIN_IP` arrives from the docker bridge gateway, so the count of such lines must not
+   change during the run. The same run without `--scope` must change it, which shows the check can see
+   that traffic.
+5. MTA-STS: with `!mta-sts.posture.test`, the posture table says the policy was not fetched.
+
+`bench-run-recon.sh resume`: two uninterrupted runs of the lab targets with `-t 1 --tls`, then a third one
+stopped by SIGTERM after two seeds (exit 143, state `interrupted`) and resumed. The resumed CSV must equal
+the first run's under `compare --exact`, with the second run as the noise floor.
+
+`bench-run-recon.sh history`:
+1. A run of the lab targets, then the `spa` backend is stopped and a second run is made with `--monitor`.
+2. `<out>.delta.tsv` must show `spa.test` status `200` → `502` and nothing for the other three hosts, and
+   the report must have the Changes section. `recon-db.sh changes --csv` must find the same event.
+3. With `RECON_DB_DSN` set (a PostgreSQL database), both runs also go to the store (`--db`), and
+   `recon-db.sh changes` / `history` must find the event and nginx.test's first/last seen there.
 
 ## HTTP-detail fixtures (run-recon 1.19)
 

@@ -7,8 +7,9 @@ default path is kept only if it is no slower and its output is identical (or the
 justified accuracy fix).
 
 **Status:** Done · In progress · Planned · Blocked (needs something from Ben) · Won't do
-**Last updated:** 2026-11-06, follow-ups F1–F10 done on `followups-v1.18` (PR #3) and Batch 3 on
-`batch-3-email-dns` (stacked on it). Not released: the next release follows the rest of the open batch work
+**Last updated:** 2026-11-06, follow-ups F1–F10 done on `followups-v1.18` (PR #3), Batch 3 on
+`batch-3-email-dns` (PR #4) and Batch 4 on `batch-4-evidence` (stacked on #4). Not released: the next release
+follows the rest of the open batch work (B2.8, T1–T2)
 
 ## 0. Source of truth
 
@@ -16,7 +17,7 @@ justified accuracy fix).
 |---|---|---|---|
 | R1 | Git repository, `main` = v1.18.0, generated lab files ignored | Done | `git log` |
 | R2 | Push to GitHub (private `benheise/run-recon`) | Done: `main` pushed; releases v1.18.0 and v1.19.0 published. Tags cannot be pushed from Claude's sessions (HTTP 403), so releases/tags are created in the GitHub UI | tags `v1.18.0`, `v1.19.0` on GitHub |
-| R3 | Each batch on its own branch, merged by pull request | Done for Batch 2 (#1, merged); follow-ups #3; Batch 3 on `batch-3-email-dns` | PR per batch |
+| R3 | Each batch on its own branch, merged by pull request | Done for Batch 2 (#1, merged); follow-ups #3; Batch 3 #4; Batch 4 on `batch-4-evidence` (stacked on #4) | PR per batch |
 
 ## 1. Batch 2: HTTP detail (WebInventory A4, A5, A6, A11)
 
@@ -43,6 +44,7 @@ justified accuracy fix).
 | V6 | Higher `-t`, rate limits, and the `--db` cache on public seeds | Planned | no blanks; warm run faster |
 | V7 | `--favicon` pivot with real uncover keys | Planned | hits cert-scanned, names in scope |
 | V8 | `--dns-posture` on Ben's own domains; `--tld-variants` and `--cloudlist` with real accounts | Planned | no false positives on a correctly configured domain |
+| V9 | `--scope` with Ben's real ASNs and ranges (asnmap prefixes, origin candidates in and out of them); `--resume` of a long run interrupted mid-way; `--monitor --db` week over week | Planned | `.scope.txt` lists only what is really outside; resumed CSV complete; `.delta.tsv` shows real changes only |
 
 ## 3. Follow-ups from v1.18
 
@@ -73,11 +75,11 @@ justified accuracy fix).
 
 | ID | Item | Status | Check |
 |---|---|---|---|
-| B4.1 | Fail-closed scope file + dry run (`--scope FILE`, `--list-targets`), like WebInventory `-Scope` / `-ListTargets` | Planned | suite |
-| B4.2 | SHA-256 manifest of every output file | Planned (run.json done in 1.18) | suite |
-| B4.3 | Field-by-field diff between runs | Planned | suite |
-| B4.4 | First seen / last seen and change events in recon-db | Planned | suite |
-| B4.5 | Resume an interrupted run | Planned | suite |
+| B4.1 | Fail-closed scope file + dry run (`--scope FILE`, `--list-targets`), like WebInventory `-Scope` / `-ListTargets` | Done (`batch-4-evidence`): + `--drop-out-of-scope`, `<out>.scope.txt`; names, address exclusions, addresses run-recon picks, crawl, browser, redirects held to the scope | suite; lab: `bench-run-recon.sh scope` (origin access log shows no request to an excluded address) |
+| B4.2 | SHA-256 manifest of every output file | Done: `<out>.manifest.sha256` (`sha256sum -c` format; older same-prefix files left out and named) | suite |
+| B4.3 | Field-by-field diff between runs | Done: `--monitor` → `<out>.delta.tsv` (per service; new/removed/17 fields), report section; `recon-db.sh diff` | suite; lab: `bench-run-recon.sh history` |
+| B4.4 | First seen / last seen and change events in recon-db | Done: `recon-db.sh history` / `changes` (store or `--csv`), compared fields stored per run, `recon_runs` | suite; real PostgreSQL 16 (migration from a 1.19 store); lab: `history` with `--db` |
+| B4.5 | Resume an interrupted run | Done: SIGINT/SIGTERM keep the work dir (exit 130/143), `--resume` (state hashes, flock while running) | suite; lab: `bench-run-recon.sh resume` (resumed CSV `--exact` equals an uninterrupted run) |
 
 ## 6. TLS parity with WebInventory (A9)
 
