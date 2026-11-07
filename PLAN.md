@@ -7,20 +7,21 @@ default path is kept only if it is no slower and its output is identical (or the
 justified accuracy fix).
 
 **Status:** Done · In progress · Planned · Blocked (needs something from Ben) · Won't do
-**Last updated:** 2026-11-06, follow-ups F1–F10 done on `followups-v1.18` (PR #3), Batch 3 on
-`batch-3-email-dns` (PR #4), Batch 4 on `batch-4-evidence` (PR #5) and Batch 5 on `batch-5-redirects-tls`
-(PR #6, stacked on #5). Section 8 (JSON output and shipping to Tideline, P1–P3) was brought forward at
-Ben's request and is done as Batch 6 on `batch-6-json-ship` (PR #7, stacked on #6). `release-v1.20.0` (PR #8,
-stacked on #7) sets `VERSION` to 1.20.0: merge #3 → #8 in order, then create the v1.20.0 release and tag in the
-GitHub UI. The V-list (section 2) still needs Ben's Kali VM.
+**Last updated:** 2026-11-07. The repository is now `benheise/outcrop` (renamed from `benheise/run-recon`;
+GitHub redirects the old URLs). Follow-ups F1–F10 (PR #3), Batch 3 (#4), Batch 4 (#5), Batch 5 (#6), Batch 6
+(#7, section 8: JSON output and shipping to Tideline, brought forward at Ben's request) and `release-v1.20.0` (#8,
+`VERSION` 1.20.0) are all merged. Only #3 reached `main`: each stacked PR merged into the branch below it, because
+GitHub retargets a stacked PR only when its base branch is deleted. PR #9 lands `release-v1.20.0`, which holds all of
+it, on `main`; then create the v1.20.0 release and tag in the GitHub UI. The V-list (section 2) still needs Ben's
+Kali VM.
 
 ## 0. Source of truth
 
 | ID | Item | Status | Check |
 |---|---|---|---|
 | R1 | Git repository, `main` = v1.18.0, generated lab files ignored | Done | `git log` |
-| R2 | Push to GitHub (private `benheise/run-recon`) | Done: `main` pushed; releases v1.18.0 and v1.19.0 published; v1.20.0 ready (PR #8, release notes drafted). Tags cannot be pushed from Claude's sessions (HTTP 403), so releases/tags are created in the GitHub UI | tags `v1.18.0`, `v1.19.0` on GitHub; `v1.20.0` after #8 |
-| R3 | Each batch on its own branch, merged by pull request | Done for Batch 2 (#1, merged); follow-ups #3; Batch 3 #4; Batch 4 #5; Batch 5 #6 (stacked on #5); Batch 6 #7 (stacked on #6); release #8 (stacked on #7) | PR per batch |
+| R2 | Push to GitHub (private `benheise/outcrop`, renamed from `benheise/run-recon` on 2026-11-07) | Done: `main` pushed; releases v1.18.0 and v1.19.0 published; v1.20.0 ready once #9 lands it on `main` (release notes drafted). Tags cannot be pushed from Claude's sessions (HTTP 403), so releases/tags are created in the GitHub UI | tags `v1.18.0`, `v1.19.0` on GitHub; `v1.20.0` after #9 |
+| R3 | Each batch on its own branch, merged by pull request | Done for Batch 2 (#1, merged); follow-ups #3; Batch 3 #4; Batch 4 #5; Batch 5 #6 (stacked on #5); Batch 6 #7 (stacked on #6); release #8 (stacked on #7); all merged, #4–#8 into their stack bases, so #9 lands the stack on `main`. Next time: turn on "Automatically delete head branches" (GitHub then retargets the next PR to `main` as each merges), or merge only the top of a stack | PR per batch |
 
 ## 1. Batch 2: HTTP detail (WebInventory A4, A5, A6, A11)
 
