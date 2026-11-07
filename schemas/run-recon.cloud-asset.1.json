@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tideline:schema:run-recon.cloud-asset/1",
+  "title": "run-recon cloud-asset",
+  "description": "One asset listed by --cloudlist and whether the scan saw it (a row of <out>.cloud-assets.tsv). Values are strings, as in the TSV.",
+  "x-tideline-schema": "run-recon.cloud-asset/1",
+  "x-minor": 0,
+  "type": "object",
+  "properties": {
+    "provider": {
+      "type": "string"
+    },
+    "account": {
+      "type": "string"
+    },
+    "service": {
+      "type": "string"
+    },
+    "names": {
+      "type": "string"
+    },
+    "addresses": {
+      "type": "string"
+    },
+    "seen_in_scan": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "provider",
+    "account",
+    "service",
+    "names",
+    "addresses",
+    "seen_in_scan"
+  ],
+  "additionalProperties": {
+    "type": "string"
+  }
+}

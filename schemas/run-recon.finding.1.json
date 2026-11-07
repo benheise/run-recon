@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tideline:schema:run-recon.finding/1",
+  "title": "run-recon finding",
+  "description": "One line of a <out>.<source>.txt finding file. Structured lines read '[seed] check [severity] key=value ... note=text'; tool output lines (nuclei, wpscan, content discovery) keep their text and have no fields.",
+  "x-tideline-schema": "run-recon.finding/1",
+  "x-minor": 0,
+  "type": "object",
+  "properties": {
+    "source": {
+      "type": "string",
+      "pattern": "^[a-z][a-z-]*$"
+    },
+    "seed": {
+      "type": "string"
+    },
+    "check": {
+      "type": "string"
+    },
+    "severity": {
+      "enum": [
+        "critical",
+        "high",
+        "medium",
+        "low",
+        "info",
+        "unknown"
+      ]
+    },
+    "host": {
+      "type": "string"
+    },
+    "fields": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "note": {
+      "type": "string"
+    },
+    "text": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "source",
+    "seed",
+    "check",
+    "severity",
+    "host",
+    "fields",
+    "note",
+    "text"
+  ],
+  "additionalProperties": false
+}

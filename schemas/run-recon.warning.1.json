@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tideline:schema:run-recon.warning/1",
+  "title": "run-recon warning",
+  "description": "One warning the run logged, in order, duplicates removed (run.json keeps the first 200).",
+  "x-tideline-schema": "run-recon.warning/1",
+  "x-minor": 0,
+  "type": "object",
+  "properties": {
+    "message": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "message"
+  ],
+  "additionalProperties": false
+}

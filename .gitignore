@@ -19,3 +19,13 @@ bench-out.csv*
 *.report.html
 *.tar.gz
 lab/targets-http.txt
+lab/targets-posture.txt
+lab/cloud.tfstate
+lab/cloudlist.yaml
+lab/brute-wordlist.txt
+lab/targets-discovery.txt
+lab/tls/
+lab/targets-tls.txt
+*.tideline.tar
+*.ship-state.json
+__pycache__/

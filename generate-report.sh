@@ -25,7 +25,8 @@
 #
 # Reads (when present, derived from <csv>): <csv>.nuclei.txt, .activescan.txt,
 #   .secrets.txt, .takeover.txt, .zone.txt, .origin.txt, .extras.txt, .favicon.txt, .buckets.txt, .cms.txt,
-#   .params.txt, .osint.txt, .virustotal.txt, .urlscan.txt, .social.txt,
+#   .params.txt, .osint.txt, .virustotal.txt, .urlscan.txt, .social.txt, .dnsposture.txt, .dnsposture.tsv,
+#   .cloud.txt, .tld-variants.txt, .vulnx.txt,
 #   .new-assets.txt, .edge.tsv, .cname.tsv, .zone-names.txt, .screenshots.tsv,
 #   .run.json, and the vuln join <csv>.vulns.csv (recon-db.sh vulns).
 # Requires: python3.  Exit 0 on success, 2 on bad input.
@@ -134,6 +135,7 @@ SEV_TAG   = re.compile(r'\[(critical|high|medium|low|info)\]', re.I)
 KIND_SEV = {
     "takeover": "high", "secrets": "high", "buckets": "medium",
     "origin": "info", "zone": "info", "extras": "info", "favicon": "info", "params": "info", "cms": "info",
+    "dnsposture": "info", "vulnx": "info", "cloud": "info", "tld-variants": "info",
     "osint": "info", "virustotal": "info", "urlscan": "info", "social": "info",
 }
 KIND_LABEL = {
@@ -141,7 +143,8 @@ KIND_LABEL = {
     "takeover": "Subdomain takeover", "secrets": "Exposed secret",
     "buckets": "Exposed cloud bucket", "origin": "Exposed origin",
     "zone": "DNS zone exposure", "zonecheck": "DNS zone check", "edgehint": "Edge fingerprint",
-    "originprotected": "Protected origin",
+    "originprotected": "Protected origin", "dnsposture": "Email / DNS posture", "vulnx": "Product advisory (vulnx)",
+    "cloud": "Cloud inventory", "tld-variants": "TLD variant", "scope": "Scope",
     "http": "HTTP", "extras": "security.txt", "extrasinfo": "Web server note", "favicon": "Favicon pivot",
     "tls": "TLS / certificate",
     "params": "Parameterized URL", "cms": "CMS / tech", "osint": "OSINT",
@@ -149,7 +152,7 @@ KIND_LABEL = {
     "vuln": "Known CVE (NVD/KEV)",
 }
 # evidence of a check that ran, not a finding: kept out of the severity counts
-EVIDENCE_KINDS = {"zonecheck", "edgehint", "extrasinfo", "originprotected"}
+EVIDENCE_KINDS = {"zonecheck", "edgehint", "extrasinfo", "originprotected", "scope"}
 
 def sev_from_nuclei(text):
     m = re.search(r'\[(critical|high|medium|low|info|unknown)\]', text, re.I)
@@ -175,7 +178,10 @@ def new_host(seed=""):
             "tls_flags": set(), "tls_version": "", "tls_cipher": "", "seed": seed, "findings": [],
             "title": "", "_tlen": 10 ** 9, "webserver": "", "ipv6": set(), "cert_not_after": "",
             "cert_issuer": "", "cpe": set(), "cloud": "", "rdap_org": "", "geo": "", "in_csv": True,
-            "http_root": {}, "_hrk": (9, 9, 10 ** 9), "hflags": {}, "cookie_issues": set(), "auths": set()}
+            "http_root": {}, "_hrk": (9, 9, 10 ** 9), "hflags": {}, "cookie_issues": set(), "auths": set(),
+            # run-recon 1.20: the TLS version matrix, the leaf certificate, login forms
+            "tls_supported": "", "tls_weak_cipher": "", "cert_key": "", "cert_sig_alg": "",
+            "cert_not_before": "", "logins": {}}
 # 1.19 HTTP columns that describe the site: taken from its root row (https preferred)
 HTTP_HOST_COLS = ("content_type", "missing_sec_headers", "hsts_max_age", "alt_svc", "powered_by",
                   "favicon_mmh3", "favicon_md5", "ptr", "robots", "security_txt")
@@ -205,8 +211,11 @@ try:
             if row.get("title") and len(u) < d["_tlen"]:
                 d["title"], d["_tlen"] = row["title"], len(u)
             for k in ("webserver", "tls_version", "tls_cipher", "cert_not_after", "cert_issuer",
-                      "cloud", "rdap_org", "geo"):
+                      "cloud", "rdap_org", "geo", "tls_supported", "tls_weak_cipher", "cert_key",
+                      "cert_sig_alg", "cert_not_before"):
                 if row.get(k): d[k] = row[k]
+            if row.get("login_form"):     # the page the row ends on (after its redirects) -> form target
+                d["logins"][u] = (row.get("final_url") or u, row["login_form"])
             for fl in (row.get("tls_flags") or "").split(";"):
                 fl = fl.strip()
                 if fl: d["tls_flags"].add(fl)
@@ -246,7 +255,8 @@ extra_names = {}   # names with findings but no CSV row (not live): host -> dict
 ORIGIN_FINDINGS = ("origin-exposed", "origin-alternate", "origin-candidate")
 
 for kind in ["nuclei", "activescan", "takeover", "secrets", "buckets", "zone", "origin", "extras", "favicon",
-             "params", "cms", "osint", "virustotal", "urlscan", "social"]:
+             "params", "cms", "osint", "virustotal", "urlscan", "social", "dnsposture", "vulnx", "cloud",
+             "tld-variants", "scope"]:
     path = f"{csv_path}.{kind}.txt"
     if not os.path.isfile(path):
         continue
@@ -299,7 +309,7 @@ for kind in ["nuclei", "activescan", "takeover", "secrets", "buckets", "zone", "
                 # use the URL's host; for OSINT/reference findings (social account
                 # links, VT/passive-DNS, etc.) tie to the seed domain/brand instead.
                 TARGET_URL_KINDS = {"nuclei", "activescan", "secrets", "takeover", "zone", "extras", "favicon",
-                                    "buckets", "origin", "params", "cms", "urlscan"}
+                                    "buckets", "origin", "params", "cms", "urlscan", "dnsposture", "cloud", "tld-variants"}
                 uh = host_of(line)
                 if not uh:   # DNS findings name the affected host as host=<name>
                     _hm = re.search(r'\bhost=([A-Za-z0-9_.-]+)', line)
@@ -316,18 +326,39 @@ for kind in ["nuclei", "activescan", "takeover", "secrets", "buckets", "zone", "
                 # attach to the host card; a name that is not live still gets a card
                 if h in hosts:
                     hosts[h]["findings"].append(f)
-                elif h and kind_eff not in EVIDENCE_KINDS and kind in ("takeover", "zone", "origin"):
+                elif h and kind_eff not in EVIDENCE_KINDS and kind in ("takeover", "zone", "origin", "dnsposture"):
                     extra_names.setdefault(h, {"seed": seed, "findings": []})["findings"].append(f)
     except Exception as e:
         sys.stderr.write(f"[report] warning: {path}: {e}\n")
 
 # --- TLS posture (from the CSV) as findings, expiry graded by days left -----------
 TLS_FLAG_SEV = {"WeakCipher": "high", "CertRevoked": "high", "CertUntrusted": "medium",
-                "WeakTLS": "medium", "SelfSigned": "medium", "CertNameMismatch": "medium"}
+                "WeakTLS": "medium", "SelfSigned": "medium", "CertNameMismatch": "medium",
+                "WeakKey": "medium", "WeakSig": "medium", "CertNotYetValid": "medium", "DefaultCert": "medium"}
 TLS_FLAG_DESC = {"WeakTLS": "obsolete TLS version supported (< TLS 1.2)", "WeakCipher": "weak cipher offered",
                  "SelfSigned": "self-signed certificate", "CertNameMismatch": "certificate name mismatch",
                  "CertUntrusted": "certificate chain not trusted by the system trust store",
-                 "CertRevoked": "revoked certificate"}
+                 "CertRevoked": "revoked certificate", "WeakKey": "weak certificate key",
+                 "WeakSig": "weak certificate signature", "CertNotYetValid": "certificate not valid yet",
+                 "DefaultCert": "a vendor's or OpenSSL's default certificate is still in place"}
+_OLD_VERSIONS = ("SSL 3.0", "TLS 1.0", "TLS 1.1")
+def tls_flag_text(fl, d):
+    # the flag's description with the detail run-recon 1.20 records (blank in older CSVs)
+    desc, ver = TLS_FLAG_DESC.get(fl, fl), d.get("tls_version") or "TLS"
+    sup = [v for v in (d.get("tls_supported") or "").split(";") if v in _OLD_VERSIONS]
+    if fl == "WeakTLS" and sup:
+        return "obsolete protocol versions accepted: " + ", ".join(sup)
+    if fl == "WeakCipher" and d.get("tls_weak_cipher"):
+        v, _, s = d["tls_weak_cipher"].partition(":")
+        return "weak cipher accepted: %s (%s)" % (s or v, v if s else ver)
+    if fl == "WeakKey" and d.get("cert_key"):
+        return "%s (%s)" % (desc, d["cert_key"])
+    if fl == "WeakSig" and d.get("cert_sig_alg"):
+        return "%s (%s)" % (desc, d["cert_sig_alg"])
+    if fl == "CertNotYetValid" and d.get("cert_not_before"):
+        dt = parse_dt(d["cert_not_before"])
+        return "%s (valid from %s)" % (desc, dt.strftime("%Y-%m-%d %H:%M UTC") if dt else d["cert_not_before"])
+    return "%s (%s)" % (desc, ver)
 def days_left(d):
     dt = parse_dt(d.get("cert_not_after"))
     return None if dt is None else (dt - ref_time).total_seconds() / 86400.0
@@ -348,8 +379,10 @@ for _h, _d in hosts.items():
         if _fl in ("CertExpiring", "CertExpired", "Wildcard"):
             continue   # expiry is graded below; a wildcard certificate is an attribute
         _sev = TLS_FLAG_SEV.get(_fl, "info")
+        if _fl == "WeakTLS" and "SSL 3.0" in (_d.get("tls_supported") or "").split(";"):
+            _sev = "high"            # SSL 3.0 (POODLE): WebInventory grades WeakTLS:SSL3 critical too
         _f = {"kind": "tls", "sev": _sev, "host": _h, "seed": _d.get("seed", ""),
-              "text": "%s (%s)" % (TLS_FLAG_DESC.get(_fl, _fl), _d.get("tls_version") or "TLS")}
+              "text": tls_flag_text(_fl, _d)}
         findings.append(_f); _d["findings"].append(_f)
         sev_counts[_sev] = sev_counts.get(_sev, 0) + 1
         kind_counts["tls"] = kind_counts.get("tls", 0) + 1
@@ -375,9 +408,16 @@ def _add(kind, sev, h, d, text):
     sev_counts[sev] = sev_counts.get(sev, 0) + 1
     kind_counts[kind] = kind_counts.get(kind, 0) + 1
 for _h, _d in hosts.items():
+    _forms = set()
     for _u in sorted(_d["hflags"].get("CleartextAuth", ())):
+        if _u in _d["logins"]:
+            _forms.add(_d["logins"][_u])   # one finding per (login page, form target)
+            continue
         _realm = next((a for (uu, a) in sorted(_d["auths"]) if uu == _u), "basic auth")
         _add("http", "medium", _h, _d, "credentials sent in cleartext: %s on %s (use HTTPS)" % (_realm, _u))
+    for _page, _tgt in sorted(_forms):
+        _add("http", "medium", _h, _d, "login form sends the password in cleartext: %s posts to %s (use HTTPS)"
+             % (_page, _tgt))
     _pl = sorted(_d["hflags"].get("PlainHttp", ()))
     if _pl:
         _add("http", "low", _h, _d, "served over plain HTTP without a redirect to HTTPS: %s%s"
@@ -542,11 +582,25 @@ elif shots_dir and os.path.isdir(shots_dir):
                                "empty image (0 bytes)" if empty else "")
                 break
 
+# --- field-by-field changes vs the previous run (<csv>.delta.tsv, --monitor) ----------
+delta = []
+if os.path.isfile(csv_path + ".delta.tsv"):
+    try:
+        with open(csv_path + ".delta.tsv", encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                f = line.rstrip("\n").split("\t")
+                if i and len(f) >= 6:
+                    delta.append({"change": f[0], "seed": f[1], "service": f[2], "field": f[3],
+                                  "old": clean(f[4]), "new": clean(f[5])})
+    except Exception as e:
+        sys.stderr.write(f"[report] warning: delta: {e}\n")
+
 # --- HTML ------------------------------------------------------------------
 now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 sev_color = {"critical": "#8b0000", "high": "#d7301f", "medium": "#ef8a00",
              "low": "#c9a400", "info": "#4a7fb5"}
-highlight_kinds = {"nuclei", "takeover", "secrets", "buckets", "origin", "zone", "http", "extras", "tls", "vuln"}
+highlight_kinds = {"nuclei", "takeover", "secrets", "buckets", "origin", "zone", "http", "extras", "tls", "vuln",
+                   "dnsposture", "cloud"}
 total_findings = sum(1 for f in findings if f["kind"] not in EVIDENCE_KINDS)
 top_asns = {}
 for h in hosts.values():
@@ -631,13 +685,21 @@ if run:
                f'tools: {esc(_tv)} (lab-verified: {esc(run.get("lab_verified", ""))})<br>'
                f'resolvers: {esc(_res.get("file") or "system")} ({esc(_res.get("count", 0))}), check {esc(_res.get("check", "not run"))}'
                + (f' &middot; proxy {esc(run.get("proxy"))}' if run.get("proxy") else "") )
+    _sc = run.get("scope") or {}
+    if _sc:
+        _hb = sum((_sc.get("held_back") or {}).values())
+        out.append(f'<br>scope: <b>{esc(_sc.get("file", ""))}</b> (sha256 {esc((_sc.get("sha256") or "")[:16])}&hellip;,'
+                   f' {esc(_sc.get("entries", 0))} entries) &middot; seeds in scope <b>{esc(_sc.get("seeds_in", 0))}</b>'
+                   + (f', skipped {esc(_sc.get("seeds_out", 0) + _sc.get("seeds_invalid", 0))}' if _sc.get("dropped") else "")
+                   + f' &middot; held back (not contacted) <b>{esc(_hb)}</b>')
     _w = run.get("warnings") or []
     if _w:
         out.append(f'<details><summary>{len(_w)} warning(s) during the run</summary><ul>'
                    + "".join(f"<li>{esc(x)}</li>" for x in _w) + "</ul></details>")
     out.append('</div>')
 out.append("""  <div class="tabs mut" style="margin-top:8px">
-    <a href="#summary">Summary</a><a href="#findings">Findings</a><a href="#names">Names</a><a href="#hosts">Hosts</a>
+    <a href="#summary">Summary</a><a href="#findings">Findings</a>""" + ('<a href="#changes">Changes</a>' if delta else "")
+           + """<a href="#names">Names</a><a href="#hosts">Hosts</a>
   </div>
 </header>""")
 if no_results:
@@ -665,6 +727,12 @@ if top_asns:
 if new_assets:
     out.append(f'<div class="mut" style="margin-top:8px">New assets vs previous run: '
                f'<b style="color:#cdd9e5">{len(new_assets)}</b></div>')
+if delta:
+    _dc = {k: sum(1 for d in delta if d["change"] == k) for k in ("new", "removed")}
+    _ds = len({(d["seed"], d["service"]) for d in delta if d["change"] == "changed"})
+    out.append(f'<div class="mut" style="margin-top:8px">Services vs previous run: <b style="color:#cdd9e5">{_dc["new"]}</b> new,'
+               f' <b style="color:#cdd9e5">{_dc["removed"]}</b> removed, <b style="color:#cdd9e5">{_ds}</b> changed'
+               f' (<a href="#changes">changes</a>)</div>')
 # DNS zones checked (--zone-exposure): each zone's result, findings or not
 zrows = [f for f in findings if f["kind"] in ("zone", "zonecheck")]
 if zrows:
@@ -684,11 +752,41 @@ if zrows:
                    'listed, not scanned: ' + ", ".join(esc(n) for n, _, _ in zone_outside[:40]) +
                    (" ..." if len(zone_outside) > 40 else "") + '</div>')
 
+# Email and DNS posture (--dns-posture): one row per name checked, findings or not
+_dp = f"{csv_path}.dnsposture.tsv"
+if os.path.isfile(_dp):
+    try:
+        with open(_dp, newline="", encoding="utf-8", errors="replace") as fh:
+            dprows = list(csv.DictReader(fh, delimiter="\t"))
+    except Exception:
+        dprows = []
+    if dprows:
+        nfind = {}
+        for f in findings:
+            if f["kind"] == "dnsposture":
+                nfind.setdefault(f["host"], []).append(f)
+        out.append('<h3 style="font-size:15px;margin-top:22px">Email and DNS posture</h3><div class="tbl"><table><thead><tr>'
+                   '<th>Name</th><th>MX</th><th>SPF</th><th>DMARC</th><th>MTA-STS</th><th>TLS-RPT</th><th>CAA</th>'
+                   '<th>Name servers</th><th>Findings</th></tr></thead><tbody>')
+        for r in dprows:
+            n = (r.get("name") or "").lower()
+            fs = sorted(nfind.get(n, []), key=lambda f: SEV_RANK.get(f["sev"], 9))
+            worst = badge(fs[0]["sev"]) + " " if fs else ""
+            spf = r.get("spf_all") or ("-" if (r.get("spf") or "-") == "-" else (r.get("spf") or ""))
+            out.append(f'<tr><td>{esc(n)}{" <span class=mut>(zone)</span>" if r.get("role") == "apex" else ""}</td>'
+                       f'<td class="detail">{esc(r.get("mx") or "")}</td><td>{esc(spf)}</td>'
+                       f'<td>{esc(r.get("dmarc") or "")}</td><td>{esc(r.get("mta_sts") or "")}</td>'
+                       f'<td>{esc(r.get("tls_rpt") or "")}</td><td class="detail">{esc(r.get("caa") or "")}</td>'
+                       f'<td class="detail">{esc(r.get("ns") or "")}</td>'
+                       f'<td>{worst}{len(fs) if fs else "-"}</td></tr>')
+        out.append('</tbody></table></div>')
+
 # ---- Findings table (highlighted first: vulns/weaknesses/misconfigs) -------
 out.append('<h2 id="findings">Findings</h2>')
 hi = [f for f in findings if f["kind"] in highlight_kinds]
 # within a severity: exposure findings first, certificate hygiene last
-KIND_ORDER = {k: i for i, k in enumerate(["vuln", "nuclei", "secrets", "origin", "zone", "takeover", "http", "buckets", "extras", "tls"])}
+KIND_ORDER = {k: i for i, k in enumerate(["vuln", "nuclei", "secrets", "origin", "zone", "takeover", "dnsposture", "http",
+                                         "buckets", "extras", "tls"])}
 hi.sort(key=lambda f: (SEV_RANK.get(f["sev"], 9), KIND_ORDER.get(f["kind"], 99), f["host"]))
 if hi:
     out.append('<p class="mut">Vulnerabilities, weaknesses and misconfigurations, most severe first.</p>')
@@ -733,6 +831,20 @@ if ctx:
     out.append('<p class="mut" style="margin-top:14px">Context / OSINT gathered: ' +
                " &middot; ".join(f'{esc(KIND_LABEL.get(k,k))} <b style="color:#cdd9e5">({v})</b>'
                                  for k, v in sorted(ctx.items(), key=lambda kv: -kv[1])) + "</p>")
+
+# ---- Changes vs the previous run -------------------------------------------------
+if delta:
+    out.append('<h2 id="changes">Changes since the previous run</h2>')
+    out.append('<p class="mut">Per service (scheme://host:port): new and removed under the seeds both runs covered, '
+               'and each field that changed. A field is compared only when both runs collected it.</p>')
+    out.append('<table><tr><th>Change</th><th>Service</th><th>Field</th><th>Before</th><th>Now</th></tr>')
+    _ord = {"removed": 0, "changed": 1, "new": 2}
+    for d in sorted(delta, key=lambda d: (_ord.get(d["change"], 3), d["service"], d["field"]))[:500]:
+        out.append(f'<tr><td>{esc(d["change"])}</td><td>{esc(d["service"])}</td><td>{esc(d["field"])}</td>'
+                   f'<td>{esc(d["old"])}</td><td>{esc(d["new"])}</td></tr>')
+    out.append('</table>')
+    if len(delta) > 500:
+        out.append(f'<div class="mut">... and {len(delta) - 500} more in {esc(os.path.basename(csv_path))}.delta.tsv</div>')
 
 # ---- Name inventory --------------------------------------------------------------
 out.append('<h2 id="names">Names</h2>')
@@ -830,6 +942,8 @@ for h in card_names:
             et = expiry_text(d) or ("expires " + d["cert_not_after"])
             tl += f' &middot; <span class="{"pill bad" if dl is not None and dl < 30 else ""}">{esc(et)}</span>'
         if "Wildcard" in d["tls_flags"]: tl += " &middot; wildcard"
+        if d.get("cert_key"): tl += " &middot; " + esc(d["cert_key"])
+        if d.get("tls_supported"): tl += " &middot; accepts " + esc(d["tls_supported"].replace(";", ", "))
         meta2.append(f'<span>TLS <b>{tl}</b></span>')
     if e.get("cname"):
         hops = " &rarr; ".join(esc(x) for x in [h] + [y for y in e["cname"].split(">") if y])
@@ -898,12 +1012,13 @@ for h in card_names:
 # ---- footer: raw artifact links --------------------------------------------
 arts = []
 for kind in ["nuclei", "activescan", "takeover", "secrets", "buckets", "zone", "origin", "extras", "favicon",
-             "params", "cms", "osint", "virustotal", "urlscan", "social", "new-assets"]:
+             "params", "cms", "osint", "virustotal", "urlscan", "social", "dnsposture", "cloud", "tld-variants",
+             "vulnx", "scope", "new-assets"]:
     p = f"{csv_path}.{kind}.txt"
     if os.path.isfile(p):
         arts.append(f'<a href="{esc(rel_out(p))}">{esc(kind)}</a>')
 for suf, lab in ((".edge.tsv", "edge/origin"), (".cname.tsv", "CNAMEs"), (".zone-names.txt", "zone names"),
-                 (".screenshots.tsv", "screenshot list"), (".run.json", "run record")):
+                 (".screenshots.tsv", "screenshot list"), (".delta.tsv", "changes"), (".run.json", "run record")):
     if os.path.isfile(csv_path + suf):
         arts.append(f'<a href="{esc(rel_out(csv_path + suf))}">{esc(lab)}</a>')
 arts.append(f'<a href="{esc(rel_out(csv_path))}">CSV</a>')

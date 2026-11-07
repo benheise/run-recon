@@ -17,6 +17,11 @@
 #                for every path (the catch-all fixture for the 404 probe)
 #   :8080        published on LAB_PROTECTED_IP:80 (origin.spa.test): 403 for every request,
 #                the "origin locked to its CDN" fixture for --origin (origin-protected)
+# Redirect and login-form fixtures (run-recon 1.20, `bench-run-recon.sh http`):
+#   redir.test   http:// -> 301 https://redir.test/ -> 302 /login: a password form whose
+#                action is http:// (cleartext from an HTTPS page); /login links /old, which
+#                leaves the host (301 elsewhere.test: listed, not followed)
+#   plainlogin.redir.test   a password form on a plain-HTTP page (CleartextAuth)
 # The basic-auth password is a throwaway lab value ("lab-only-not-a-secret").
 {
 	local_certs
@@ -77,12 +82,69 @@ http://ci.test, https://ci.test {
 	reverse_proxy jenkins:8080
 }
 
+# --- redirect chains and login forms (--extras follows the same-host hops) ---
+http://redir.test {
+	redir https://redir.test{uri} 301
+}
+https://redir.test {
+	handle / {
+		redir * /login 302
+	}
+	handle /old {
+		redir https://elsewhere.test/ 301
+	}
+	handle /login {
+		header Content-Type "text/html; charset=utf-8"
+		respond `<!doctype html><html><head><title>Lab login</title></head><body>
+<form method="post" action="http://redir.test/session"><input name="user"><input type="password" name="pass"></form>
+<a href="/old">old portal</a></body></html>
+` 200
+	}
+	handle {
+		respond "redir lab" 200
+	}
+}
+http://plainlogin.redir.test {
+	header Content-Type "text/html; charset=utf-8"
+	respond `<!doctype html><html><head><title>Plain login</title></head><body>
+<form method="post" action="/login"><input name="user"><input type="password" name="pass"></form></body></html>
+` 200
+}
+
 # --- zone-fixture names with a role of their own ---
 http://vpn-legacy.walk.test {
 	basicauth bcrypt "Legacy VPN" {
 		vpnuser $2a$14$dhDYrJi/7xGUNdoaC5R...6fFGmjdchIglc1nhldDum/yd9qOSCgK
 	}
 	respond "legacy VPN portal" 200
+}
+
+# --- an alternate port (--ports): nginx.test also answers on 8443 (127.0.0.1:8443) ---
+https://nginx.test:8443 {
+	respond "lab alternate-port service" 200
+}
+
+# --- MTA-STS policies (--dns-posture): posture.test in testing mode, listing only one of its
+# two MX hosts; good.posture.test enforced and complete ---
+https://mta-sts.posture.test {
+	handle /.well-known/mta-sts.txt {
+		header Content-Type "text/plain; charset=utf-8"
+		respond `version: STSv1
+mode: testing
+mx: mx1.posture.test
+max_age: 86400
+` 200
+	}
+}
+https://mta-sts.good.posture.test {
+	handle /.well-known/mta-sts.txt {
+		header Content-Type "text/plain; charset=utf-8"
+		respond `version: STSv1
+mode: enforce
+mx: mx1.posture.test
+max_age: 604800
+` 200
+	}
 }
 
 # --- the protected origin (origin.spa.test -> LAB_PROTECTED_IP:80 -> :8080) ---

@@ -124,7 +124,7 @@ mk httpx <<'EOF'
 printf '%s ' "$@" >> "$MOCKLOG/httpx.args"; echo >> "$MOCKLOG/httpx.args"
 # Reject unknown flags the way ProjectDiscovery httpx (goflags) does -- this is
 # what catches an invalid flag like -a that silently blanks all enrichment.
-__vf=" -timeout -rl -rate-limit -r -resolvers -l -list -o -output -srd -store-response-dir -mc -match-code -t -threads -retries -H -header -p -ports -delay -proxy -http-proxy -ho -headless-options -hash -st -screenshot-timeout -path "
+__vf=" -timeout -rl -rate-limit -r -resolvers -l -list -o -output -srd -store-response-dir -mc -match-code -t -threads -retries -H -header -p -ports -delay -proxy -http-proxy -ho -headless-options -hash -st -screenshot-timeout -path -er -extract-regex "
 __bf=" -silent -json -sc -status-code -cl -content-length -ct -content-type -title -td -tech-detect -server -web-server -ip -cname -asn -cdn -probe -ss -screenshot -system-chrome -nc -no-color -version -h -help -fr -follow-redirects -favicon -location -jarm -method -websocket -nfs -no-fallback-scheme -nf -no-fallback -esb -exclude-screenshot-bytes -ehb -exclude-headless-body -irh -include-response-header -irr -include-response -irrb -include-response-base64 "
 __A=("$@"); __i=0
 while [ $__i -lt ${#__A[@]} ]; do
@@ -239,6 +239,16 @@ if [ "$mode" = json ]; then
       : > "$MOCKLOG/httpx.flaky"; continue
     fi
     [ -n "${MOCK_HTTPX_DEAD:-}" ] && [ "$u" = "$MOCK_HTTPX_DEAD" ] && continue
+    # MOCK_HTTPX_REDIRECT="URL>LOCATION": that URL answers 302 (1.20 redirect hops);
+    # MOCK_HTTPX_LOGIN=URL: that URL is a login page whose form posts over http:// (-er matches)
+    if [ -n "${MOCK_HTTPX_REDIRECT:-}" ] && [ "$u" = "${MOCK_HTTPX_REDIRECT%%>*}" ]; then
+      printf '{"input":"%s","url":"%s","status_code":302,"location":"%s","content_length":0,"webserver":"nginx","title":"","host":"93.184.216.34","header":{"location":"%s"}}\n' "$u" "$u" "${MOCK_HTTPX_REDIRECT#*>}" "${MOCK_HTTPX_REDIRECT#*>}"
+      continue
+    fi
+    if [ -n "${MOCK_HTTPX_LOGIN:-}" ] && [ "$u" = "$MOCK_HTTPX_LOGIN" ]; then
+      printf '{"input":"%s","url":"%s","status_code":200,"content_length":50,"webserver":"nginx","title":"Login","host":"93.184.216.34","content_type":"text/html","header":{"content_type":"text/html"},"extracts":{"re":["<form method=\\"post\\" action=\\"http://example.com/session\\">","<input type=\\"password"]}}\n' "$u" "$u"
+      continue
+    fi
     if [ "$irh" = 1 ]; then   # 1.19 enrichment: the same request's headers, body hash and time
       printf '{"input":"%s","url":"%s","status_code":200,"content_length":100,"webserver":"nginx","title":"Home, %sMain%s","tech":["nginx","PHP"],"host":"93.184.216.34","time":"12.5ms","content_type":"text/html","hash":{"body_sha256":"%064d"},"header":{"server":"nginx","content_type":"text/html; charset=utf-8","x_frame_options":"DENY","set_cookie":"sessionid=abc; Path=/; HttpOnly, theme=dark; Expires=Thu, 01 Jan 2030 00:00:00 GMT; Secure; HttpOnly","alt_svc":"h3=\\\":443\\\"; ma=86400","x_powered_by":"PHP/8.1.2"}}\n' "$u" "$u" "$esc" "$esc" 7
     else
@@ -299,6 +309,40 @@ for a in "$@"; do
 done
 # reverse DNS (-x IP): public addresses and the 10.0.0.0/8 test address have a PTR
 _px=0; for a in "$@"; do if [ "$_px" = 1 ]; then case "$a" in 93.184.216.34) echo "edge-93-184-216-34.example.net.";; 10.0.0.9) echo "db01.corp.example.";; esac; exit 0; fi; [ "$a" = "-x" ] && _px=1; done
+# --dns-posture fixtures for example.com (MOCK_POSTURE=bad|lookups|multi), answered in dig's
+# full format with a status header:
+#   NS ns1 (authoritative), ns-gone.gone-dns.net (domain gone: dangling), ns-lame (REFUSED)
+#   MX mx1 (exists), mx-old.gone-mail.net (domain gone); SPF include: an existing record and a
+#   domain that does not exist, ending ?all; DMARC quarantine pct=50 without rua; MTA-STS
+#   enforce listing mx1 only (curl mock); no TLS-RPT; no CAA
+if [ -n "${MOCK_POSTURE:-}" ] && [ "$comments" = 1 ]; then
+  st=NOERROR; aa=""; out=()
+  a(){ out+=("$1. 60 IN $2 $3"); }
+  case "$typ:$q" in
+    SOA:example.com) if [ "$srv" = 192.0.2.54 ]; then st=REFUSED; else aa=" aa"; a example.com SOA "ns1.example.com. hostmaster.example.com. 1 7200 3600 1209600 60"; fi;;
+    SOA:gone-dns.net|SOA:gone-mail.net|SOA:gone-spf.net) st=NXDOMAIN;;
+    NS:example.com) a example.com NS ns1.example.com.; a example.com NS ns-gone.gone-dns.net.; a example.com NS ns-lame.example.com.;;
+    A:ns1.example.com) a "$q" A 192.0.2.53;;    A:ns-lame.example.com) a "$q" A 192.0.2.54;;
+    A:mx1.example.com) a "$q" A 192.0.2.25;;    A:mta-sts.example.com) a "$q" A 192.0.2.80;;
+    A:ns-gone.gone-dns.net|AAAA:ns-gone.gone-dns.net|A:mx-old.gone-mail.net|AAAA:mx-old.gone-mail.net) st=NXDOMAIN;;
+    MX:example.com) a example.com MX "10 mx1.example.com."; a example.com MX "20 mx-old.gone-mail.net.";;
+    TXT:example.com)
+      case "$MOCK_POSTURE" in
+        lookups) a example.com TXT '"v=spf1 include:i1.example.com include:i2.example.com include:i3.example.com include:i4.example.com include:i5.example.com include:i6.example.com" " include:i7.example.com include:i8.example.com include:i9.example.com include:i10.example.com include:i11.example.com -all"';;
+        multi)   a example.com TXT '"v=spf1 -all"'; a example.com TXT '"v=spf1 mx -all"';;
+        *)       a example.com TXT '"v=spf1 include:_spf.example.com include:gone-spf.net ?all"';;
+      esac;;
+    TXT:_spf.example.com) a "$q" TXT '"v=spf1 ip4:192.0.2.0/24 -all"';;
+    TXT:i*.example.com) a "$q" TXT '"v=spf1 -all"';;
+    TXT:gone-spf.net) st=NXDOMAIN;;
+    TXT:_dmarc.example.com) a "$q" TXT '"v=DMARC1; p=quarantine; pct=50"';;
+    TXT:_mta-sts.example.com) a "$q" TXT '"v=STSv1; id=20261101"';;
+  esac
+  echo ";; ->>HEADER<<- opcode: QUERY, status: $st, id: 4242"
+  echo ";; flags: qr rd$aa; QUERY: 1, ANSWER: ${#out[@]}, AUTHORITY: 0, ADDITIONAL: 1"
+  [ "${#out[@]}" -gt 0 ] && printf '%s\n' "${out[@]}"
+  exit 0
+fi
 # resolver preflight (+noall +comments): MOCK_DIG_STATUS sets the reply status
 [ "$comments" = 1 ] && echo ";; ->>HEADER<<- opcode: QUERY, status: ${MOCK_DIG_STATUS:-NOERROR}, id: 4242"
 # a seed that is a CNAME to a name that does not exist (the resolve-gate warning)
@@ -608,7 +652,7 @@ EOF
 mk notify <<'EOF'
 #!/usr/bin/env bash
 printf '%s ' "$@" >> "$MOCKLOG/notify.args"; echo >> "$MOCKLOG/notify.args"
-cat >/dev/null
+cat > "$MOCKLOG/notify.stdin"
 EOF
 
 # --- passive subs (findomain) + GitHub mining + cloud buckets + resolvers ---
@@ -708,7 +752,7 @@ EOF
 mk httpx-toolkit <<'EOF'
 #!/usr/bin/env bash
 printf '%s ' "$@" >> "$MOCKLOG/httpx-toolkit.args"; echo >> "$MOCKLOG/httpx-toolkit.args"
-__vf=" -timeout -rl -rate-limit -r -resolvers -l -list -o -output -srd -store-response-dir -mc -match-code -t -threads -retries -H -header -p -ports -delay -proxy -http-proxy -ho -headless-options -hash -st -screenshot-timeout -path "
+__vf=" -timeout -rl -rate-limit -r -resolvers -l -list -o -output -srd -store-response-dir -mc -match-code -t -threads -retries -H -header -p -ports -delay -proxy -http-proxy -ho -headless-options -hash -st -screenshot-timeout -path -er -extract-regex "
 __bf=" -silent -json -sc -status-code -cl -content-length -ct -content-type -title -td -tech-detect -server -web-server -ip -cname -asn -cdn -probe -ss -screenshot -system-chrome -nc -no-color -version -h -help -fr -follow-redirects -favicon -location -jarm -method -websocket -nfs -no-fallback-scheme -nf -no-fallback -esb -exclude-screenshot-bytes -ehb -exclude-headless-body -irh -include-response-header -irr -include-response -irrb -include-response-base64 "
 __A=("$@"); __i=0
 while [ $__i -lt ${#__A[@]} ]; do
@@ -1190,7 +1234,11 @@ run_case monitor --monitor --monitor-prev "$PREVCSV" --notify
 assert_grep  "$CSV.new-assets.txt" 'gau-path'                         "new URL flagged as a new asset vs prior CSV"
 refute_grep  "$CSV.new-assets.txt" 'OLD-ONLY'                         "prior-only URL not reported as new"
 assert_grep  "$ERRLOG" 'new asset'                                    "monitoring summary reports new assets"
-assert_grep  "$MOCKLOG/notify.args" -- ''                            "notify invoked on the new-asset list"
+assert_grep  "$MOCKLOG/notify.args" -- '^-silent -bulk $'               "notify sends one message per run (-bulk)"
+assert_grep  "$MOCKLOG/notify.stdin" '^run-recon: [0-9]+ new asset\(s\) vs prev\.csv$' "the message opens with a summary line"
+assert_grep  "$MOCKLOG/notify.stdin" 'gau-path'                       "...and lists the new assets"
+NOTIFY_CONFIG="$TMP/notify.yaml" run_case monitor_cfg --monitor --monitor-prev "$PREVCSV" --notify
+assert_grep  "$MOCKLOG/notify.args" -- "-pc $TMP/notify\.yaml"          "NOTIFY_CONFIG picks the providers (-pc)"
 
 # --- 32) --all: umbrella enables the full discovery + defensive set ---------
 section "--all (umbrella flag)"
@@ -1583,10 +1631,12 @@ run_case tls --tls
 assert_grep "$MOCKLOG/tlsx.args" -- '-tls-version'                "tlsx invoked with -tls-version (posture mode)"
 assert_grep "$CSV" ',TLS 1.3,TLS_AES_256_GCM_SHA384,'             "posture joined into the CSV for live https hosts"
 assert_grep "$CSV" 'tls_version,tls_cipher,cert_not_after,cert_issuer,tls_flags' "CSV header carries the 5 TLS columns"
-# --tls-full adds the enumeration flags
+assert_grep "$MOCKLOG/tlsx.args" -- '-wildcard-cert -cert -silent' "posture asks tlsx for the leaf certificate (-cert, 1.20)"
+# --tls-full / --tls-enum: the version matrix is run-recon's own probe (tls_enum_probe), not
+# tlsx -version-enum / -cipher-enum; it only contacts addresses tlsx reported (the mock reports none)
 run_case tlsfull --tls-full
-assert_grep "$MOCKLOG/tlsx.args" -- '-version-enum'               "--tls-full enables -version-enum"
-assert_grep "$MOCKLOG/tlsx.args" -- '-cipher-enum'                "--tls-full enables -cipher-enum"
+refute_grep "$MOCKLOG/tlsx.args" -- '-version-enum|-cipher-enum'  "--tls-full no longer runs tlsx's enumeration"
+assert_grep "$ERRLOG" 'TLS version matrix \+ weak-cipher probe'     "--tls-full runs the version-matrix stage"
 
 # C) report surfaces TLS flags as findings
 section "TLS posture: report surfaces tls_flags as findings"
@@ -2041,9 +2091,9 @@ PSQLEOF
 chmod +x "$MOCKBIN/psql"
 export MOCK_HTTPX_DEAD="https://example.com/katana-path"
 run_case noneg_db --db
-assert_grep   "$MOCKLOG/psql.args" "'httpx_json_v2','https://example\.com/" "--db: enrichment records that came back are cached (key httpx_json_v2: records cached before 1.19 have no headers)"
+assert_grep   "$MOCKLOG/psql.args" "'httpx_json_v3','https://example\.com/" "--db: enrichment records that came back are cached (key httpx_json_v3: records cached before 1.20 have no login-form matches)"
 assert_grep   "$MOCKLOG/psql.args" "'live_probe!neg'|'live_probe','"      "--db: the live probe keeps its cache entries (dead hosts may be negative-cached)"
-refute_grep   "$MOCKLOG/psql.args" "\\('httpx_json_v2!neg','"                  "--db: a URL with no record is NOT negative-cached (retried next run, not blank for NEG_TTL)"
+refute_grep   "$MOCKLOG/psql.args" "\\('httpx_json_v3!neg','"                  "--db: a URL with no record is NOT negative-cached (retried next run, not blank for NEG_TTL)"
 unset MOCK_HTTPX_DEAD
 
 
@@ -2066,7 +2116,7 @@ assert_grep   "$MOCKLOG/katana.args" -- '-proxy http://127.0.0.1:8080' "katana's
 section "Batch 2: HTTP columns from the enrichment request (no extra traffic)"
 run_case http_cols
 assert_grep  "$MOCKLOG/httpx.args" -- '-tech-detect -web-server -irh -hash sha256 -nfs' "enrichment asks for headers and the body hash in the same request"
-assert_grep  "$CSV" '^seed_domain,url,host,.*,cpe,redirect_location,response_ms,body_sha256,content_type,powered_by,auth,cookies,cookie_issues,missing_sec_headers,hsts_max_age,alt_svc,http_flags,favicon_mmh3,favicon_md5,ptr,robots,security_txt.?$' "17 HTTP columns appended after cpe (existing positions unchanged)"
+assert_grep  "$CSV" '^seed_domain,url,host,.*,cpe,redirect_location,response_ms,body_sha256,content_type,powered_by,auth,cookies,cookie_issues,missing_sec_headers,hsts_max_age,alt_svc,http_flags,favicon_mmh3,favicon_md5,ptr,robots,security_txt,final_url,redirect_chain,login_form,tls_supported,tls_ciphers,tls_weak_cipher,cert_key,cert_sig_alg,cert_not_before.?$' "17 HTTP columns appended after cpe, then the 9 of 1.20 (existing positions unchanged)"
 assert_grep  "$CSV" ',https://example\.com/katana-path,.*,12,0{63}7,text/html,PHP/8\.1\.2,,sessionid;theme,sessionid:no-Secure,Content-Security-Policy;X-Content-Type-Options;Strict-Transport-Security,,"h3="":443""; ma=86400",,' "response time, body hash, content type, X-Powered-By, cookies and their flag gaps, missing headers, Alt-Svc"
 refute_grep  "$MOCKLOG/httpx.args" -- '-path |-favicon' "default run sends no favicon or well-known requests"
 
@@ -2116,9 +2166,9 @@ refute_grep  "$CSV" 'bak\$|\*\.bak'                                         "wil
 assert_grep  "$CSV.extras.txt" '^\[example\.com\] security-txt-expired \[low\] host=example\.com path=/\.well-known/security\.txt expires=2021-01-01T00:00:00Z' "expired security.txt -> security-txt-expired [low]"
 assert_grep  "$CSV.extras.txt" 'catch-all-200 \[info\] host=example\.com path=/rr-'  "random path answered 200 -> catch-all-200 [info]"
 assert_grep  "$CSV.extras.txt" 'error-page \[info\] host=example\.com status=200 server="nginx" title="Home" reveals="Apache/2\.4\.41 \(Ubuntu\)"' "error page reveals a version the Server header does not"
-assert_grep  "$CSV" ',-732438843,1e23ac45e53e0bd440ab397425229b87,,200 disallow=2 allow=0 sitemap=1,expired contact=mailto:security@example\.com expires=2021-01-01T00:00:00Z.?$' "favicon, robots and security.txt columns on the host's rows"
+assert_grep  "$CSV" ',-732438843,1e23ac45e53e0bd440ab397425229b87,,200 disallow=2 allow=0 sitemap=1,expired contact=mailto:security@example\.com expires=2021-01-01T00:00:00Z,{9}.?$' "favicon, robots and security.txt columns on the host's rows"
 MOCK_EXTRAS_NOSEC=1 run_case extras_nosec --extras
-assert_grep  "$CSV" ',missing.?$'                                           "no security.txt -> security_txt=missing"
+assert_grep  "$CSV" ',missing,{9}.?$'                                       "no security.txt -> security_txt=missing"
 refute_grep  "$CSV.extras.txt" 'security-txt'                             "a missing security.txt is a column value, not a finding"
 MOCK_EXTRAS_ICON='link' run_case extras_iconlink --extras
 assert_grep  "$MOCKLOG/httpx.args" -- '-l [^ ]*extras_icon_urls\.txt -silent -json -irrb' "an icon declared at another path is fetched in one follow-up pass"
@@ -2134,6 +2184,17 @@ refute_grep  "$MOCKLOG/httpx.args" -- '-favicon'                            "--e
 assert_grep  "$MOCKLOG/uncover.args" -- 'http\.favicon\.hash:-732438843'     "the locally computed mmh3 drives the favicon pivot"
 
 section "Batch 2: --favicon pivots on the favicon hash (uncover), hits feed --origin"
+mv "$MOCKBIN/uncover" "$MOCKBIN/uncover.keys"
+mk uncover <<'EOF'
+#!/usr/bin/env bash
+printf '%s ' "$@" >> "$MOCKLOG/uncover.args"; echo >> "$MOCKLOG/uncover.args"
+echo '[FTL] Could not run enumeration: [uncover:RUNTIME] agents [shodan] requires keys but no keys were found' >&2
+exit 1
+EOF
+run_case favnokeys --favicon
+assert_grep  "$ERRLOG" '--favicon: uncover has no API keys for its engines'  "uncover without keys: one clear warning (was silent)"
+if [ "$(grep -c 'uncover has no API keys' "$ERRLOG")" = 1 ]; then _pass "...said once, not per call"; else _fail "...said once, not per call"; fi
+mv "$MOCKBIN/uncover.keys" "$MOCKBIN/uncover"
 run_case favpivot --favicon --origin
 assert_grep  "$MOCKLOG/uncover.args" -- '-shodan http\.favicon\.hash:-123456 -fofa icon_hash="-123456" -censys services\.http\.response\.favicons\.md5_hash: "0123456789abcdef0123456789abcdef" -silent -duc -l 100' "favicon hash searched on Shodan/Fofa (mmh3) and Censys (MD5), no update check, capped"
 assert_grep  "$MOCKLOG/uncover.args" -- '-q ssl:"example\.com" -silent -duc' "certificate-name search kept, without uncover's update check"
@@ -2464,6 +2525,1228 @@ printf '%s ' "$@" >> "$MOCKLOG/curl.args"; echo >> "$MOCKLOG/curl.args"
 exit 0
 EOF
 
+
+# --- v1.20 Batch 3: email/DNS posture, cloud inventory, TLD variants, vulnx -------------
+section "Batch 3: --dns-posture, --cloudlist, --tld-variants, --vulnx"
+mk curl <<'EOF'
+#!/usr/bin/env bash
+printf '%s ' "$@" >> "$MOCKLOG/curl.args"; echo >> "$MOCKLOG/curl.args"
+case " $* " in
+  *"https://mta-sts.example.com/.well-known/mta-sts.txt"*)
+    printf 'version: STSv1\nmode: enforce\nmx: mx1.example.com\nmax_age: 604800\n\n200'; exit 0;;
+esac
+printf '000'; exit 7
+EOF
+MOCK_POSTURE=bad run_case posture --dns-posture
+P="$CSV.dnsposture.txt"
+assert_grep  "$ERRLOG" 'Email/DNS posture: 1 seed'                         "the posture stage runs in the main process, once"
+assert_grep  "$P" '^\[example\.com\] spf-neutral \[medium\] host=example\.com all=\?all '                      "SPF ?all -> spf-neutral [medium]"
+assert_grep  "$P" '^\[example\.com\] spf-include-dangling \[high\] host=example\.com include=gone-spf\.net '      "an include: of a domain that does not exist -> spf-include-dangling [high]"
+assert_grep  "$P" '^\[example\.com\] dmarc-partial \[low\] host=example\.com pct=50 '                           "DMARC pct=50 -> dmarc-partial [low]"
+assert_grep  "$P" '^\[example\.com\] dmarc-no-rua \[info\] host=example\.com '                                 "no rua= -> dmarc-no-rua [info]"
+assert_grep  "$P" '^\[example\.com\] mta-sts-mx-mismatch \[medium\] host=example\.com mx=mx-old\.gone-mail\.net ' "an MX host the enforced policy does not list -> mta-sts-mx-mismatch"
+refute_grep  "$P" 'mta-sts-(testing|none|invalid|missing|policy)'          "an enforced, fetched policy is not itself a finding"
+assert_fgrep "$MOCKLOG/curl.args" '--proto =https --resolve mta-sts.example.com:443:192.0.2.80 https://mta-sts.example.com/.well-known/mta-sts.txt' "the policy is fetched over HTTPS only, from the address DNS gave"
+refute_grep  "$MOCKLOG/curl.args" -- ' -k | --insecure '                    "the policy fetch verifies the certificate (RFC 8461)"
+assert_grep  "$P" '^\[example\.com\] tlsrpt-missing \[info\] host=example\.com '                               "no TLS-RPT -> tlsrpt-missing [info]"
+assert_grep  "$P" '^\[example\.com\] mx-dangling \[high\] host=example\.com mx=mx-old\.gone-mail\.net '          "an MX host whose domain does not exist -> mx-dangling [high]"
+assert_grep  "$P" '^\[example\.com\] ns-dangling \[high\] host=example\.com ns=ns-gone\.gone-dns\.net '          "a name server whose domain does not exist -> ns-dangling [high]"
+assert_grep  "$P" '^\[example\.com\] ns-lame \[medium\] host=example\.com ns=ns-lame\.example\.com\(192\.0\.2\.54\) reason=refused ' "a name server that refuses the zone -> ns-lame [medium]"
+refute_grep  "$P" 'ns-lame .*ns=ns1\.'                                    "the authoritative name server is not lame"
+assert_grep  "$P" '^\[example\.com\] caa-missing \[low\] host=example\.com '                                   "no CAA -> caa-missing [low]"
+assert_grep  "$MOCKLOG/dig.args" '\+norec @192\.0\.2\.54 SOA example\.com'    "lameness asked of the name server itself, without recursion"
+assert_grep  "$CSV.dnsposture.tsv" '^example\.com	apex	example\.com	mx1\.example\.com;mx-old\.gone-mail\.net	v=spf1 include:_spf\.example\.com include:gone-spf\.net \?all	\?all	2	p=quarantine	enforce	no	-	' "dnsposture.tsv: one row per name"
+assert_grep  "$CSV.run.json" '"dnsposture": 1[0-9]'                         "run.json counts the posture findings"
+bash "$(dirname "$RUN_RECON")/generate-report.sh" "$CSV" -o "$OUTDIR/p.html" >/dev/null 2>&1 || true
+if python3 -c 'import sys,re; s=open(sys.argv[1],encoding="utf-8").read(); t=re.sub(r"<[^>]+>"," ",s); sys.exit(0 if re.search(r"HIGH\s+Email / DNS posture\s+example\.com", t) and "Email and DNS posture" in s else 1)' "$OUTDIR/p.html" 2>/dev/null
+then _pass "report: posture findings in the findings table, and the posture table"; else _fail "report: posture findings in the findings table, and the posture table"; fi
+MOCK_POSTURE=bad run_case posture_passive --dns-posture --passive-only
+refute_grep  "$MOCKLOG/curl.args" 'mta-sts'                               "--passive-only: the MTA-STS policy is not fetched (DNS checks still run)"
+assert_grep  "$CSV.dnsposture.tsv" 'record \(policy not fetched: --passive-only\)' "...and the table says so"
+MOCK_POSTURE=lookups run_case posture_lookups --dns-posture
+assert_grep  "$CSV.dnsposture.txt" 'spf-too-many-lookups \[medium\] host=example\.com lookups=11 '               "11 DNS-querying terms -> spf-too-many-lookups (record split across strings)"
+MOCK_POSTURE=multi run_case posture_multi --dns-posture
+assert_grep  "$CSV.dnsposture.txt" 'spf-multiple \[medium\] host=example\.com records=2 '                       "two SPF records -> spf-multiple [medium]"
+run_case posture_off
+refute_grep  "$ERRLOG" 'Email/DNS posture'                                 "off by default"
+
+# --cloudlist: the accounts' assets vs the scan's inventory
+CLC="$TMP/cloudlist.yaml"; printf -- '- provider: aws\n  id: prod\n' > "$CLC"
+mk cloudlist <<'EOF'
+#!/usr/bin/env bash
+printf '%s ' "$@" >> "$MOCKLOG/cloudlist.args"; echo >> "$MOCKLOG/cloudlist.args"
+printf '{"public":true,"provider":"aws","service":"ec2","id":"prod","public_ipv4":"10.0.0.1","dns_name":"example.com"}\n'
+printf '{"public":true,"provider":"aws","service":"ec2","id":"prod","public_ipv4":"203.0.113.50","dns_name":"legacy-api.example.com"}\n'
+printf '{"public":true,"provider":"aws","service":"elb","id":"prod","public_ipv4":"203.0.113.51"}\n'
+printf '{"public":false,"provider":"aws","service":"ec2","id":"prod","private_ipv4":"10.9.9.9"}\n'
+EOF
+run_case cloud --cloudlist "$CLC"
+assert_grep  "$MOCKLOG/cloudlist.args" -- "-pc $CLC -json -silent -duc"      "cloudlist runs on the provider config given"
+assert_grep  "$CSV.cloud.txt" '^\[cloud\] cloud-asset-unseen \[info\] host=legacy-api\.example\.com provider=aws account=prod service=ec2 scope=in ' "a cloud asset the scan did not find (in scope) -> cloud-asset-unseen"
+assert_grep  "$CSV.cloud.txt" 'cloud-asset-unseen \[info\] host=203\.0\.113\.51 provider=aws'                     "an address-only asset the scan did not find"
+refute_grep  "$CSV.cloud.txt" 'host=example\.com |10\.9\.9\.9'              "assets the scan found, and internal-only addresses, are not reported"
+assert_grep  "$CSV.cloud-assets.tsv" '^aws	prod	ec2	example\.com	10\.0\.0\.1	yes$' "cloud-assets.tsv marks what the scan saw"
+bash "$(dirname "$RUN_RECON")/generate-report.sh" "$CSV" -o "$OUTDIR/c.html" >/dev/null 2>&1 || true
+assert_grep  "$OUTDIR/c.html" 'Cloud inventory'                           "report: cloud inventory findings listed"
+mkdir -p "$TMP/clhome"; HOME="$TMP/clhome" run_case cloud_nocfg --cloudlist
+assert_grep  "$ERRLOG" '--cloudlist: no provider config at'                 "no provider config: a clear warning, no run"
+rm -f "$MOCKBIN/cloudlist"
+
+# --tld-variants: listed only, with an ownership hint
+mk tldfinder <<'EOF'
+#!/usr/bin/env bash
+printf '%s ' "$@" >> "$MOCKLOG/tldfinder.args"; echo >> "$MOCKLOG/tldfinder.args"
+printf 'example.com\nexample.net\nexample.org\n'
+EOF
+run_case tld --tld-variants
+assert_grep  "$MOCKLOG/tldfinder.args" -- '-d example -dm tld -silent -duc -nc'  "tldfinder looks for the seed's name under other TLDs"
+assert_grep  "$CSV.tld-variants.txt" '^\[example\.com\] tld-variant \[info\] host=example\.net of=example\.com same_ns=' "variants listed with the domain they mirror"
+refute_grep  "$CSV.tld-variants.txt" 'host=example\.com '                   "the seed's own domain is not a variant"
+refute_grep  "$CSV" 'example\.net|example\.org'                             "variants are never scanned or added to the inventory"
+rm -f "$MOCKBIN/tldfinder"
+
+# --vulnx: product advisories for the CPEs the inventory holds
+mk vulnx <<'EOF'
+#!/usr/bin/env bash
+printf '%s ' "$@" >> "$MOCKLOG/vulnx.args"; echo >> "$MOCKLOG/vulnx.args"
+case " $* " in
+  *"product:nginx"*) printf '{"count":2,"facets":{"is_kev":{"buckets":{"true":1,"false":36}}},"results":[{"cve_id":"CVE-2023-44487","cvss_score":7.5,"epss_score":0.94,"is_kev":true,"is_poc":true,"severity":"high"},{"cve_id":"CVE-2021-23017","cvss_score":7.7,"epss_score":0.53,"severity":"high"}],"total":37}';;
+  *) printf '{"count":0,"results":[],"total":0}';;
+esac
+EOF
+run_case vulnx --vulnx
+assert_grep  "$MOCKLOG/vulnx.args" -- 'search --json --silent --disable-update-check --no-color -n 10 --sort-desc epss_score .*affected_products\.vendor:f5 && affected_products\.product:nginx' "vulnx asked for the product's CVEs, most likely exploited first"
+assert_grep  "$CSV.vulnx.txt" '^\[vulnx\] product-advisories \[info\] host=[^ ]+ product=f5:nginx versions=unknown hosts=[0-9]+ cves=37 kev=1 top=CVE-2023-44487\(kev;epss=0\.94\),CVE-2021-23017\(epss=0\.53\) ' "one advisory line per product: CVE and KEV counts, the top CVEs (versionless CPE: versions=unknown)"
+assert_grep  "$CSV.vulnx.tsv" '^f5	nginx	unknown	[0-9]+	CVE-2023-44487	7\.5	0\.94	yes	yes	no$' "vulnx.tsv: one row per CVE"
+refute_grep  "$CSV.vulnx.txt" 'product=php:php'                          "a product with no filed CVEs gets no line"
+bash "$(dirname "$RUN_RECON")/generate-report.sh" "$CSV" -o "$OUTDIR/v.html" >/dev/null 2>&1 || true
+assert_grep  "$OUTDIR/v.html" 'Product advisory \(vulnx\)'                   "report: vulnx advisories counted as context"
+rm -f "$MOCKBIN/vulnx"
+mk curl <<'EOF'
+#!/usr/bin/env bash
+printf '%s ' "$@" >> "$MOCKLOG/curl.args"; echo >> "$MOCKLOG/curl.args"
+exit 0
+EOF
+
+# --- Batch 4 (B4.1): --scope, --list-targets, --drop-out-of-scope ------------------
+section "Batch 4: --scope FILE (fail-closed), --list-targets, --drop-out-of-scope"
+SC="$TMP/scopecase"; mkdir -p "$SC"
+_rc_is(){ if [ "$1" = "$2" ]; then _pass "$3"; else _fail "$3  [exit $1, want $2]"; fi; }
+_none_ran(){ if [ -z "$(ls "$MOCKLOG"/*.args 2>/dev/null)" ]; then _pass "$1"; else _fail "$1  [ran: $(cd "$MOCKLOG" && ls *.args | tr '\n' ' ')]"; fi; }
+# the dry run: the plan on stdout, nothing started, no work dir
+printf 'example.com\nhttps://www.example.com/x\nfoo bar\n10.0.0.1\n' > "$SC/in1.txt"
+rm -f "$MOCKLOG"/*.args; LT="$TMP/out_lt"; rm -rf "$LT"; mkdir -p "$LT"; _rc=0
+env PATH="$TESTPATH" HTTPX_BIN=httpx bash "$RUN_RECON" -i "$SC/in1.txt" -D "$LT" --list-targets > "$LT/plan.txt" 2> "$LT/err.txt" || _rc=$?
+_rc_is "$_rc" 0                                                              "--list-targets without --scope: exit 0"
+assert_grep  "$LT/plan.txt" '^1 +example\.com +domain +in scope'             "--list-targets: each seed with its status"
+assert_grep  "$LT/plan.txt" '^2 +www\.example\.com +domain +in scope'        "--list-targets: a URL line is shown as the seed it becomes"
+assert_grep  "$LT/plan.txt" '^3 +foo bar +- +INVALID +not a domain'          "--list-targets: an invalid line and why"
+assert_grep  "$LT/plan.txt" 'a bare address: write it as 10\.0\.0\.1/32'     "--list-targets: a bare address is invalid, with the fix"
+_none_ran                                                                     "--list-targets: no tool is started (nothing is sent)"
+if compgen -G "$LT/_work-*" >/dev/null; then _fail "--list-targets: no work dir"; else _pass "--list-targets: no work dir"; fi
+# fail closed: an out-of-scope seed, a malformed entry
+printf 'example.com\n!api.example.com\n10.0.0.0/24\n' > "$SC/s1.txt"
+printf 'example.com\nother.net\n' > "$SC/in2.txt"
+rm -f "$MOCKLOG"/*.args; _rc=0
+env PATH="$TESTPATH" HTTPX_BIN=httpx bash "$RUN_RECON" -i "$SC/in2.txt" -D "$LT" -o "$LT/r.csv" --scope "$SC/s1.txt" > /dev/null 2> "$LT/err2.txt" || _rc=$?
+_rc_is "$_rc" 2                                                              "--scope: an out-of-scope seed stops the run (exit 2)"
+assert_grep  "$LT/err2.txt" 'line 2: other\.net: out of scope: no entry covers it' "--scope: the refusal names the seed and the reason"
+_none_ran                                                                     "--scope refusal: nothing is sent (no tool started)"
+assert_absent "$LT/r.csv"                                                     "--scope refusal: no output"
+rm -f "$MOCKLOG"/*.args; _rc=0
+env PATH="$TESTPATH" HTTPX_BIN=httpx bash "$RUN_RECON" -i "$SC/in2.txt" -D "$LT" --scope "$SC/s1.txt" --list-targets > "$LT/plan2.txt" 2>&1 || _rc=$?
+_rc_is "$_rc" 2                                                              "--list-targets: exit 2 when the run would refuse"
+assert_grep  "$LT/plan2.txt" 'would REFUSE to start'                         "--list-targets: says the run would refuse"
+assert_grep  "$LT/plan2.txt" '^scope +: .*s1\.txt \(sha256 [0-9a-f]{16}\): 3 entries \(1 name\(s\), 1 range\(s\), 0 ASN\(s\); 1 exclusion\(s\)\)' "--list-targets: the scope file, its hash and a summary"
+printf 'example.com\nhttps://x.org/a\n10.0.0.1/8\ncom\n' > "$SC/bad.txt"
+_rc=0; env PATH="$TESTPATH" HTTPX_BIN=httpx bash "$RUN_RECON" -i "$SC/in2.txt" -D "$LT" --scope "$SC/bad.txt" > /dev/null 2> "$LT/err3.txt" || _rc=$?
+_rc_is "$_rc" 2                                                              "--scope: a malformed scope file stops the run"
+assert_grep  "$LT/err3.txt" 'line 2: https://x\.org/a: write a bare name'    "--scope: a URL entry is refused, with its line number"
+assert_grep  "$LT/err3.txt" 'line 3: 10\.0\.0\.1/8 has host bits set \(did you mean 10\.0\.0\.0/8\?\)' "--scope: a CIDR with host bits set is refused"
+assert_grep  "$LT/err3.txt" 'line 4: com is a whole top-level domain'        "--scope: a whole TLD is refused"
+# a default run (no --scope) warns about the lines it ignores (they were dropped silently)
+DOMAINS="$SC/in1.txt" run_case ignored --passive-only
+assert_grep  "$ERRLOG" 'input: ignored 2 line\(s\): foo bar, 10\.0\.0\.1'   "default run: the ignored input lines are named (once silent)"
+
+# names: exclusions hold, the crawl stays inside, tools that cannot be held are skipped
+DOMAINS="$SC/in2.txt" run_case scope_names --scope "$SC/s1.txt" --drop-out-of-scope --subs --crawlers-all --nuclei --takeover
+assert_grep  "$ERRLOG" '--scope: skipped line 2: other\.net: out of scope'   "--drop-out-of-scope: the seed is skipped with a warning"
+refute_grep  "$CSV" 'other\.net'                                             "--drop-out-of-scope: the skipped seed is not run"
+refute_grep  "$CSV" 'api\.example\.com'                                      "--scope: an excluded name (subfinder found it) is not probed or listed"
+assert_grep  "$CSV" 'https://www\.example\.com[^,]*,www\.example\.com,'      "--scope: other names under the seed still run"
+_ws="$(ls -d "$OUTDIR"/_work-* 2>/dev/null | head -n 1)"
+assert_grep  "$_ws/raw/example.com/hosts_all.txt" '^www\.example\.com$'      "takeover candidates: the list the check reads"
+refute_grep  "$_ws/raw/example.com/hosts_all.txt" 'api\.example\.com'       "--scope: the excluded name is not a takeover candidate (not probed by subzy/nuclei)"
+assert_fgrep "$MOCKLOG/katana.args" '-cs ^https?://(([^/?#@]*\.)?(example\.com))(:[0-9]+)?([/?#]|$)' "--scope: katana follows links only inside the allowed names (-cs)"
+assert_fgrep "$MOCKLOG/katana.args" '-cos ^https?://(([^/?#@]*\.)?(api\.example\.com))(:[0-9]+)?([/?#]|$)' "--scope: katana never follows a link to an excluded name (-cos)"
+assert_absent "$MOCKLOG/gospider.args"                                       "--scope: gospider (cannot be held to the scope) is skipped"
+assert_grep  "$ERRLOG" '--crawlers-all under --scope'                        "--scope: ...with a warning"
+assert_grep  "$MOCKLOG/nuclei.args" -- ' -dr( |$)'                            "--scope: nuclei follows no redirects (-dr)"
+assert_grep  "$CSV.scope.txt" '^\[scope\] scope-file \[info\] file=.*s1\.txt sha256=[0-9a-f]{64} entries=3 '  "<out>.scope.txt: the scope file and its hash"
+assert_grep  "$CSV.scope.txt" '^\[scope\] seed-in-scope \[info\] seed=example\.com kind=domain line=1 entry=example\.com' "<out>.scope.txt: each seed and the entry that allows it"
+assert_grep  "$CSV.scope.txt" '^\[scope\] seed-skipped \[info\] seed=other\.net line=2 status=out'  "<out>.scope.txt: the skipped seed"
+assert_grep  "$CSV.run.json" '"seeds_out": 1'                                "run.json: the scope record (seeds skipped)"
+assert_grep  "$CSV.run.json" '"sha256": "[0-9a-f]{64}"'                      "run.json: the scope file's SHA-256"
+assert_grep  "$CSV.run.json" '"input": ".*in2\.txt"'                         "run.json: the input is the file given, not the filtered copy"
+
+# addresses: a name resolving into an excluded range is held back; origin candidates
+# outside the allowed ranges are not contacted
+cp "$MOCKBIN/dnsx" "$MOCKBIN/dnsx.base"
+mk dnsx <<'EOF'
+#!/usr/bin/env bash
+"$(dirname "$0")/dnsx.base" "$@" | sed -E 's/^(\{"host":"www\.example\.com","a":\[)"10\.0\.0\.1"/\1"10.9.9.9"/'
+EOF
+# tlsx gets its names in a file: record what each call was given
+cp "$MOCKBIN/tlsx" "$MOCKBIN/tlsx.base"
+mk tlsx <<'EOF'
+#!/usr/bin/env bash
+a=("$@"); for i in "${!a[@]}"; do [ "${a[$i]}" = -l ] && cat "${a[$((i+1))]}" >> "$MOCKLOG/tlsx.lists" 2>/dev/null; done
+exec "$(dirname "$0")/tlsx.base" "$@"
+EOF
+printf 'example.com\n!10.9.9.0/24\n' > "$SC/s2.txt"
+run_case scope_addr --scope "$SC/s2.txt" --subs --certs --origin
+refute_grep  "$CSV" 'www\.example\.com'                                      "--scope: a name resolving into an excluded range is not probed"
+assert_grep  "$CSV.scope.txt" 'scope-held-back \[info\] kind=name target=www\.example\.com address=10\.9\.9\.9 note=not contacted: resolves into an excluded range' "<out>.scope.txt: ...and is listed with its address"
+assert_grep  "$MOCKLOG/tlsx.lists" '^api\.example\.com$'                      "certificate harvest: the names tlsx was given"
+refute_grep  "$MOCKLOG/tlsx.lists" '^www\.example\.com$'                      "--scope: ...not the held-back name (checked before the harvest)"
+assert_fgrep "$MOCKLOG/katana.args" '-cs ^https?://(amass-host\.example\.com|api\.example\.com|asset-host\.example\.com|' "--scope with address exclusions: katana crawls only the live hosts already checked"
+refute_grep  "$MOCKLOG/katana.args" -- '-cs [^ ]*\[\^/'                      "--scope with address exclusions: ...not any name under the allowed domains"
+assert_grep  "$CSV.scope.txt" 'kind=origin-candidate target=10\.0\.0\.1 via=.* note=not contacted: outside the allowed ranges' "--scope: an --origin candidate outside the allowed ranges is held back"
+refute_grep  "$MOCKLOG/curl.args" -- '--resolve [^ ]*:10\.0\.0\.1 '          "--scope: ...and never requested"
+assert_grep  "$CSV.run.json" '"name": 1'                                     "run.json: what was held back, by kind"
+mv "$MOCKBIN/dnsx.base" "$MOCKBIN/dnsx"; mv "$MOCKBIN/tlsx.base" "$MOCKBIN/tlsx"; rm -f "$MOCKLOG/tlsx.lists"
+
+# allowed ranges: candidates inside are verified; internet-scan hits outside are held back;
+# a CIDR seed loses its excluded addresses; range-certificate names outside the scope stay out
+printf 'example.com\n10.0.0.0/24\n192.0.2.0/24\n!192.0.2.5\n' > "$SC/s3.txt"
+printf 'example.com\n192.0.2.0/24\n' > "$SC/in3.txt"
+DOMAINS="$SC/in3.txt" run_case scope_ranges --scope "$SC/s3.txt" --origin --favicon
+assert_grep  "$MOCKLOG/curl.args" -- '--resolve [^ ]*:10\.0\.0\.1 '           "--scope: an --origin candidate inside an allowed range is verified"
+_ws="$(ls -d "$OUTDIR"/_work-* 2>/dev/null | head -n 1)"
+assert_grep  "$_ws/raw/example.com/favicon_ips.txt" '^192\.0\.2\.77$'        "--scope: an internet-scan hit inside an allowed range is cert-scanned"
+assert_grep  "$CSV.scope.txt" 'kind=internet-scan-hit target=198\.51\.100\.20:8443 note=not contacted: outside the allowed ranges' "--scope: a hit outside the allowed ranges is held back"
+refute_grep  "$_ws/raw/example.com/favicon_hits_hp.txt" '198\.51\.100\.20'   "--scope: ...and not cert-scanned"
+assert_grep  "$_ws/cidrs.txt" '^192\.0\.2\.4/32$'                             "--scope: a CIDR seed is swept without its excluded address"
+refute_grep  "$_ws/cidrs.txt" '^192\.0\.2\.0/24$|^192\.0\.2\.5/'              "--scope: ...the excluded address is not in the sweep"
+assert_grep  "$CSV.scope.txt" '^\[ranges\] scope-held-back \[info\] kind=range-certificate-name target=sneaky\.otherdomain\.com ' "--scope: a range-certificate name outside the scope is not made a seed"
+refute_grep  "$CSV" 'sneaky\.otherdomain\.com'                               "--scope: ...and not scanned"
+assert_grep  "$CSV" 'assets\.example\.com'                                   "--scope: a range-certificate name inside the scope is"
+
+# the screenshot browser: held to this seed's names; gowitness cannot be, so it is skipped
+run_case scope_ss --scope "$SC/s1.txt" --screenshots
+assert_grep  "$MOCKLOG/httpx.args" -- '--host-resolver-rules=MAP [^ ]+ 10\.0\.0\.1, .*MAP \* ~NOTFOUND' "--scope: the browser resolves only this seed's names (MAP * ~NOTFOUND for the rest)"
+SCREENSHOT_TOOL=gowitness run_case scope_gw --scope "$SC/s1.txt" --screenshots
+assert_absent "$MOCKLOG/gowitness.args"                                      "--scope: gowitness (no resolver rules) is not used"
+assert_grep  "$ERRLOG" '--screenshots under --scope needs httpx and dnsx'     "--scope: ...with a warning"
+
+# MTA-STS: the policy is fetched only from an in-scope name
+printf 'example.com\n!mta-sts.example.com\n' > "$SC/s4.txt"
+MOCK_POSTURE=bad run_case scope_posture --scope "$SC/s4.txt" --dns-posture
+refute_grep  "$MOCKLOG/curl.args" 'mta-sts\.example\.com'                     "--scope: the MTA-STS policy is not fetched from an excluded name"
+assert_grep  "$CSV.dnsposture.tsv" 'policy not fetched: mta-sts\.example\.com is outside --scope' "--scope: ...the posture table says why"
+
+# --- Batch 4 (B4.2): SHA-256 manifest of the run's outputs --------------------------
+section "Batch 4: <out>.manifest.sha256 (sha256sum -c format, this run's files only)"
+MF="$TMP/out_manifest"; rm -rf "$MF"; mkdir -p "$MF"
+printf 'from an earlier run\n' > "$MF/r.csv.zone.txt"; touch -d '2020-01-01 00:00:00' "$MF/r.csv.zone.txt"
+rm -f "$MOCKLOG"/*.args
+timeout 25 env PATH="$TESTPATH" HTTPX_BIN=httpx SECLISTS="$SECLISTS_TEST" RECON_CLOUD_CACHE="$MF/cloud_ranges.tsv" TLS_CHAIN_CHECK=0 \
+  bash "$RUN_RECON" -i "$DOMAINS" -D "$MF" -o "$MF/r.csv" --tls --screenshots > /dev/null 2> "$MF/stderr.log" || true
+M="$MF/r.csv.manifest.sha256"
+assert_exists "$M"                                                           "the run writes <out>.manifest.sha256"
+assert_grep  "$M" '^[0-9a-f]{64}  r\.csv$'                                   "manifest: the CSV, by a path relative to its directory"
+assert_grep  "$M" '^[0-9a-f]{64}  r\.csv\.run\.json$'                        "manifest: run.json"
+assert_grep  "$M" '^[0-9a-f]{64}  r\.csv\.report\.html$'                     "manifest: the report"
+assert_grep  "$M" '^[0-9a-f]{64}  screenshots-[0-9-]+/'                      "manifest: the screenshots"
+refute_grep  "$M" 'manifest\.sha256'                                         "manifest: not itself"
+refute_grep  "$M" 'r\.csv\.zone\.txt'                                        "manifest: an older file with the same prefix (another run) is left out"
+assert_grep  "$MF/stderr.log" 'manifest: 1 older file\(s\) named like this run.s outputs were left out .*: r\.csv\.zone\.txt' "manifest: ...and named in a warning"
+if ( cd "$MF" && sha256sum --quiet -c r.csv.manifest.sha256 ) >/dev/null 2>&1; then _pass "manifest: sha256sum -c verifies the set"; else _fail "manifest: sha256sum -c verifies the set"; fi
+printf 'x' >> "$MF/r.csv.run.json"
+if ( cd "$MF" && sha256sum --quiet -c r.csv.manifest.sha256 ) >/dev/null 2>&1; then _fail "manifest: a changed file fails the check"; else _pass "manifest: a changed file fails the check"; fi
+
+# --- Batch 4 (B4.3, B4.4): field-by-field changes and history ---------------------
+section "Batch 4: recon-db.sh diff / changes / history, --monitor -> <out>.delta.tsv"
+RDB="$(dirname "$RUN_RECON")/recon-db.sh"
+DL="$TMP/delta"; rm -rf "$DL"; mkdir -p "$DL/runs"
+H='seed_domain,url,host,sources,status_code,content_length,webserver,title,technologies,ip,asn,asn_org,tls_version,cert_not_after,tls_flags,cpe'
+{ echo "$H"
+  echo 'example.com,https://example.com/,example.com,live,200,10,nginx,Home,Nginx;PHP,10.0.0.1,AS1,One,tls13,2030-01-01,,cpe:a'
+  echo 'example.com,https://example.com/a,example.com,katana,200,10,nginx,A,,10.0.0.1,AS1,One,,,,'
+  echo 'example.com,https://old.example.com,old.example.com,subfinder,200,5,apache,Old,,10.0.0.2,AS1,One,tls12,2027-01-01,,'
+  echo 'example.com,https://cdn.example.com,cdn.example.com,subfinder,200,5,cloudflare,CDN,,104.16.0.1,AS13335,Cloudflare,tls13,2027-01-01,,'
+  echo 'example.com,https://moved.example.com,moved.example.com,subfinder,200,5,nginx,M,,10.0.0.3,AS1,One,tls13,2027-01-01,,'
+  echo 'other.org,https://other.org,other.org,live,200,5,iis,O,,10.1.0.1,AS2,Two,,,,'
+} > "$DL/runs/recon-20261101-000000.csv"
+{ echo "$H"
+  echo 'example.com,https://example.com/,example.com,live,200,10,nginx,Home,PHP;Nginx,10.0.0.9,AS1,One,tls13,2031-01-01,CertExpiring,cpe:a'
+  echo 'example.com,https://example.com:8443/,example.com,naabu,401,0,caddy,,,10.0.0.1,AS1,One,tls13,2031-01-01,,'
+  echo 'example.com,https://cdn.example.com,cdn.example.com,subfinder,200,5,cloudflare,CDN,,104.16.0.2,AS13335,Cloudflare,tls13,2027-01-01,,'
+  echo 'example.com,https://moved.example.com,moved.example.com,subfinder,200,5,nginx,M,,203.0.113.7,AS9,Nine,tls13,2027-01-01,,'
+  echo 'new.org,https://new.org,new.org,live,200,5,iis,N,,10.2.0.1,AS2,Two,,,,'
+} > "$DL/runs/recon-20261102-000000.csv"
+env PATH="$TESTPATH" bash "$RDB" diff "$DL/runs/recon-20261101-000000.csv" "$DL/runs/recon-20261102-000000.csv" -o "$DL/d.tsv" 2> "$DL/d.err"
+D="$DL/d.tsv"
+assert_grep  "$D" '^change	seed	service	field	old	new$'                    "diff: a TSV with a header"
+assert_grep  "$D" '^changed	example\.com	https://example\.com	cert_not_after	2030-01-01	2031-01-01$' "diff: a field that changed, old and new (the root URL's row speaks for the service)"
+assert_grep  "$D" '^changed	example\.com	https://example\.com	tls_flags		CertExpiring$' "diff: a TLS flag that appeared (TLS ran in both runs, judged by tls_version)"
+refute_grep  "$D" '	technologies	'                                        "diff: multi-valued fields compare as sets (order is not a change)"
+refute_grep  "$D" 'https://example\.com	ip	|cdn\.example\.com	ip	'           "diff: an address change inside the same ASN is not reported (CDN, round robin)"
+assert_grep  "$D" '^changed	example\.com	https://moved\.example\.com	ip	10\.0\.0\.3	203\.0\.113\.7$' "diff: an address change to another network is"
+assert_grep  "$D" '^changed	example\.com	https://moved\.example\.com	asn	AS1	AS9$' "diff: ...and the ASN change"
+assert_grep  "$D" '^new	example\.com	https://example\.com:8443			401$'     "diff: a new service (scheme://host:port)"
+assert_grep  "$D" '^removed	example\.com	https://old\.example\.com		200 Old	$'   "diff: a removed service"
+refute_grep  "$D" 'other\.org|new\.org'                                     "diff: seeds that only one run covered are not compared"
+refute_grep  "$D" 'https://example\.com/a'                                  "diff: crawled URLs are not services (the unit is scheme://host:port)"
+assert_grep  "$DL/d.err" 'diff: 1 new, 1 removed, 2 changed service\(s\) \(4 field change\(s\)\); seeds only in .*: other\.org; seeds only in .*: new\.org' "diff: the summary"
+# a stage that was off in one run is not a change
+cut -d, -f1-12 "$DL/runs/recon-20261101-000000.csv" > "$DL/notls.csv"
+env PATH="$TESTPATH" bash "$RDB" diff "$DL/notls.csv" "$DL/runs/recon-20261102-000000.csv" -o "$DL/d2.tsv" 2>/dev/null
+refute_grep  "$DL/d2.tsv" '	(tls_version|cert_not_after|tls_flags|cpe)	'     "diff: fields one run did not collect are not compared"
+# history and change events over a directory of run CSVs (no DB)
+sed 's/,Home,/,Home v2,/' "$DL/runs/recon-20261102-000000.csv" > "$DL/runs/recon-20261103-000000.csv"
+env PATH="$TESTPATH" bash "$RDB" changes --csv "$DL/runs" > "$DL/c.tsv" 2>&1
+assert_grep  "$DL/c.tsv" '^run_ts	seed	service	change	field	old	new$'          "changes --csv: a TSV"
+assert_grep  "$DL/c.tsv" '^20261102-000000	example\.com	https://old\.example\.com	removed	'  "changes --csv: each event with the run it was seen in"
+assert_grep  "$DL/c.tsv" '^20261103-000000	example\.com	https://example\.com	changed	title	Home	Home v2$' "changes --csv: events between every pair of consecutive runs"
+env PATH="$TESTPATH" bash "$RDB" changes example.com:8443 --csv "$DL/runs" > "$DL/c2.tsv" 2>&1
+assert_grep  "$DL/c2.tsv" 'https://example\.com:8443	new'                    "changes PATTERN: filters by service (a port works)"
+refute_grep  "$DL/c2.tsv" 'old\.example\.com'                                 "changes PATTERN: ...and leaves the others out"
+env PATH="$TESTPATH" bash "$RDB" changes --since 20261102-000000 --csv "$DL/runs" > "$DL/c3.tsv" 2>&1
+refute_grep  "$DL/c3.tsv" '^20261102-000000'                                  "changes --since TS: only the runs after TS"
+env PATH="$TESTPATH" bash "$RDB" history --csv "$DL/runs" > "$DL/h.tsv" 2>&1
+assert_grep  "$DL/h.tsv" '^example\.com	https://old\.example\.com	20261101-000000	20261101-000000	1	3	gone since 20261102-000000	200 Old$' "history: first/last seen, runs seen of the seed's runs, gone since"
+assert_grep  "$DL/h.tsv" '^example\.com	https://example\.com	20261101-000000	20261103-000000	3	3	present	200 Home v2$' "history: a present service and its latest state"
+# the store: schema migration, the run's seeds and columns, history queries
+mk psql <<'PSQLEOF'
+#!/usr/bin/env bash
+sql="$(cat 2>/dev/null)"; printf 'ARGS: %s\nSQL: %s\n' "$*" "$sql" >> "$MOCKLOG/psql.args"
+case "$*" in
+  *"SELECT 1"*) echo 1;;
+  *"COPY (SELECT run_ts, seed_domain, url"*) cat "$MOCK_PG/rows.csv";;
+  *"bool_or"*) cat "$MOCK_PG/ran.csv";;
+  *"FROM recon_runs UNION ALL"*) cat "$MOCK_PG/seeds.csv";;
+esac
+exit 0
+PSQLEOF
+MOCK_PG="$DL/pg"; mkdir -p "$MOCK_PG"
+F=status_code,title,webserver,technologies,cpe,redirect_location,auth,http_flags,missing_sec_headers,ip,ipv6,asn,tls_version,cert_not_after,cert_issuer,tls_flags,favicon_mmh3
+{ echo "run_ts,seed_domain,url,$F"
+  echo '20261001-000000,example.com,https://example.com/,200,Home,nginx,Nginx,,,,,,10.0.0.1,,AS1,,,,,'
+  echo '20261101-000000,example.com,https://example.com/,200,Home,nginx,Nginx,cpe:a,,,,,10.0.0.1,,AS1,tls13,2030-01-01,,,'
+  echo '20261102-000000,example.com,https://example.com/,200,Home,nginx,Nginx,cpe:a,,,,,10.0.0.1,,AS1,tls13,2031-01-01,,,'
+} > "$MOCK_PG/rows.csv"
+{ echo "run_ts,$F"
+  echo '20261001-000000,t,t,t,t,f,f,f,f,f,t,f,t,f,f,f,f,f'
+  echo '20261101-000000,t,t,t,t,t,f,f,f,f,t,f,t,t,t,f,f,f'
+  echo '20261102-000000,t,t,t,t,t,f,f,f,f,t,f,t,t,t,f,f,f'
+} > "$MOCK_PG/ran.csv"
+{ echo 'run_ts,seeds,cols'
+  echo '20261101-000000,example.com,status_code;title;webserver;technologies;cpe;ip;asn;tls_version;cert_not_after'
+  echo '20261102-000000,example.com,status_code;title;webserver;technologies;cpe;ip;asn;tls_version;cert_not_after'
+  echo '20261001-000000,example.com,'
+} > "$MOCK_PG/seeds.csv"
+rm -f "$MOCKLOG/psql.args"
+env PATH="$TESTPATH" MOCK_PG="$MOCK_PG" RECON_DB_ENV=/nonexistent RECON_DB_DSN=postgresql://mock/recon bash "$RDB" changes > "$DL/dbc.tsv" 2>&1
+assert_grep  "$DL/dbc.tsv" '^20261102-000000	example\.com	https://example\.com	changed	cert_not_after	2030-01-01	2031-01-01$' "changes (store): events from the stored runs"
+refute_grep  "$DL/dbc.tsv" '	cpe	'                                            "changes (store): a run stored before 1.20 had no cpe column, so cpe is not compared with it"
+assert_grep  "$MOCKLOG/psql.args" 'ADD COLUMN IF NOT EXISTS cpe text'            "store: the schema gains the compared columns (existing stores are migrated)"
+rm -f "$MOCKLOG/psql.args"
+printf 'example.com\nexample.net\n' > "$DL/seeds.txt"
+env PATH="$TESTPATH" RECON_DB_ENV=/nonexistent RECON_DB_DSN=postgresql://mock/recon bash -c '. "$1"; db_load_csv "$2" 20261105-000000 "$3"' _ "$RDB" "$DL/runs/recon-20261102-000000.csv" "$DL/seeds.txt" > /dev/null 2>&1
+assert_grep  "$MOCKLOG/psql.args" "INSERT INTO recon_runs \(run_ts, seeds, cols\) VALUES \('20261105-000000', 'example\.com;example\.net', 'status_code;title;webserver;technologies;cpe;ip;asn;tls_version;cert_not_after;tls_flags'\)" "store: each run records the seeds it covered and the columns its CSV had"
+assert_grep  "$MOCKLOG/psql.args" 'tls_flags, favicon_mmh3\)'                   "store: the compared fields are loaded"
+rm -f "$MOCKBIN/psql"
+# --monitor: the delta next to new-assets, in run.json and in the report
+run_case mon_a
+cp "$CSV" "$TMP/mon_prev.csv"
+run_case mon_b --subs --monitor --monitor-prev "$TMP/mon_prev.csv"
+assert_exists "$CSV.delta.tsv"                                               "--monitor: <out>.delta.tsv"
+assert_grep  "$CSV.delta.tsv" '^new	example\.com	https://api\.example\.com	'   "--monitor: a service found this time is new"
+assert_grep  "$ERRLOG" 'Changes +: [0-9]+ new, 0 removed, 0 changed service\(s\) \(0 field change\(s\)\) vs mon_prev\.csv' "--monitor: the change summary"
+assert_grep  "$CSV.run.json" '"delta_changes": [1-9]'                        "run.json: the number of changes"
+assert_grep  "$CSV.report.html" 'id="changes">Changes since the previous run' "report: a Changes section"
+assert_grep  "$CSV.manifest.sha256" '  r\.csv\.delta\.tsv$'                    "manifest: the delta is covered"
+# --monitor with --db: probe results are measured afresh (the cache would hide a change), and stored
+mk psql <<'PSQLEOF'
+#!/usr/bin/env bash
+sql=""; A=("$@"); i=0
+while [ $i -lt ${#A[@]} ]; do case "${A[$i]}" in -c) i=$((i+1)); sql="${A[$i]}";; esac; i=$((i+1)); done
+[ -z "$sql" ] && sql="$(cat 2>/dev/null)"
+printf 'SQL: %s\n' "$sql" >> "$MOCKLOG/psql.args"
+case "$sql" in "SELECT 1") echo 1;; esac
+exit 0
+PSQLEOF
+run_case mon_db --db --monitor --monitor-prev "$TMP/mon_prev.csv"
+refute_grep  "$MOCKLOG/psql.args" "c\.source = 'live_probe'"                   "--monitor --db: the live probe is not read from the cache"
+refute_grep  "$MOCKLOG/psql.args" "c\.source = 'httpx_json_v3'"                "--monitor --db: nor the enrichment records"
+assert_grep  "$MOCKLOG/psql.args" "'live_probe'"                                "--monitor --db: the fresh probe results are still stored"
+assert_grep  "$MOCKLOG/psql.args" "source='urls'"                               "--monitor --db: passive lookups still use the cache"
+run_case nomon_db --db
+assert_grep  "$MOCKLOG/psql.args" "c\.source = 'live_probe'"                   "--db without --monitor: the live probe cache is read (unchanged)"
+rm -f "$MOCKBIN/psql"
+
+# --- Batch 4 (B4.5): an interrupted run keeps its work dir; --resume continues it -----
+section "Batch 4: SIGTERM/SIGINT stop the run and keep its work; --resume skips the finished seeds"
+RS="$TMP/resume"; rm -rf "$RS"; mkdir -p "$RS/out" "$RS/full"
+printf 'example.com\nslow.example.org\n' > "$RS/in.txt"
+cp "$MOCKBIN/gau" "$MOCKBIN/gau.base"
+mk gau <<'EOF'
+#!/usr/bin/env bash
+in="$(cat)"; printf '%s\n' "$in" >> "$MOCKLOG/gau.seeds"
+case "$in" in *slow.example.org*) [ -e "$MOCKLOG/gau.hang" ] && exec sleep 61.5;; esac
+printf '%s\n' "$in" | exec "$(dirname "$0")/gau.base" "$@"
+EOF
+_rr(){ # <outdir> <stderr> [args...]: the run-recon command line the resume tests repeat
+  local o="$1" e="$2"; shift 2
+  env PATH="$TESTPATH" HTTPX_BIN=httpx SECLISTS="$SECLISTS_TEST" RECON_CLOUD_CACHE="$RS/cloud.tsv" TLS_CHAIN_CHECK=0 \
+    bash "$RUN_RECON" -i "$RS/in.txt" -D "$o" -o "$o/r.csv" -t 1 --no-report "$@" > /dev/null 2> "$e"
+}
+_rr_bg(){ # the same, in the background: exec, so $! is run-recon itself
+  local o="$1" e="$2"; shift 2
+  exec env PATH="$TESTPATH" HTTPX_BIN=httpx SECLISTS="$SECLISTS_TEST" RECON_CLOUD_CACHE="$RS/cloud.tsv" TLS_CHAIN_CHECK=0 \
+    bash "$RUN_RECON" -i "$RS/in.txt" -D "$o" -o "$o/r.csv" -t 1 --no-report "$@" > /dev/null 2> "$e"
+}
+_wait_hang(){ local _; for _ in $(seq 1 150); do grep -q slow "$MOCKLOG/gau.seeds" 2>/dev/null && compgen -G "$1/_work-*/done/example.com" >/dev/null && return 0; sleep 0.2; done; return 1; }
+# the reference: the same run, never interrupted
+rm -f "$MOCKLOG/gau.hang"; _rr "$RS/full" "$RS/full.err" || true
+# run 1: stopped by SIGTERM while the second seed runs
+: > "$MOCKLOG/gau.hang"; rm -f "$MOCKLOG/gau.seeds"
+_rr_bg "$RS/out" "$RS/err1.txt" & RP=$!
+_wait_hang "$RS/out" && sleep 0.5
+_rc=0; _rr "$RS/out" "$RS/err0.txt" --resume || _rc=$?
+_rc_is "$_rc" 2                                                             "--resume while the run is still running: refused (its work dir is locked)"
+assert_grep  "$RS/err0.txt" 'is still running \(its lock is held\)'         "--resume while it runs: ...and why"
+kill -TERM "$RP" 2>/dev/null; _rc=0; wait "$RP" || _rc=$?
+_rc_is "$_rc" 143                                                           "SIGTERM: the run stops with exit 143"
+W="$(ls -d "$RS/out"/_work-* 2>/dev/null | head -n 1)"
+_rsid="$(sed -n 's/^run_id=//p' "$W/state" 2>/dev/null)"
+assert_grep  "$W/state" '^status=interrupted$'                               "SIGTERM: the work dir is kept and marked interrupted"
+assert_grep  "$W/state" '^args_sha256=[0-9a-f]{64}$'                         "state: a hash of the command line (no values)"
+if [ -e "$W/done/example.com" ] && [ -s "$W/parts/map.example.com.tsv" ]; then _pass "SIGTERM: the finished seed's work is there"; else _fail "SIGTERM: the finished seed's work is there"; fi
+assert_grep  "$RS/err1.txt" 'run the same command again with --resume' "SIGTERM: the message says how to resume"
+sleep 0.5
+if pgrep -f 'sleep 61\.5' >/dev/null; then _fail "SIGTERM: the stages the run started are stopped too"; pkill -f 'sleep 61\.5'; else _pass "SIGTERM: the stages the run started are stopped too"; fi
+assert_absent "$RS/out/r.csv"                                                "SIGTERM: no partial CSV"
+# another command line is not resumed
+_rc=0; _rr "$RS/out" "$RS/err2.txt" --subs --resume || _rc=$?
+_rc_is "$_rc" 2                                                             "--resume with other options: refused (exit 2)"
+assert_grep  "$RS/err2.txt" 'no interrupted run in .* was started with this command line' "--resume with other options: ...and why"
+# run 2: --resume
+rm -f "$MOCKLOG/gau.hang" "$MOCKLOG/gau.seeds"
+_rc=0; _rr "$RS/out" "$RS/err3.txt" --resume || _rc=$?
+_rc_is "$_rc" 0                                                             "--resume: the run finishes"
+assert_grep  "$RS/err3.txt" '--resume \(session 2\): 1 of 2 seed\(s\) had finished'  "--resume: the finished seed is kept"
+refute_grep  "$MOCKLOG/gau.seeds" '^example\.com$'                           "--resume: the finished seed is not run again"
+assert_grep  "$MOCKLOG/gau.seeds" '^slow\.example\.org$'                     "--resume: the interrupted seed runs again"
+if diff <(sort "$RS/full/r.csv") <(sort "$RS/out/r.csv") >/dev/null 2>&1; then _pass "--resume: the CSV equals the uninterrupted run's"; else _fail "--resume: the CSV equals the uninterrupted run's"; fi
+assert_grep  "$RS/out/r.csv.run.json" '"sessions": 2'                        "run.json: two sessions"
+assert_grep  "$RS/out/r.csv.run.json" '"seeds_resumed": 1'                   "run.json: one seed carried over"
+if [ -n "$_rsid" ] && grep -q "\"run_id\": \"$_rsid\"" "$RS/out/r.csv.run.json"; then _pass "--resume keeps the run_id (Tideline sees one run)"; else _fail "--resume keeps the run_id  [state: ${_rsid:-none}]"; fi
+_rc=0; _rr "$RS/out" "$RS/err4.txt" --resume || _rc=$?
+_rc_is "$_rc" 2                                                             "--resume after the run finished: nothing to resume (exit 2)"
+# SIGINT (Ctrl-C) works the same way (here with SIGINT restored to its default: a script's
+# background job starts with it ignored)
+rm -rf "$RS/out2"; mkdir -p "$RS/out2"; : > "$MOCKLOG/gau.hang"; rm -f "$MOCKLOG/gau.seeds"
+env PATH="$TESTPATH" HTTPX_BIN=httpx SECLISTS="$SECLISTS_TEST" RECON_CLOUD_CACHE="$RS/cloud.tsv" TLS_CHAIN_CHECK=0 \
+  python3 -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.execvp("bash", ["bash"] + sys.argv[1:])' \
+  "$RUN_RECON" -i "$RS/in.txt" -D "$RS/out2" -o "$RS/out2/r.csv" -t 1 --no-report > /dev/null 2> "$RS/err5.txt" & RP=$!
+_wait_hang "$RS/out2" && sleep 0.5
+kill -INT "$RP" 2>/dev/null; _rc=0; wait "$RP" || _rc=$?
+_rc_is "$_rc" 130                                                           "SIGINT: the run stops with exit 130"
+assert_grep  "$(ls -d "$RS/out2"/_work-* | head -n 1)/state" '^status=interrupted$' "SIGINT: the work dir is kept"
+sleep 0.5; pkill -f 'sleep 61\.5' 2>/dev/null || true
+rm -f "$MOCKLOG/gau.hang" "$MOCKLOG/gau.seeds"; mv "$MOCKBIN/gau.base" "$MOCKBIN/gau"
+
+# --- v1.20 (Batch 5): redirect chains, login forms, the TLS version matrix, the leaf
+# certificate, CPE aliases ---------------------------------------------------------------
+section "Batch 5: redirect chains and login forms (aggregator, no requests)"
+B5D="$TMP/b5"; rm -rf "$B5D"; mkdir -p "$B5D"
+awk "/python3 - .*map.tsv.*<<'PY'/{f=1;next} f&&/^PY\$/{f=0} f" "$RUN_RECON" > "$B5D/agg.py"
+printf 'ex.com\thttp://r.ex.com/\tgau\nex.com\thttps://r.ex.com/\tgau\nex.com\thttps://r.ex.com/old\tgau\nex.com\thttps://loop.ex.com/a\tgau\nex.com\thttps://loop.ex.com/b\tgau\nex.com\thttp://p.ex.com/\tgau\nex.com\thttps://s.ex.com/\tgau\nex.com\thttps://n.ex.com/\tgau\nex.com\thttps://q.ex.com/\tgau\n' > "$B5D/map.tsv"
+python3 - "$B5D" <<'PYB5'
+import json, sys, os
+d = sys.argv[1]
+def rec(u, st, loc="", ex=None):
+    j = {"input": u, "url": u, "status_code": st, "content_type": "text/html", "header": {"content_type": "text/html"}}
+    if loc:
+        j["location"] = loc; j["header"]["location"] = loc
+    if ex is not None:
+        j["extracts"] = {"re": ex}
+    return json.dumps(j)
+pw = '<input type="password'
+with open(os.path.join(d, "httpx.jsonl"), "w") as f:
+    for line in (rec("http://r.ex.com/", 301, "https://r.ex.com/"), rec("https://r.ex.com/", 302, "/login"),
+                 rec("https://r.ex.com/old", 301, "https://other.ex.net/x#frag"),
+                 rec("https://loop.ex.com/a", 302, "/b"), rec("https://loop.ex.com/b", 302, "/a"),
+                 rec("http://p.ex.com/", 200, ex=['<form method="post">', pw]),
+                 rec("https://s.ex.com/", 200, ex=['<form action="/search">', '<FORM method=post action=\'/login?a=1&amp;b=2\'>', pw]),
+                 rec("https://n.ex.com/", 302, "/next"),
+                 rec("https://q.ex.com/", 200, ex=['<form action="/search">'])):
+        f.write(line + "\n")
+with open(os.path.join(d, "hops.jsonl"), "w") as f:   # what --extras fetched
+    f.write(rec("https://r.ex.com/login", 200, ex=['<form method="post" action="http://r.ex.com/session">', pw]) + "\n")
+PYB5
+: > "$B5D/tlsx.jsonl"
+( cd "$B5D" && env PATH="$TESTPATH" HOPS_FILE="$B5D/hops.jsonl" python3 agg.py map.tsv httpx.jsonl out.csv 0 2000 tlsx.jsonl >/dev/null 2>"$B5D/agg.err" )
+b5col(){ python3 - "$1" "$2" "$3" <<'PYCOL'
+import csv, sys
+for r in csv.DictReader(open(sys.argv[1], newline="")):
+    if r["url"] == sys.argv[2]:
+        print(r.get(sys.argv[3], "")); break
+PYCOL
+}
+b5eq(){ local got; got="$(b5col "$B5D/out.csv" "$1" "$2")"; if [ "$got" = "$3" ]; then _pass "$4"; else _fail "$4 (got: $got)"; fi; }
+b5eq http://r.ex.com/ final_url 'https://r.ex.com/login' "http:// -> https:// -> /login: final_url is the last URL that answered (a hop --extras fetched)"
+b5eq http://r.ex.com/ redirect_chain '301->https://r.ex.com/ | 302->https://r.ex.com/login' "redirect_chain: code->absolute URL per hop, joined ' | '"
+b5eq http://r.ex.com/ login_form 'http://r.ex.com/session' "login_form: the password form of the page the chain ends on, made absolute"
+b5eq http://r.ex.com/ http_flags 'CleartextAuth' "a form on an HTTPS page that posts to http:// -> CleartextAuth"
+b5eq http://r.ex.com/ auth 'Form' "auth gains Form for a password form (WebInventory's Auth=Form)"
+b5eq https://r.ex.com/old redirect_chain '301->https://other.ex.net/x' "an off-host hop is listed (fragment dropped) ..."
+b5eq https://r.ex.com/old final_url 'https://r.ex.com/old' "... and not followed: final_url stays the last URL that answered"
+b5eq https://loop.ex.com/a redirect_chain '302->https://loop.ex.com/b | 302->https://loop.ex.com/a' "a redirect loop stops when it comes back"
+b5eq https://n.ex.com/ redirect_chain '302->https://n.ex.com/next' "a hop nobody fetched is listed ..."
+b5eq https://n.ex.com/ final_url 'https://n.ex.com/' "... and the chain ends at the last URL that answered"
+b5eq http://p.ex.com/ login_form 'http://p.ex.com/' "a form without action posts to its own page"
+b5eq http://p.ex.com/ http_flags 'PlainHttp;CleartextAuth' "a password form on a plain-HTTP page -> CleartextAuth (after PlainHttp)"
+b5eq https://s.ex.com/ login_form 'https://s.ex.com/login?a=1&b=2' "the form before the password field wins (not the search form); entities decoded"
+b5eq https://s.ex.com/ http_flags '' "an HTTPS form posting to HTTPS is not cleartext"
+b5eq https://q.ex.com/ auth '' "a form without a password field is not a login form"
+b5eq https://q.ex.com/ final_url '' "a URL that does not redirect has no final_url or chain"
+assert_absent "$B5D/agg.err" "the aggregator ran without errors"
+
+section "Batch 5: --extras fetches same-host redirect hops; the login form joins the redirecting row"
+MOCK_HTTPX_REDIRECT='https://example.com/katana-path>/portal/login' MOCK_HTTPX_LOGIN='https://example.com/portal/login' run_case b5hops --extras
+assert_grep  "$MOCKLOG/httpx.args" -- "-er (\(\?is\)|[^ ]*)<form" "the enrichment request carries the login-form regex (-er)"
+assert_grep  "$ERRLOG" 'redirect hops: 1 same-host target\(s\) fetched' "the one hop the run had not probed is fetched"
+assert_grep  "$CSV" ',https://example\.com/katana-path,.*,https://example\.com/portal/login,302->https://example\.com/portal/login,http://example\.com/session,' "the redirecting row: final_url, redirect_chain, login_form"
+assert_grep  "$CSV" ',https://example\.com/katana-path,.*,Form,.*CleartextAuth' "... with Form in auth and CleartextAuth"
+refute_grep  "$CSV" ',https://example\.com/portal/login,example\.com,' "a hop is evidence for its chain, not a URL row of its own"
+MOCK_HTTPX_REDIRECT='https://example.com/katana-path>https://elsewhere.example.net/' run_case b5offhost --extras
+refute_grep  "$ERRLOG" 'redirect hops:'                              "an off-host target is never fetched"
+assert_grep  "$CSV" ',302->https://elsewhere\.example\.net/,'        "... but it is listed in the chain"
+MOCK_HTTPX_REDIRECT='https://example.com/katana-path>/portal/login' run_case b5nohops
+refute_grep  "$ERRLOG" 'redirect hops'                               "without --extras no hop is fetched"
+
+section "Batch 5: the TLS version matrix (tls_enum_probe) against a local TLS speaker"
+# (not enum.py: a file of that name next to a script shadows the stdlib's enum module)
+awk "/^# TLSENUM-PROBE/{f=1} f&&/^PYENUM\$/{f=0} f" "$RUN_RECON" > "$B5D/tlsenum_probe.py"
+python3 - "$B5D/port" <<'PYTLS' &
+# Answers each ClientHello with a ServerHello and closes: "legacy" on the first port (TLS 1.0-1.2,
+# server preference ECDHE-RSA-AES128-SHA, AES128-SHA, then NULL-SHA), "modern" on the second
+# (TLS 1.2 + 1.3). No key exchange: the probe stops at the ServerHello.
+import socket, struct, sys, os, threading
+def hello(conn):
+    try:
+        h = conn.recv(5)
+        if len(h) < 5: return None
+        body = b""
+        n = (h[3] << 8) | h[4]
+        while len(body) < n:
+            c = conn.recv(n - len(body))
+            if not c: return None
+            body += c
+        d = body[4:]
+        ver = (d[0] << 8) | d[1]; q = 34; q += 1 + d[q]
+        cl = (d[q] << 8) | d[q + 1]; suites = [(d[q + 2 + i] << 8) | d[q + 3 + i] for i in range(0, cl, 2)]; q += 2 + cl
+        q += 1 + d[q]
+        sv = []
+        if q + 2 <= len(d):
+            e = q + 2 + ((d[q] << 8) | d[q + 1]); q += 2
+            while q + 4 <= e:
+                t, l = (d[q] << 8) | d[q + 1], (d[q + 2] << 8) | d[q + 3]
+                if t == 0x002b: sv = [(d[q + 5 + i] << 8) | d[q + 6 + i] for i in range(0, d[q + 4], 2)]
+                q += 4 + l
+        return ver, suites, sv
+    except Exception:
+        return None
+def server_hello(ver, suite, tls13=False):
+    ext = (struct.pack(">HHH", 0x002b, 2, 0x0304)) if tls13 else b""
+    b = struct.pack(">H", 0x0303 if tls13 else ver) + os.urandom(32) + b"\x00" + struct.pack(">H", suite) + b"\x00"
+    b += struct.pack(">H", len(ext)) + ext
+    hs = b"\x02" + struct.pack(">I", len(b))[1:] + b
+    return b"\x16" + struct.pack(">H", 0x0303 if tls13 else ver) + struct.pack(">H", len(hs)) + hs
+ALERT = lambda code: b"\x15\x03\x03\x00\x02\x02" + bytes([code])
+def legacy(ver, suites, sv):
+    if ver < 0x0301: return ALERT(70)
+    v = min(ver, 0x0303)
+    for s in (0xC013, 0x002F, 0x0002):
+        if s in suites: return server_hello(v, s)
+    return ALERT(40)
+def modern(ver, suites, sv):
+    if 0x0304 in sv: return server_hello(0x0303, 0x1301, tls13=True)
+    if ver < 0x0303: return ALERT(70)
+    return server_hello(0x0303, 0xC02F) if 0xC02F in suites else ALERT(40)
+socks = []
+for prof in (legacy, modern):
+    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", 0)); s.listen(16); s.settimeout(20)
+    socks.append((s, prof))
+open(sys.argv[1], "w").write(" ".join(str(s.getsockname()[1]) for s, _ in socks))
+def serve(s, prof):
+    for _ in range(6):
+        try:
+            c, _a = s.accept()
+        except Exception:
+            return
+        r = hello(c)
+        if r: c.sendall(prof(*r))
+        c.close()
+ts = [threading.Thread(target=serve, args=x) for x in socks]
+[t.start() for t in ts]; [t.join() for t in ts]
+PYTLS
+_tsrv=$!
+for _i in $(seq 1 20); do [ -s "$B5D/port" ] && break; sleep 0.2; done
+read -r LPORT MPORT < "$B5D/port"
+printf 'legacy.test:%s\nmodern.test:%s\nnoaddr.test:443\n' "$LPORT" "$MPORT" > "$B5D/keys.txt"
+printf '{"host":"legacy.test","port":"%s","ip":"127.0.0.1"}\n{"host":"modern.test","port":"%s","ip":"127.0.0.1"}\n{"host":"noaddr.test","port":"443"}\n' "$LPORT" "$MPORT" > "$B5D/tlsx_ip.jsonl"
+TLS_ENUM_TIMEOUT=3 python3 -I "$B5D/tlsenum_probe.py" "$B5D/keys.txt" "$B5D/tlsx_ip.jsonl" > "$B5D/enum.jsonl" 2>"$B5D/enum.err"
+kill "$_tsrv" 2>/dev/null; wait "$_tsrv" 2>/dev/null
+assert_grep "$B5D/enum.jsonl" '"host": "legacy\.test".*"tls_supported": \["TLS 1\.2", "TLS 1\.1", "TLS 1\.0"\]' "legacy: TLS 1.2, 1.1, 1.0 (the TLS 1.3 hello answered at 1.2 is not counted; SSL 3.0 refused)"
+assert_grep "$B5D/enum.jsonl" '"host": "legacy\.test".*"TLS 1\.0": "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA"' "legacy: the suite the server chose, per version"
+assert_grep "$B5D/enum.jsonl" '"host": "legacy\.test".*"tls_weak_cipher": "TLS 1\.2:TLS_RSA_WITH_NULL_SHA"' "legacy: the weak-only hello is answered with NULL-SHA -> tls_weak_cipher"
+assert_grep "$B5D/enum.jsonl" '"host": "modern\.test".*"tls_ciphers": \{"TLS 1\.2": "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", "TLS 1\.3": "TLS_AES_128_GCM_SHA256"\}' "modern: TLS 1.3 from the supported_versions extension, TLS 1.2"
+assert_grep "$B5D/enum.jsonl" '"host": "modern\.test".*"tls_weak_cipher": ""' "modern: no weak suite accepted"
+refute_grep "$B5D/enum.jsonl" 'noaddr'                                "a host tlsx gave no address for is not contacted"
+assert_absent "$B5D/enum.err" "the probe ran without errors"
+# joined by the aggregator: columns and the WeakTLS / WeakCipher flags
+printf 'ex.com\thttps://legacy.test:%s/\tgau\nex.com\thttps://modern.test:%s/\tgau\n' "$LPORT" "$MPORT" > "$B5D/map2.tsv"
+printf '{"host":"legacy.test","port":"%s","tls_version":"tls12","cipher":"TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA"}\n{"host":"modern.test","port":"%s","tls_version":"tls13","cipher":"TLS_AES_128_GCM_SHA256"}\n' "$LPORT" "$MPORT" > "$B5D/tlsx2.jsonl"
+: > "$B5D/empty.jsonl"
+( cd "$B5D" && env PATH="$TESTPATH" TLSENUM_FILE="$B5D/enum.jsonl" python3 agg.py map2.tsv empty.jsonl out2.csv 0 2000 tlsx2.jsonl >/dev/null 2>&1 )
+b5eq2(){ local got; got="$(b5col "$B5D/out2.csv" "$1" "$2")"; if [ "$got" = "$3" ]; then _pass "$4"; else _fail "$4 (got: $got)"; fi; }
+b5eq2 "https://legacy.test:$LPORT/" tls_supported 'TLS 1.2;TLS 1.1;TLS 1.0' "tls_supported column"
+b5eq2 "https://legacy.test:$LPORT/" tls_weak_cipher 'TLS 1.2:TLS_RSA_WITH_NULL_SHA' "tls_weak_cipher column"
+b5eq2 "https://legacy.test:$LPORT/" tls_flags 'WeakTLS;WeakCipher' "WeakTLS (TLS 1.0/1.1 accepted) and WeakCipher (NULL-SHA accepted)"
+b5eq2 "https://modern.test:$MPORT/" tls_ciphers 'TLS 1.3=TLS_AES_128_GCM_SHA256;TLS 1.2=TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256' "tls_ciphers in plan order (1.3 first)"
+b5eq2 "https://modern.test:$MPORT/" tls_flags '' "the modern host carries no flag"
+
+section "Batch 5: the leaf certificate (tlsx -cert): cert_key, cert_sig_alg, WeakKey, WeakSig, DefaultCert, CertNotYetValid"
+if command -v openssl >/dev/null 2>&1 \
+   && openssl req -x509 -newkey rsa:1024 -sha1 -nodes -keyout "$B5D/k1.pem" -out "$B5D/weak.pem" -days 2 -subj "/CN=weak.ex.com" >/dev/null 2>&1 \
+   && openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -sha256 -nodes -keyout "$B5D/k2.pem" -out "$B5D/ec.pem" -days 2 -subj "/CN=ec.ex.com" >/dev/null 2>&1 \
+   && openssl req -x509 -newkey rsa:2048 -sha256 -nodes -keyout "$B5D/k3.pem" -out "$B5D/def.pem" -days 2 -subj "/C=AU/ST=Some-State/O=Internet Widgits Pty Ltd/CN=def.ex.com" >/dev/null 2>&1; then
+  python3 - "$B5D" > "$B5D/tlsx3.jsonl" <<'PYCERT'
+import json, sys, os, datetime
+d = sys.argv[1]
+now = datetime.datetime.now(datetime.timezone.utc)
+iso = lambda t: t.strftime("%Y-%m-%dT%H:%M:%SZ")
+pem = lambda n: open(os.path.join(d, n)).read()
+far, past, soon = iso(now + datetime.timedelta(days=300)), iso(now - datetime.timedelta(days=1)), iso(now + datetime.timedelta(days=20))
+for r in [
+    {"host": "weak.ex.com", "port": "443", "tls_version": "tls12", "cipher": "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", "not_before": past, "not_after": far, "certificate": pem("weak.pem")},
+    {"host": "ec.ex.com", "port": "443", "tls_version": "tls13", "cipher": "TLS_AES_128_GCM_SHA256", "not_before": past, "not_after": far, "certificate": pem("ec.pem")},
+    {"host": "def.ex.com", "port": "443", "tls_version": "tls13", "cipher": "TLS_AES_128_GCM_SHA256", "not_before": past, "not_after": far, "certificate": pem("def.pem"),
+     "subject_dn": "CN=def.ex.com, O=Internet Widgits Pty Ltd, ST=Some-State, C=AU", "self_signed": True},
+    {"host": "future.ex.com", "port": "443", "tls_version": "tls13", "cipher": "TLS_AES_128_GCM_SHA256", "not_before": iso(now + datetime.timedelta(days=30)), "not_after": far},
+    {"host": "gone.ex.com", "port": "443", "tls_version": "tls13", "cipher": "TLS_AES_128_GCM_SHA256", "not_before": iso(now - datetime.timedelta(days=90)), "not_after": past},
+    {"host": "esxi.ex.com", "port": "443", "tls_version": "tls12", "cipher": "TLS_AES_128_GCM_SHA256", "not_after": far, "issuer_dn": "CN=localhost.localdomain, OU=VMware Engineering, O=VMware"},
+    {"host": "junk.ex.com", "port": "443", "tls_version": "tls13", "cipher": "TLS_AES_128_GCM_SHA256", "not_after": far, "certificate": "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"},
+]:
+    print(json.dumps(r))
+PYCERT
+  printf 'ex.com\thttps://%s.ex.com/\tgau\n' weak ec def future gone esxi junk > "$B5D/map3.tsv"
+  ( cd "$B5D" && env PATH="$TESTPATH" python3 agg.py map3.tsv empty.jsonl out3.csv 0 2000 tlsx3.jsonl >/dev/null 2>"$B5D/agg3.err" )
+  b5eq3(){ local got; got="$(b5col "$B5D/out3.csv" "$1" "$2")"; if [ "$got" = "$3" ]; then _pass "$4"; else _fail "$4 (got: $got)"; fi; }
+  b5eq3 https://weak.ex.com/ cert_key 'RSA 1024' "cert_key: RSA modulus size from the DER (stdlib parser)"
+  b5eq3 https://weak.ex.com/ cert_sig_alg 'sha1WithRSAEncryption' "cert_sig_alg: the signature algorithm"
+  b5eq3 https://weak.ex.com/ tls_flags 'WeakKey;WeakSig' "RSA 1024 / SHA-1 -> WeakKey;WeakSig"
+  b5eq3 https://ec.ex.com/ cert_key 'EC P-256' "an EC key names its curve"
+  b5eq3 https://ec.ex.com/ tls_flags '' "EC P-256 / SHA-256: no flag"
+  b5eq3 https://def.ex.com/ tls_flags 'SelfSigned;DefaultCert' "OpenSSL's default subject (Internet Widgits) -> DefaultCert"
+  b5eq3 https://esxi.ex.com/ tls_flags 'DefaultCert' "the VMware installer's issuer -> DefaultCert"
+  b5eq3 https://future.ex.com/ tls_flags 'CertNotYetValid' "notBefore in the future -> CertNotYetValid (tlsx reports no expired flag for it)"
+  b5eq3 https://future.ex.com/ cert_not_before "$(python3 -c 'import json,sys; print([json.loads(l) for l in open(sys.argv[1])][3]["not_before"])' "$B5D/tlsx3.jsonl")" "cert_not_before column"
+  b5eq3 https://gone.ex.com/ tls_flags 'CertExpired' "notAfter in the past -> CertExpired even without tlsx's expired field"
+  b5eq3 https://junk.ex.com/ cert_key '' "an unreadable certificate leaves the columns blank"
+  refute_grep "$B5D/agg3.err" 'Traceback' "the aggregator ran without errors"
+else
+  _pass "openssl unavailable: certificate parsing test skipped"
+fi
+
+section "Batch 5: the chain check retries below the local OpenSSL security level"
+if command -v openssl >/dev/null 2>&1 && openssl req -x509 -newkey rsa:1024 -sha1 -nodes -keyout "$B5D/lk.pem" -out "$B5D/lc.pem" -days 2 -subj "/CN=localhost" >/dev/null 2>&1; then
+  # a TLS 1.0-only server (RSA 1024 / SHA-1): the local OpenSSL refuses the protocol before
+  # it gets to the chain, so only the second try (level 0) can reach the verdict
+  python3 - "$B5D/lc.pem" "$B5D/lk.pem" "$B5D/lport" <<'PYLSRV' &
+import ssl, socket, sys, warnings
+warnings.simplefilter("ignore")
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.set_ciphers("DEFAULT:@SECLEVEL=0"); ctx.load_cert_chain(sys.argv[1], sys.argv[2])
+ctx.minimum_version = ssl.TLSVersion.TLSv1; ctx.maximum_version = ssl.TLSVersion.TLSv1
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", 0)); s.listen(5); s.settimeout(20)
+open(sys.argv[3], "w").write(str(s.getsockname()[1]))
+n = 0
+for _ in range(3):
+    try:
+        c, _a = s.accept()
+    except Exception:
+        break
+    n += 1; s.settimeout(2)
+    try:
+        ctx.wrap_socket(c, server_side=True).close()
+    except Exception:
+        pass
+open(sys.argv[3] + ".n", "w").write(str(n))
+PYLSRV
+  _lsrv=$!
+  for _i in $(seq 1 20); do [ -s "$B5D/lport" ] && break; sleep 0.2; done
+  printf '{"host":"localhost","ip":"127.0.0.1","port":"%s"}\n' "$(cat "$B5D/lport")" > "$B5D/lt.jsonl"
+  awk '/^tls_chain_check\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' "$RUN_RECON" > "$B5D/fn.sh"
+  ( . "$B5D/fn.sh"; tls_chain_check "$B5D/lt.jsonl" )
+  for _i in $(seq 1 30); do [ -s "$B5D/lport.n" ] && break; sleep 0.2; done
+  kill "$_lsrv" 2>/dev/null; wait "$_lsrv" 2>/dev/null
+  assert_grep "$B5D/lt.jsonl" '"chain_error": "self-signed certificate", "untrusted": true' "a TLS 1.0-only self-signed host: the second try at level 0 reaches the verdict"
+  if [ "$(cat "$B5D/lport.n" 2>/dev/null)" = 2 ]; then _pass "... after exactly one retry"; else _fail "... after exactly one retry (got $(cat "$B5D/lport.n" 2>/dev/null) connections)"; fi
+else
+  _pass "openssl unavailable: chain retry test skipped"
+fi
+
+section "Batch 5: report findings for the new flags and cleartext login forms"
+R5="$TMP/rpt20"; rm -rf "$R5"; mkdir -p "$R5"
+python3 - "$R5/r.csv" <<'PYR5'
+import csv, sys
+cols = ["seed_domain", "url", "host", "sources", "status_code", "tls_version", "tls_flags", "auth", "http_flags",
+        "final_url", "redirect_chain", "login_form", "tls_supported", "tls_weak_cipher", "cert_key", "cert_sig_alg", "cert_not_before"]
+rows = [
+    ["ex.com", "https://legacy.ex.com/", "legacy.ex.com", "gau", "200", "TLS 1.2", "WeakTLS;WeakCipher;WeakKey;WeakSig;DefaultCert", "", "",
+     "", "", "", "TLS 1.2;TLS 1.1;TLS 1.0;SSL 3.0", "TLS 1.2:TLS_RSA_WITH_NULL_SHA", "RSA 1024", "sha1WithRSAEncryption", ""],
+    ["ex.com", "https://soon.ex.com/", "soon.ex.com", "gau", "200", "TLS 1.3", "CertNotYetValid", "", "",
+     "", "", "", "", "", "EC P-256", "ecdsa-with-SHA256", "2031-02-03T04:05:06Z"],
+    ["ex.com", "http://r.ex.com/", "r.ex.com", "gau", "301", "", "", "Form", "CleartextAuth",
+     "https://r.ex.com/login", "301->https://r.ex.com/ | 302->https://r.ex.com/login", "http://r.ex.com/session", "", "", "", "", ""],
+    ["ex.com", "https://r.ex.com/", "r.ex.com", "gau", "302", "", "", "Form", "CleartextAuth",
+     "https://r.ex.com/login", "302->https://r.ex.com/login", "http://r.ex.com/session", "", "", "", "", ""],
+]
+w = csv.writer(open(sys.argv[1], "w", newline="")); w.writerow(cols); w.writerows(rows)
+PYR5
+env PATH="$TESTPATH" bash "$REPORT_SH" -o "$R5/out.html" "$R5/r.csv" >/dev/null 2>"$R5/e.log"
+assert_grep "$R5/out.html" 'obsolete protocol versions accepted: TLS 1\.1, TLS 1\.0, SSL 3\.0' "WeakTLS names the old versions accepted"
+assert_grep "$R5/out.html" 'weak cipher accepted: TLS_RSA_WITH_NULL_SHA \(TLS 1\.2\)' "WeakCipher names the suite and version"
+assert_grep "$R5/out.html" 'weak certificate key \(RSA 1024\)'      "WeakKey names the key"
+assert_grep "$R5/out.html" 'weak certificate signature \(sha1WithRSAEncryption\)' "WeakSig names the algorithm"
+assert_grep "$R5/out.html" 'certificate not valid yet \(valid from 2031-02-03 04:05 UTC\)' "CertNotYetValid gives the start date"
+assert_grep "$R5/out.html" "default certificate is still in place" "DefaultCert finding"
+assert_grep "$R5/out.html" 'login form sends the password in cleartext: https://r\.ex\.com/login posts to http://r\.ex\.com/session' "a cleartext login form is one finding ..."
+if [ "$(grep -o 'login form sends the password in cleartext' "$R5/out.html" | wc -l)" = "$(grep -o 'weak certificate key (RSA 1024)' "$R5/out.html" | wc -l)" ]; then
+  _pass "... however many rows reach it (counted like any other single finding)"
+else _fail "... however many rows reach it (counted like any other single finding)"; fi
+refute_grep "$R5/out.html" 'credentials sent in cleartext: Form'     "not reported as Basic/Digest auth"
+assert_grep "$R5/out.html" 'sev-high"[^>]*>HIGH</span></td><td>TLS / certificate</td><td>[^\n]*obsolete protocol versions accepted: [^<]*SSL 3\.0' "WeakTLS with SSL 3.0 accepted is graded high (POODLE)"
+
+section "Batch 5: CPE aliases in the vulns join (cpe-aliases.json)"
+X1D="$TMP/x1"; rm -rf "$X1D"; mkdir -p "$X1D/nvd"
+printf 'seed_domain,url,host,status_code,technologies,cpe\nex.com,https://jira.ex.com/,jira.ex.com,200,Jira:9.4.0,cpe:2.3:a:atlassian:jira:9.4.0:*:*:*:*:*:*:*\nex.com,https://cache.ex.com/,cache.ex.com,200,Varnish,cpe:2.3:a:varnish_cache_project:varnish_cache:7.1.0:*:*:*:*:*:*:*\n' > "$X1D/r.csv"
+python3 - "$X1D/nvd/nvdcve-2.0-2026.json" <<'PYX1'
+import json, sys
+def cve(i, crit, **rng):
+    cm = {"vulnerable": True, "criteria": crit}; cm.update(rng)
+    return {"cve": {"id": i, "published": "2026-01-01", "lastModified": "2026-01-02", "vulnStatus": "Analyzed",
+            "descriptions": [{"lang": "en", "value": "test " + i}],
+            "configurations": [{"nodes": [{"operator": "OR", "cpeMatch": [cm]}]}]}}
+json.dump({"vulnerabilities": [
+    cve("CVE-2026-0001", "cpe:2.3:a:atlassian:jira_server:*:*:*:*:*:*:*:*", versionStartIncluding="9.0.0", versionEndExcluding="9.4.5"),
+    cve("CVE-2026-0002", "cpe:2.3:a:varnish-software:varnish_cache:*:*:*:*:*:*:*:*", versionEndExcluding="7.2.0"),
+    cve("CVE-2026-0003", "cpe:2.3:a:atlassian:jira_server:*:*:*:*:*:*:*:*", versionEndExcluding="9.0.0"),
+    cve("CVE-2026-0004", "cpe:2.3:a:atlassian:confluence:*:*:*:*:*:*:*:*", versionEndExcluding="9.0.0"),
+]}, open(sys.argv[1], "w"))
+PYX1
+env PATH="$TESTPATH" bash "$RDB" vulns "$X1D/r.csv" --nvd-feed "$X1D/nvd" -o "$X1D/v.csv" >/dev/null 2>&1
+assert_grep  "$X1D/v.csv" '^ex\.com,jira\.ex\.com,.*,CVE-2026-0001,.*,range,' "a CVE filed under jira_server joins the service CPE'd as atlassian:jira (version range checked)"
+assert_grep  "$X1D/v.csv" '^ex\.com,cache\.ex\.com,.*,CVE-2026-0002,'         "Varnish Cache under another vendor string joins too"
+refute_grep  "$X1D/v.csv" 'CVE-2026-0003|CVE-2026-0004'                       "the version range still decides; other products stay out"
+assert_grep  "$X1D/v.csv.provenance.json" '"cpe_aliases": \{' "provenance records the alias file ..."
+assert_grep  "$X1D/v.csv.provenance.json" '"groups": 184'     "... and its 184 groups"
+env PATH="$TESTPATH" CPE_ALIASES_FILE= bash "$RDB" vulns "$X1D/r.csv" --nvd-feed "$X1D/nvd" -o "$X1D/v0.csv" >/dev/null 2>&1
+if [ "$(wc -l < "$X1D/v0.csv")" = 1 ]; then _pass "CPE_ALIASES_FILE= turns the aliases off (exact names only: no match)"; else _fail "CPE_ALIASES_FILE= turns the aliases off"; fi
+mkdir -p "$X1D/bin"; ln -sf "$RDB" "$X1D/bin/recon-db"
+env PATH="$TESTPATH" bash "$X1D/bin/recon-db" vulns "$X1D/r.csv" --nvd-feed "$X1D/nvd" -o "$X1D/v2.csv" >/dev/null 2>&1
+assert_grep  "$X1D/v2.csv" 'CVE-2026-0001'                    "run through a symlink (the installed command), the alias file is still found"
+
+# --- Batch 6: JSON lines (--json), run_id/--engagement, shipping to Tideline (--ship) ----
+section "Batch 6: the CSV builder writes urls.jsonl and services.jsonl (RR_JSON=1), unguarded"
+B6="$TMP/b6"; rm -rf "$B6"; mkdir -p "$B6/agg"
+LABDIR6="$(dirname "$RUN_RECON")/lab"; SCHEMAS6="$(dirname "$RUN_RECON")/schemas"; SHIP6="$(dirname "$RUN_RECON")/ship-recon.sh"
+awk "/^python3 - .*<<'PY'/{f=1;next} f&&/^PY\$/{f=0} f" "$RUN_RECON" > "$B6/agg/agg.py"
+printf 'ex.com\thttps://a.ex.com/\tgau\nex.com\thttps://a.ex.com/login?x=1\tkatana\nex.com\thttps://a.ex.com:8443/admin\tkatana\nex.com\thttp://b.ex.com/p\tgau\nother.org\thttps://a.ex.com/\tgau\n' > "$B6/agg/map.tsv"
+cat > "$B6/agg/httpx.jsonl" <<'JX'
+{"input":"https://a.ex.com/","url":"https://a.ex.com/","status_code":200,"title":"=HYPERLINK(\"http://x\")","webserver":"nginx","host":"1.1.1.1","a":["1.1.1.1"]}
+{"input":"https://a.ex.com/login?x=1","url":"https://a.ex.com/login?x=1","status_code":200,"title":"+1 login","host":"1.1.1.1","a":["1.1.1.1"]}
+{"input":"https://a.ex.com:8443/admin","url":"https://a.ex.com:8443/admin","status_code":401,"title":"Admin","host":"1.1.1.1","a":["1.1.1.1"]}
+{"input":"http://b.ex.com/p","url":"http://b.ex.com/p","status_code":404,"title":"Not found","host":"2.2.2.2","a":["2.2.2.2"]}
+JX
+( cd "$B6/agg" && env PATH="$TESTPATH" python3 agg.py map.tsv httpx.jsonl off.csv 0 100 >/dev/null 2>&1 )
+if [ -f "$B6/agg/off.csv" ] && ! ls "$B6/agg"/off.csv.*.jsonl >/dev/null 2>&1; then _pass "without --json the CSV builder writes no JSON lines"; else _fail "without --json the CSV builder writes no JSON lines"; fi
+( cd "$B6/agg" && env PATH="$TESTPATH" RR_JSON=1 python3 agg.py map.tsv httpx.jsonl out.csv 0 100 >/dev/null 2>&1 )
+python3 - "$B6/agg/out.csv" > "$B6/agg/check.txt" 2>&1 <<'PYB6A'
+import csv, json, sys
+out = sys.argv[1]
+rows = list(csv.reader(open(out, newline="", encoding="utf-8")))
+hdr, body = rows[0], rows[1:]
+def ung(v):
+    return v[1:] if v[:1] == "'" and v[1:2] in ("=", "+", "-", "@", "\t", "\r") else v
+js = [json.loads(l) for l in open(out + ".urls.jsonl", encoding="utf-8")]
+print("count", len(js) == len(body))
+print("order", all(list(j) == hdr for j in js))
+print("equal", all([ung(c) for c in r] == [j[k] for k in hdr] for r, j in zip(body, js)))
+t = {j["url"]: j["title"] for j in js}
+c = {r[1]: r[7] for r in body}
+print("unguarded", t["https://a.ex.com/"] == '=HYPERLINK("http://x")' and c["https://a.ex.com/"].startswith("'="))
+print("strings", all(isinstance(v, str) for j in js for v in j.values()))
+sv = [json.loads(l) for l in open(out + ".services.jsonl", encoding="utf-8")]
+key = {(s["seed_domain"], s["service"]): s for s in sv}
+a = key.get(("ex.com", "https://a.ex.com"), {})
+print("services", sorted(key) == [("ex.com", "http://b.ex.com"), ("ex.com", "https://a.ex.com"), ("ex.com", "https://a.ex.com:8443"), ("other.org", "https://a.ex.com")])
+print("svc_root", a.get("url") == "https://a.ex.com/" and a.get("url_count") == 2 and a.get("port") == 443 and a.get("scheme") == "https")
+print("svc_port", key.get(("ex.com", "https://a.ex.com:8443"), {}).get("port") == 8443 and key.get(("ex.com", "http://b.ex.com"), {}).get("port") == 80)
+print("svc_fields", list(a)[:6] == ["seed_domain", "service", "scheme", "host", "port", "url_count"] and set(a) == set(hdr) | {"service", "scheme", "port", "url_count"})
+PYB6A
+assert_grep  "$B6/agg/check.txt" '^count True$'      "urls.jsonl: one record per CSV row"
+assert_grep  "$B6/agg/check.txt" '^order True$'      "urls.jsonl: the CSV's field names, in its column order"
+assert_grep  "$B6/agg/check.txt" '^equal True$'      "urls.jsonl: every value equals the CSV cell (after the formula guard is undone)"
+assert_grep  "$B6/agg/check.txt" '^unguarded True$'  "urls.jsonl: a title starting with = is the site's text (the CSV keeps its apostrophe)"
+assert_grep  "$B6/agg/check.txt" '^strings True$'    "urls.jsonl: values are strings, as in the CSV"
+assert_grep  "$B6/agg/check.txt" '^services True$'   "services.jsonl: one record per seed and scheme://host[:port] (default ports omitted)"
+assert_grep  "$B6/agg/check.txt" '^svc_root True$'   "services.jsonl: the root URL's values, url_count over the service's URLs"
+assert_grep  "$B6/agg/check.txt" '^svc_port True$'   "services.jsonl: port explicit (8443, 80)"
+assert_grep  "$B6/agg/check.txt" '^svc_fields True$' "services.jsonl: service/scheme/port/url_count, then the URL fields"
+
+section "Batch 6: the side files as JSON lines (findings, TSV inventories, warnings, seeds)"
+mkdir -p "$B6/exp/wd"
+awk "/<<'PYJSONL'/{f=1;next} f&&/^PYJSONL\$/{f=0} f" "$RUN_RECON" > "$B6/exp/jsonl.py"
+X="$B6/exp/r.csv"
+printf '[ex.com] dangling-cname [high] host=old.ex.com cname=gone.herokudns.com dns=NXDOMAIN provider=heroku note=claim it: the name points at an app that no longer exists (a=b, "q")\n[ex.com] nuclei-takeover [aws-bucket-takeover] [dns] [critical] old2.ex.com\n[ex.com] plain line without any tag http://old3.ex.com/x\n' > "$X.takeover.txt"
+printf '[ex.com] nuclei [git-config] [http] [medium] https://a.ex.com:8443/.git/config\n' > "$X.nuclei.txt"
+printf '[ex.com] security-txt-invalid [low] host=a.ex.com path=/.well-known/security.txt contact="mailto:x y" note=RFC 9116 requires Expires=\n\n' > "$X.extras.txt"
+printf 'seed_domain\thost\tedge\torigin_software\tedge_evidence\tjarm\tcdn\tfavicon_mmh3\ttitle\tedge_ip\nex.com\ta.ex.com\tcloudflare\tnginx\tcf-ray\t\tcloudflare\t123\tA\t104.16.0.1\n' > "$X.edge.tsv"
+printf 'host\tfile\tstatus\treason\tbytes\na.ex.com\ta.png\tok\t\t100\nb.ex.com\t\tfailed\tno image\n' > "$X.screenshots.tsv"
+printf 'change\tseed\tservice\tfield\told\tnew\nchanged\tex.com\thttps://a.ex.com\ttitle\tOld\tNew\twith\ttabs\n' > "$X.delta.tsv"
+{ for i in $(seq 1 250); do printf '\033[1;33mwarning %d\033[0m\n' "$i"; done; printf 'warning 1\n'; } > "$B6/exp/wd/warnings.txt"
+printf 'ex.com\t12\t10\t3\nother.org\t-\t-\t0\n' > "$B6/exp/wd/seedstat.tsv"
+( cd "$B6/exp" && python3 jsonl.py "$X" "$B6/exp/wd" > sum.txt 2> err.txt )
+python3 - "$X" > "$B6/exp/check.txt" 2>&1 <<'PYB6B'
+import json, sys
+x = sys.argv[1]
+def jl(k):
+    return [json.loads(l) for l in open("%s.%s.jsonl" % (x, k), encoding="utf-8")]
+f = jl("findings")
+d = {(r["source"], r["check"]): r for r in f}
+s = d.get(("takeover", "dangling-cname"), {})
+print("structured", s.get("severity") == "high" and s.get("seed") == "ex.com" and s.get("host") == "old.ex.com"
+      and s.get("fields") == {"host": "old.ex.com", "cname": "gone.herokudns.com", "dns": "NXDOMAIN", "provider": "heroku"})
+print("note", s.get("note") == 'claim it: the name points at an app that no longer exists (a=b, "q")')
+t = d.get(("takeover", "nuclei-takeover"), {})
+print("toolline", t.get("severity") == "critical" and t.get("fields") == {} and t.get("text", "").startswith("nuclei-takeover [aws"))
+p = d.get(("takeover", "plain"), {})
+print("default", p.get("severity") == "high" and p.get("host") == "old3.ex.com")
+n = d.get(("nuclei", "nuclei"), {})
+print("nuclei", n.get("severity") == "medium" and n.get("host") == "a.ex.com")
+e = d.get(("extras", "security-txt-invalid"), {})
+print("quoted", e.get("fields", {}).get("contact") == "mailto:x y" and e.get("note") == "RFC 9116 requires Expires=")
+print("nfind", len(f) == 5)
+ed = jl("edges")
+print("edges", ed == [{"seed_domain": "ex.com", "host": "a.ex.com", "edge": "cloudflare", "origin_software": "nginx",
+                       "edge_evidence": "cf-ray", "jarm": "", "cdn": "cloudflare", "favicon_mmh3": "123", "title": "A",
+                       "edge_ip": "104.16.0.1"}])
+sh = jl("screenshots")
+print("short", sh[1] == {"host": "b.ex.com", "file": "", "status": "failed", "reason": "no image", "bytes": ""})
+de = jl("delta")
+print("long", de[0]["new"] == "New\twith\ttabs")
+w = jl("warnings")
+print("warnings", len(w) == 250 and w[0] == {"message": "warning 1"} and w[-1] == {"message": "warning 250"})
+se = jl("seeds")
+print("seeds", se == [{"seed": "ex.com", "candidates": 12, "resolved": 10, "live_hosts": 3},
+                      {"seed": "other.org", "candidates": None, "resolved": None, "live_hosts": 0}])
+PYB6B
+for _k in structured note toolline default nuclei quoted nfind edges short long warnings seeds; do
+  case "$_k" in
+    structured) _m="findings: '[seed] check [severity] key=value ... note=' -> seed, check, severity, host, fields";;
+    note)       _m="findings: the note is the free text to the end of the line (= signs and quotes kept)";;
+    toolline)   _m="findings: a tool's output line keeps its text, its first [severity] tag, no fields";;
+    default)    _m="findings: an untagged line gets the report's default severity for its kind; host from its URL";;
+    nuclei)     _m="findings: nuclei lines: severity from the tag, host from the URL (port dropped)";;
+    quoted)     _m="findings: a quoted value is one field";;
+    nfind)      _m="findings: every non-empty line, one record each";;
+    edges)      _m="edges.jsonl: the TSV header's field names";;
+    short)      _m="a short TSV row is padded with empty strings";;
+    long)       _m="a TSV row with extra tabs keeps them in its last field";;
+    warnings)   _m="warnings.jsonl: every warning (not capped at 200), ANSI codes stripped, duplicates once";;
+    seeds)      _m="seeds.jsonl: counts as integers, null where a stage did not count";;
+  esac
+  assert_grep "$B6/exp/check.txt" "^$_k True\$" "$_m"
+done
+assert_grep  "$B6/exp/err.txt" '2 TSV row\(s\) had the wrong number of fields' "the exporter reports the TSV rows it had to fix up (one short, one long)"
+assert_absent "$X.dnsposture.jsonl" "a stage that did not run gets no JSON lines file"
+
+section "Batch 6: schema contract (schemas/: JSON Schema 2020-12, field lists match what run-recon writes)"
+python3 - "$SCHEMAS6" "$RUN_RECON" "$(dirname "$RUN_RECON")/recon-db.sh" > "$B6/contract.txt" 2>&1 <<'PYB6C'
+import json, os, re, sys
+sd, rr, rdb = sys.argv[1:4]
+S = {}
+for n in sorted(os.listdir(sd)):
+    if not n.endswith(".json"):
+        continue
+    s = json.load(open(os.path.join(sd, n)))
+    S[s["x-tideline-schema"]] = s
+src = open(rr, encoding="utf-8").read()
+db = open(rdb, encoding="utf-8").read()
+m = re.search(r"CSV_HEADER = \[(.*?)\]", src, re.S)
+csvh = re.findall(r'"([a-z0-9_]+)"', m.group(1)) if m else []
+print("url", list(S["run-recon.url/1"]["properties"]) == csvh and S["run-recon.url/1"]["required"] == csvh and len(csvh) == 48)
+def tsv(pat, text=src):
+    m = re.search(pat, text)
+    return m.group(1).split("\\t") if m else None
+heads = {
+    "run-recon.edge/1": tsv(r"printf '(seed_domain\\thost\\tedge\\t[^']*?)\\n"),
+    "run-recon.cname/1": tsv(r"printf '(seed_domain\\thost\\tcname_chain[^']*?)\\n"),
+    "run-recon.zone-name/1": tsv(r"printf '(zone\\tname\\tsource)\\n"),
+    "run-recon.screenshot/1": tsv(r'o\.write\("(host\\tfile\\tstatus[^"]*?)\\n"\)'),
+    "run-recon.cloud-asset/1": tsv(r'"(provider\\taccount\\tservice[^"]*?)\\n"'),
+    "run-recon.vulnx/1": tsv(r'"(vendor\\tproduct\\tversions_seen[^"]*?)\\n"'),
+    "run-recon.delta/1": tsv(r'o\.write\("(change\\tseed\\tservice[^"]*?)\\n"\)', db),
+}
+m = re.search(r'COLS = \[("name", "role".*?)\]', src)
+heads["run-recon.dnsposture/1"] = re.findall(r'"([a-z_]+)"', m.group(1)) if m else None
+bad = [k for k, h in heads.items() if not h or list(S[k]["properties"]) != h or S[k]["required"] != h]
+print("tsv", not bad, bad)
+try:
+    import jsonschema
+    for s in S.values():
+        jsonschema.Draft202012Validator.check_schema(s)
+    print("metaschema True")
+except ImportError:
+    print("metaschema True (jsonschema not installed: skipped)")
+PYB6C
+assert_grep  "$B6/contract.txt" '^url True$'        "run-recon.url/1 lists exactly the CSV's 48 columns, in order"
+assert_grep  "$B6/contract.txt" '^tsv True'         "each TSV schema lists exactly the header run-recon (recon-db.sh) writes"
+assert_grep  "$B6/contract.txt" '^metaschema True'  "every schema is valid JSON Schema 2020-12"
+
+# a schema validator for the checks below: jsonschema when installed, else the subset the schemas use
+cat > "$B6/validate.py" <<'PYB6V'
+import json, os, re, sys
+sd = sys.argv[1]
+S = {}
+for n in os.listdir(sd):
+    if not n.endswith(".json"):
+        continue
+    s = json.load(open(os.path.join(sd, n)))
+    S[s["x-tideline-schema"]] = s
+try:
+    import jsonschema
+    def errors(s, o):
+        return [e.message for e in jsonschema.Draft202012Validator(s).iter_errors(o)]
+except ImportError:
+    T = {"string": str, "integer": int, "object": dict, "array": list, "null": type(None)}
+    def errors(s, o, p="$"):
+        e = []
+        if s is True:
+            return e
+        if s is False:
+            return [p + ": not allowed"]
+        if "type" in s:
+            ts = s["type"] if isinstance(s["type"], list) else [s["type"]]
+            if not any(isinstance(o, T[t]) and not (t == "integer" and isinstance(o, bool)) for t in ts):
+                return [p + ": type"]
+        if "const" in s and o != s["const"]:
+            e.append(p + ": const")
+        if "enum" in s and o not in s["enum"]:
+            e.append(p + ": enum")
+        if isinstance(o, str):
+            if "pattern" in s and not re.search(s["pattern"], o):
+                e.append(p + ": pattern")
+            if len(o) < s.get("minLength", 0) or len(o) > s.get("maxLength", 1 << 30):
+                e.append(p + ": length")
+        if isinstance(o, int) and (o < s.get("minimum", -(1 << 62)) or o > s.get("maximum", 1 << 62)):
+            e.append(p + ": range")
+        if "oneOf" in s and sum(1 for x in s["oneOf"] if not errors(x, o, p)) != 1:
+            e.append(p + ": oneOf")
+        if isinstance(o, dict):
+            for r in s.get("required", []):
+                if r not in o:
+                    e.append(p + ": missing " + r)
+            props = s.get("properties", {})
+            for k, v in o.items():
+                e += errors(props[k], v, p + "." + k) if k in props else errors(s.get("additionalProperties", True), v, p + "." + k)
+            if "if" in s:
+                e += errors(s.get("then", True) if not errors(s["if"], o, p) else s.get("else", True), o, p)
+        if isinstance(o, list):
+            if len(o) < s.get("minItems", 0) or len(o) > s.get("maxItems", 1 << 30):
+                e.append(p + ": items")
+            for i, x in enumerate(o):
+                e += errors(s.get("items", True), x, "%s[%d]" % (p, i))
+        return e
+bad = 0
+for arg in sys.argv[2:]:
+    sid, path = arg.split("=", 1)
+    lines = [open(path, encoding="utf-8").read()] if sid == "tideline-envelope/1" else open(path, encoding="utf-8")
+    for i, l in enumerate(lines, 1):
+        if l.strip():
+            er = errors(S[sid], json.loads(l))
+            if er:
+                bad += 1
+                print("%s line %d: %s" % (os.path.basename(path), i, er[:3]))
+print("valid" if not bad else "INVALID %d" % bad)
+PYB6V
+
+section "Batch 6: run-recon --json, run_id, --engagement / --job-id"
+run_case b6plain --tls
+if ls "$OUTDIR"/r.csv.*.jsonl >/dev/null 2>&1; then _fail "without --json: no .jsonl files"; else _pass "without --json: no .jsonl files"; fi
+assert_grep  "$CSV.run.json" '"run_id": "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"' "run.json: a run_id (UUID v4) on every run"
+assert_grep  "$CSV.run.json" '"engagement": null'                         "run.json: engagement null when not given"
+_rid1="$(sed -n 's/.*"run_id": "\([^"]*\)".*/\1/p' "$CSV.run.json")"
+assert_grep  "$(ls -d "$OUTDIR"/_work-* | head -n 1)/state" "^run_id=$_rid1\$" "the run_id is kept in the work dir's state (for --resume)"
+run_case b6json --json --tls --takeover --screenshots --engagement eng-2026.014 --job-id job:7
+B6RUN="$OUTDIR"
+for _k in urls services findings warnings seeds; do
+  if [ -f "$CSV.$_k.jsonl" ]; then _pass "--json writes <out>.$_k.jsonl (empty when there is nothing of the kind)"; else _fail "--json writes <out>.$_k.jsonl"; fi
+done
+assert_exists "$CSV.urls.jsonl"                                           "--json: urls.jsonl has the URL rows"
+assert_exists "$CSV.screenshots.jsonl"                                    "--json: screenshots.jsonl when screenshots ran"
+assert_grep  "$CSV.run.json" '"engagement": "eng-2026\.014"'              "--engagement is written to run.json"
+assert_grep  "$CSV.run.json" '"job_id": "job:7"'                          "--job-id is written to run.json"
+assert_grep  "$CSV.manifest.sha256" '^[0-9a-f]{64}  r\.csv\.urls\.jsonl$'  "the JSON lines are in the run's manifest"
+assert_grep  "$ERRLOG" 'JSON lines      : .*urls=[1-9][0-9]* services=[1-9]'  "the summary counts the JSON records"
+if ( cd "$OUTDIR" && sha256sum --quiet -c r.csv.manifest.sha256 ) >/dev/null 2>&1; then _pass "--json: sha256sum -c still verifies the manifest"; else _fail "--json: sha256sum -c still verifies the manifest"; fi
+_v=(); for _k in url:urls service:services finding:findings warning:warnings seed:seeds screenshot:screenshots cname:cnames; do
+  [ -f "$CSV.${_k#*:}.jsonl" ] && _v+=("run-recon.${_k%%:*}/1=$CSV.${_k#*:}.jsonl")
+done
+python3 "$B6/validate.py" "$SCHEMAS6" "${_v[@]}" > "$B6/valid1.txt" 2>&1
+assert_grep  "$B6/valid1.txt" '^valid$'                                   "every record of the run validates against its schema"
+python3 -S "$B6/validate.py" "$SCHEMAS6" "${_v[@]}" > "$B6/valid1s.txt" 2>&1
+assert_grep  "$B6/valid1s.txt" '^valid$'                                  "...and so does the suite's own validator (python3 -S: no jsonschema)"
+printf '{"seed":"x.test","candidates":"3","resolved":null,"live_hosts":0}\n' > "$B6/badseed.jsonl"
+python3 "$B6/validate.py" "$SCHEMAS6" "run-recon.seed/1=$B6/badseed.jsonl" > "$B6/bad1.txt" 2>&1
+python3 -S "$B6/validate.py" "$SCHEMAS6" "run-recon.seed/1=$B6/badseed.jsonl" > "$B6/bad2.txt" 2>&1
+if grep -q '^INVALID 1$' "$B6/bad1.txt" && grep -q '^INVALID 1$' "$B6/bad2.txt"; then _pass "a count given as a string fails run-recon.seed/1 (both validators)"; else _fail "a count given as a string fails run-recon.seed/1"; fi
+if [ "$(grep -c '' "$CSV.urls.jsonl")" = "$(( $(grep -c '' "$CSV") - 1 ))" ]; then _pass "urls.jsonl has as many records as the CSV has rows"; else _fail "urls.jsonl has as many records as the CSV has rows"; fi
+_rc=0; timeout 25 env PATH="$TESTPATH" HTTPX_BIN=httpx bash "$RUN_RECON" -i "$DOMAINS" -D "$B6/bad" -o "$B6/bad/r.csv" --engagement 'bad id!' >/dev/null 2>"$B6/bad.err" || _rc=$?
+_rc_is "$_rc" 2                                                           "an invalid --engagement is refused (exit 2)"
+assert_grep  "$B6/bad.err" -- '--engagement must be 1-128 characters'     "...and why"
+
+section "Batch 6: ship-recon.sh against a mock Tideline ingest (mutual TLS on loopback)"
+bash "$LABDIR6/gen-ship-certs.sh" "$B6/pki" >/dev/null 2>&1
+P6="$B6/pki"; mkdir -p "$B6/store"
+python3 -I "$LABDIR6/mock-tideline.py" --cert "$P6/server.pem" --key "$P6/server.key" --client-ca "$P6/root.pem" \
+  --store "$B6/store" --schemas "$SCHEMAS6" --port 0 > "$B6/mock.log" 2>&1 &
+B6PID=$!
+for _i in $(seq 1 100); do [ -s "$B6/store/port" ] && break; sleep 0.1; done
+U6="https://127.0.0.1:$(cat "$B6/store/port" 2>/dev/null)"
+OK6=(--url "$U6" --cert "$P6/rr-test01.pem" --key "$P6/rr-test01.key" --ca "$P6/root.pem")
+_ship(){ local _r=0; SHIP_RETRIES="${SHIP_RETRIES:-0}" bash "$SHIP6" "$@" > "$B6/ship.out" 2> "$B6/ship.err" || _r=$?; return "$_r"; }
+_reqs(){ python3 -c 'import json,sys; print(" ".join("%s:%s:%s" % (j["method"], j["path"].rsplit("/", 1)[-1], j["status"]) for j in map(json.loads, open(sys.argv[1]))))' "$B6/store/requests.jsonl" 2>/dev/null; }
+_newrun(){ # <src dir> <dst dir>: the same run under a new run_id (manifest updated), no ship state
+  rm -rf "$2"; cp -r "$1" "$2"; rm -f "$2"/r.csv.ship-state.json "$2"/r.csv.tideline.tar
+  python3 - "$2" <<'PYNEW'
+import json, hashlib, uuid, sys, os
+d = sys.argv[1]; p = os.path.join(d, "r.csv.run.json")
+j = json.load(open(p)); j["run_id"] = str(uuid.uuid4()); json.dump(j, open(p, "w"), indent=2)
+h = hashlib.sha256(open(p, "rb").read()).hexdigest()
+m = os.path.join(d, "r.csv.manifest.sha256")
+lines = open(m).readlines()
+open(m, "w").write("".join((h + "  r.csv.run.json\n") if l.endswith("  r.csv.run.json\n") else l for l in lines))
+PYNEW
+}
+_rc=0; _ship check "${OK6[@]}" || _rc=$?;                                              _rc_is "$_rc" 0 "check: a step-ca-shaped sensor certificate passes (no connection made)"
+assert_grep "$B6/ship.err" 'settings ok: sensor rr-test01'                              "check: names the sensor from the certificate's URI SAN"
+_rc=0; _ship check --url "$U6" --cert "$P6/nourn.pem" --key "$P6/nourn.key" --ca "$P6/root.pem" || _rc=$?; _rc_is "$_rc" 1 "check: a certificate without urn:tideline:sensor: is refused"
+_rc=0; _ship check --url "$U6" --cert "$P6/rsa.pem" --key "$P6/rsa.key" --ca "$P6/root.pem" || _rc=$?;     _rc_is "$_rc" 1 "check: an RSA key is refused (ES256 needs ECDSA P-256)"
+_rc=0; _ship check --url "$U6" --cert "$P6/rr-test01.pem" --key "$P6/rr-other.key" --ca "$P6/root.pem" || _rc=$?; _rc_is "$_rc" 1 "check: a key that is not the certificate's is refused"
+_rc=0; _ship check --url "http://127.0.0.1:1" --cert "$P6/rr-test01.pem" --key "$P6/rr-test01.key" --ca "$P6/root.pem" || _rc=$?; _rc_is "$_rc" 2 "check: an http:// URL is refused"
+_rc=0; _ship check --url "$U6" --key "$P6/rr-test01.key" --ca "$P6/root.pem" || _rc=$?; _rc_is "$_rc" 2 "check: no certificate given -> usage error"
+cp -r "$B6RUN" "$B6/run1"
+_rc=0; _ship envelope "$B6/run1/r.csv" --cert "$P6/rr-test01.pem" || _rc=$?; cp "$B6/ship.out" "$B6/envelope.json"
+python3 "$B6/validate.py" "$SCHEMAS6" "tideline-envelope/1=$B6/envelope.json" > "$B6/valid2.txt" 2>&1
+assert_grep "$B6/valid2.txt" '^valid$'                                                  "envelope: valid tideline-envelope/1"
+python3 - "$B6/envelope.json" "$B6/run1" > "$B6/env.txt" 2>&1 <<'PYENV'
+import json, sys, hashlib, os
+e = json.load(open(sys.argv[1])); d = sys.argv[2]
+run = json.load(open(os.path.join(d, "r.csv.run.json")))
+man = {l.split("  ", 1)[1].rstrip("\n"): l.split("  ", 1)[0] for l in open(os.path.join(d, "r.csv.manifest.sha256"))}
+print("ids", e["run_id"] == run["run_id"] and e["engagement"] == "eng-2026.014" and e["job_id"] == "job:7" and e["sensor"] == "rr-test01" and e["tool"] == "run-recon")
+print("hashes", all(man.get(p["name"]) == p["sha256"] for p in e["parts"] if p["name"] != "r.csv.manifest.sha256"))
+print("toolman", e["tool_manifest_sha256"] == hashlib.sha256(open(os.path.join(d, "r.csv.manifest.sha256"), "rb").read()).hexdigest())
+print("kinds", [p["kind"] for p in e["parts"]][:2] == ["urls", "services"] and any(p.get("media") == "image/png" for p in e["parts"]))
+print("profile", e["profile"] == run)
+PYENV
+assert_grep "$B6/env.txt" '^ids True$'      "envelope: run_id, engagement, job_id from run.json; sensor from the certificate"
+assert_grep "$B6/env.txt" '^hashes True$'   "envelope: every part's sha256 is the one in the run's manifest"
+assert_grep "$B6/env.txt" '^toolman True$'  "envelope: tool_manifest_sha256 is the manifest file's hash"
+assert_grep "$B6/env.txt" '^kinds True$'    "envelope: the record parts, then artifacts (the manifest, the screenshots)"
+assert_grep "$B6/env.txt" '^profile True$'  "envelope: profile is run.json, unchanged"
+: > "$B6/store/requests.jsonl"
+_rc=0; _ship ship "$B6/run1/r.csv" "${OK6[@]}" || _rc=$?;                              _rc_is "$_rc" 0 "ship: delivered (exit 0)"
+_np="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["parts"]))' "$B6/envelope.json")"
+_rid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["run_id"])' "$B6/envelope.json")"
+if [ "$(_reqs)" = "POST:runs:201 $(for _i in $(seq 1 "$_np"); do printf 'PUT:%d:204 ' "$_i"; done)POST:complete:202" ]; then _pass "ship: open (201), $_np parts (204 each), complete (202)"; else _fail "ship: open, parts, complete  [$(_reqs)]"; fi
+assert_grep "$B6/run1/r.csv.ship-state.json" '"state": "complete"'                     "ship-state.json: complete"
+assert_grep "$B6/run1/r.csv.ship-state.json" '"server_state": "verified"'              "ship-state.json: Tideline verified the run"
+if cmp -s "$B6/store/runs/$_rid/manifest.json" <(head -c -1 "$B6/envelope.json"); then _pass "Tideline stored the manifest bytes that were signed"; else _fail "Tideline stored the manifest bytes that were signed"; fi
+if cmp -s "$B6/store/runs/$_rid/parts/1" "$B6/run1/r.csv.urls.jsonl"; then _pass "the stored urls part equals the local urls.jsonl, byte for byte"; else _fail "the stored urls part equals the local urls.jsonl"; fi
+refute_grep "$B6/store/requests.jsonl" '"status": 40[13]'                              "the signature verified (no 401/403)"
+: > "$B6/store/requests.jsonl"
+_rc=0; _ship ship "$B6/run1/r.csv" || _rc=$?;                                          _rc_is "$_rc" 0 "re-ship with the settings from ship-state.json: exit 0"
+if [ "$(_reqs)" = "POST:runs:200" ]; then _pass "re-ship: Tideline answers 200 (same manifest) and nothing is sent again"; else _fail "re-ship: nothing sent again  [$(_reqs)]"; fi
+_rc=0; _ship status "$B6/run1/r.csv" || _rc=$?;                                        _rc_is "$_rc" 0 "status: exit 0"
+assert_grep "$B6/ship.out" '"state": "verified"'                                        "status: Tideline's state of the run"
+_newrun "$B6/run1" "$B6/run2"
+printf '[{"method":"PUT","part":2,"status":503,"times":5}]' > "$B6/store/faults.json"; : > "$B6/store/requests.jsonl"
+_rc=0; _ship ship "$B6/run2/r.csv" "${OK6[@]}" || _rc=$?;                              _rc_is "$_rc" 4 "Tideline busy (503) on part 2: exit 4, retry later"
+assert_grep "$B6/run2/r.csv.ship-state.json" '"state": "failed"'                        "ship-state.json: failed, with the reason"
+if [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["parts_acknowledged"])' "$B6/run2/r.csv.ship-state.json")" = "[1]" ]; then _pass "ship-state.json: the parts Tideline acknowledged ([1])..."; else _fail "ship-state.json: the parts Tideline acknowledged ([1])"; fi
+assert_grep "$B6/ship.err" 'part 2 \(r\.csv\.services\.jsonl\): HTTP 503'              "...and the error names the part"
+printf '[]' > "$B6/store/faults.json"; : > "$B6/store/requests.jsonl"
+_rc=0; _ship ship "$B6/run2/r.csv" || _rc=$?;                                          _rc_is "$_rc" 0 "the retry delivers the run"
+if _reqs | grep -qE '^POST:runs:200 PUT:2:204 ' && ! _reqs | grep -q 'PUT:1:'; then _pass "the retry re-opens the run (200) and sends only the parts Tideline lacks"; else _fail "the retry sends only the missing parts  [$(_reqs)]"; fi
+_newrun "$B6/run1" "$B6/run3"
+printf '[{"method":"PUT","part":3,"action":"drop","times":1}]' > "$B6/store/faults.json"
+_rc=0; _ship ship "$B6/run3/r.csv" "${OK6[@]}" || _rc=$?;                              _rc_is "$_rc" 4 "a connection dropped mid-upload: exit 4"
+printf '[]' > "$B6/store/faults.json"
+_rc=0; _ship ship "$B6/run3/r.csv" || _rc=$?;                                          _rc_is "$_rc" 0 "...and the next attempt completes it"
+_newrun "$B6/run1" "$B6/run4"; printf '{"x":1}\n' >> "$B6/run4/r.csv.warnings.jsonl"; : > "$B6/store/requests.jsonl"
+_rc=0; _ship ship "$B6/run4/r.csv" "${OK6[@]}" || _rc=$?;                              _rc_is "$_rc" 1 "a part changed after the run: refused locally (exit 1)"
+assert_grep "$B6/ship.err" 'r\.csv\.warnings\.jsonl changed since the run wrote its manifest' "...naming the file"
+assert_absent "$B6/store/requests.jsonl"                                                "...and nothing was sent"
+rm -rf "$B6/run5"; cp -r "$B6/run1" "$B6/run5"; rm -f "$B6/run5/r.csv.ship-state.json"
+printf '{"message":"added"}\n' >> "$B6/run5/r.csv.warnings.jsonl"
+python3 - "$B6/run5" <<'PYCONF'
+import hashlib, os, sys
+d = sys.argv[1]; m = os.path.join(d, "r.csv.manifest.sha256")
+h = hashlib.sha256(open(os.path.join(d, "r.csv.warnings.jsonl"), "rb").read()).hexdigest()
+lines = open(m).readlines()
+open(m, "w").write("".join((h + "  r.csv.warnings.jsonl\n") if l.endswith("  r.csv.warnings.jsonl\n") else l for l in lines))
+PYCONF
+_rc=0; _ship ship "$B6/run5/r.csv" "${OK6[@]}" || _rc=$?;                              _rc_is "$_rc" 5 "the same run_id with a different manifest: Tideline refuses it (409, exit 5)"
+assert_grep "$B6/ship.err" 'HTTP 409'                                                   "...with Tideline's reason"
+_rc=0; _ship status "$B6/run1/r.csv" --url "$U6" --cert "$P6/rr-other.pem" --key "$P6/rr-other.key" --ca "$P6/root.pem" || _rc=$?; _rc_is "$_rc" 5 "another sensor cannot read this sensor's run (403, exit 5)"
+_newrun "$B6/run1" "$B6/run6"; : > "$B6/store/requests.jsonl"
+_rc=0; _ship ship "$B6/run6/r.csv" --url "$U6" --cert "$P6/rogue.pem" --key "$P6/rogue.key" --ca "$P6/root.pem" || _rc=$?; _rc_is "$_rc" 5 "a sensor certificate from another CA: refused in the handshake (exit 5)"
+if [ ! -d "$B6/store/runs/$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["run_id"])' "$B6/run6/r.csv.run.json")" ]; then _pass "...and nothing was stored"; else _fail "...and nothing was stored"; fi
+_rc=0; _ship ship "$B6/run6/r.csv" --url "$U6" --cert "$P6/rr-test01.pem" --key "$P6/rr-test01.key" --ca "$P6/rogue-root.pem" || _rc=$?; _rc_is "$_rc" 5 "the server does not chain to --ca: refused (exit 5)"
+mkdir -p "$B6/sysca"; cp "$P6/root.pem" "$B6/sysca/"; openssl rehash "$B6/sysca" >/dev/null 2>&1 || c_rehash "$B6/sysca" >/dev/null 2>&1
+_rc=0; SSL_CERT_DIR="$B6/sysca" CURL_CA_BUNDLE="$P6/root.pem" SSL_CERT_FILE="$P6/root.pem" _ship ship "$B6/run6/r.csv" --url "$U6" --cert "$P6/rr-test01.pem" --key "$P6/rr-test01.key" --ca "$P6/rogue-root.pem" || _rc=$?
+_rc_is "$_rc" 5 "pinned: a trust store that would accept the server (SSL_CERT_DIR, CURL_CA_BUNDLE) is not used"
+_rc=0; SHIP_RETRIES=0 _ship ship "$B6/run6/r.csv" --url "https://127.0.0.1:9" --cert "$P6/rr-test01.pem" --key "$P6/rr-test01.key" --ca "$P6/root.pem" || _rc=$?; _rc_is "$_rc" 4 "nothing listening: exit 4"
+_rc=0; _ship export "$B6/run1/r.csv" --cert "$P6/rr-test01.pem" --key "$P6/rr-test01.key" || _rc=$?; _rc_is "$_rc" 0 "export: a bundle for a hand-carried upload"
+python3 - "$B6/run1/r.csv.tideline.tar" "$B6/envelope.json" "$B6/run1" "$P6/rr-test01.pem" > "$B6/tar.txt" 2>&1 <<'PYTAR'
+import tarfile, sys, json, gzip, hashlib, base64, subprocess, tempfile, os
+t, envp, d, cert = sys.argv[1:5]
+tf = tarfile.open(t)
+names = tf.getnames()
+body = tf.extractfile("envelope.json").read()
+print("members", names[:2] == ["envelope.json", "signature.txt"] and all(n.startswith("parts/") for n in names[2:]))
+print("envelope", body == open(envp, "rb").read().rstrip(b"\n"))
+e = json.loads(body)
+ok = True
+for p in e["parts"]:
+    raw = gzip.decompress(tf.extractfile("parts/%05d.gz" % p["n"]).read())
+    ok = ok and hashlib.sha256(raw).hexdigest() == p["sha256"] and len(raw) == p["bytes"]
+print("parts", ok and len(names) == 2 + len(e["parts"]))
+sig = tf.extractfile("signature.txt").read().decode().strip()
+der = base64.b64decode(sig.split("sig=", 1)[1])
+with tempfile.TemporaryDirectory() as x:
+    open(os.path.join(x, "b"), "wb").write(body); open(os.path.join(x, "s"), "wb").write(der)
+    pub = subprocess.run(["openssl", "x509", "-in", cert, "-noout", "-pubkey"], capture_output=True).stdout
+    open(os.path.join(x, "k"), "wb").write(pub)
+    r = subprocess.run(["openssl", "dgst", "-sha256", "-verify", os.path.join(x, "k"), "-signature", os.path.join(x, "s"), os.path.join(x, "b")], capture_output=True)
+print("signature", sig.startswith("alg=ES256; enc=der; sig=") and r.returncode == 0)
+PYTAR
+for _k in members envelope parts signature; do assert_grep "$B6/tar.txt" "^$_k True\$" "export: $_k as Tideline expects (envelope.json, signature.txt, parts/NNNNN.gz)"; done
+rm -rf "$B6/nojson"; mkdir -p "$B6/nojson"; cp "$B6/run1/r.csv" "$B6/run1/r.csv.run.json" "$B6/nojson/"
+( cd "$B6/nojson" && sha256sum r.csv r.csv.run.json > r.csv.manifest.sha256 )
+_rc=0; _ship ship "$B6/nojson/r.csv" "${OK6[@]}" || _rc=$?;                            _rc_is "$_rc" 1 "a run without --json is not shipped (exit 1)..."
+assert_grep "$B6/ship.err" 'run run-recon with --json'                                  "...and the message says how to fix it"
+
+section "Batch 6: run-recon --ship (preflight, delivery, exit 4, same outputs as --json)"
+REAL_CURL="$(command -v curl)"
+mv "$MOCKBIN/curl" "$MOCKBIN/curl.b6"
+cat > "$MOCKBIN/curl" <<EOF
+#!/usr/bin/env bash
+# ship-recon's calls (-q first) go to the real curl, on loopback; every other call stays mocked
+[ "\${1:-}" = -q ] && exec "$REAL_CURL" "\$@"
+exec "$MOCKBIN/curl.b6" "\$@"
+EOF
+chmod +x "$MOCKBIN/curl"
+_rr6(){ # <dir> [args...]
+  local o="$1"; shift; rm -rf "$o"; mkdir -p "$o"
+  timeout 60 env PATH="$TESTPATH" HTTPX_BIN=httpx SECLISTS="$SECLISTS_TEST" RECON_CLOUD_CACHE="$B6/cloud.tsv" TLS_CHAIN_CHECK=0 SHIP_RETRIES=0 \
+    bash "$RUN_RECON" -i "$DOMAINS" -D "$o" -o "$o/r.csv" --tls "$@" > /dev/null 2> "$o/stderr.log"
+}
+rm -f "$MOCKLOG"/*.args
+_rc=0; _rr6 "$B6/pre" --ship "$U6" --ship-cert "$B6/missing.pem" --ship-key "$P6/rr-test01.key" --ship-ca "$P6/root.pem" || _rc=$?
+_rc_is "$_rc" 2                                                                        "--ship with an unreadable certificate: refused before the scan (exit 2)"
+assert_grep  "$B6/pre/stderr.log" 'Nothing was sent'                                   "...and nothing was sent"
+if [ ! -e "$MOCKLOG/gau.args" ] && [ ! -e "$B6/pre/r.csv" ]; then _pass "...no tool ran, no CSV"; else _fail "...no tool ran, no CSV"; fi
+_rc=0; _rr6 "$B6/s1" --ship "$U6" --ship-cert "$P6/rr-test01.pem" --ship-key "$P6/rr-test01.key" --ship-ca "$P6/root.pem" --engagement eng-1 || _rc=$?
+_rc_is "$_rc" 0                                                                        "--ship: the run is delivered (exit 0)"
+assert_grep  "$B6/s1/stderr.log" 'Tideline        : run [0-9a-f-]{36} shipped and verified' "--ship: the summary says so"
+assert_grep  "$B6/s1/r.csv.ship-state.json" '"state": "complete"'                     "--ship: ship-state.json complete"
+assert_exists "$B6/s1/r.csv.urls.jsonl"                                                "--ship implies --json"
+refute_grep  "$B6/s1/r.csv.manifest.sha256" 'ship-state'                               "ship-state.json is written after the manifest, not listed in it"
+_rr6 "$B6/j1" --json --engagement eng-1 || true
+if [ "$(find "$B6/j1" -mindepth 1 -maxdepth 1 -printf '%f\n' | grep -v '^_work\|stderr.log' | sort | tr '\n' ' ')" = "$(find "$B6/s1" -mindepth 1 -maxdepth 1 -printf '%f\n' | grep -v '^_work\|stderr.log\|ship-state' | sort | tr '\n' ' ')" ]; then
+  _pass "--ship writes the same files as --json, plus ship-state.json only"; else _fail "--ship writes the same files as --json, plus ship-state.json only"; fi
+if diff <(sort "$B6/j1/r.csv") <(sort "$B6/s1/r.csv") >/dev/null && cmp -s "$B6/j1/r.csv.urls.jsonl" "$B6/s1/r.csv.urls.jsonl"; then _pass "--ship: the CSV and urls.jsonl equal the --json run's"; else _fail "--ship: the CSV and urls.jsonl equal the --json run's"; fi
+_rc=0; _rr6 "$B6/s2" --ship "https://127.0.0.1:9" --ship-cert "$P6/rr-test01.pem" --ship-key "$P6/rr-test01.key" --ship-ca "$P6/root.pem" || _rc=$?
+_rc_is "$_rc" 4                                                                        "--ship to an unreachable Tideline: the run completes and exits 4"
+assert_exists "$B6/s2/r.csv"                                                           "...the CSV is there"
+assert_grep  "$B6/s2/r.csv.ship-state.json" '"state": "failed"'                       "...ship-state.json says failed"
+assert_grep  "$B6/s2/stderr.log" 'retry with: .*ship-recon\.sh ship .*r\.csv'          "...and the message says how to retry"
+assert_grep  "$B6/s2/r.csv.run.json" '"exit_status": 0'                                "run.json keeps the scan's own exit status"
+mv "$MOCKBIN/curl.b6" "$MOCKBIN/curl"
+kill "$B6PID" 2>/dev/null; wait "$B6PID" 2>/dev/null || true
+
+section "Tideline identifiers are frozen (decided 2026-11-06): envelope, header, sensor URN, schema ids, checksums"
+python3 - "$SCHEMAS6" "$SHIP6" "$LABDIR6/mock-tideline.py" > "$B6/frozen.txt" 2>&1 <<'PYFRZ'
+import json, os, re, sys
+sd, ship, mock = sys.argv[1:4]
+src, msrc = open(ship, encoding="utf-8").read(), open(mock, encoding="utf-8").read()
+def ok(k, c):
+    print(k, bool(c))
+ok("envelope", 'ENVELOPE = "tideline-envelope/1"' in src and '{"schema": ENVELOPE,' in src)
+ok("header", '"Tideline-Signature: " + sig' in src and '"alg=ES256; enc=der; sig="' in src
+   and 'self.headers.get("Tideline-Signature")' in msrc)
+ok("sensor", 'r"URI:urn:tideline:sensor:([A-Za-z0-9][A-Za-z0-9._-]{0,63})(?=[,\\s]|$)"' in src
+   and 'URN = "urn:tideline:sensor:"' in msrc)
+ok("endpoints", all(e in src for e in ('"/v1/runs"', '"/v1/runs/%s/parts/%d"', '"/v1/runs/%s/complete"', '"/v1/runs/%s"')))
+bad = []
+for n in sorted(os.listdir(sd)):
+    if not n.endswith(".json"):
+        continue
+    s = json.load(open(os.path.join(sd, n)))
+    sid = s.get("x-tideline-schema", "")
+    if s.get("$id") != "urn:tideline:schema:" + sid or n != sid.replace("/", ".") + ".json" or not re.fullmatch(r"[a-z][a-z0-9.-]*/1", sid):
+        bad.append(n)
+env = json.load(open(os.path.join(sd, "tideline-envelope.1.json")))
+ok("schemaids", not bad and env["properties"]["schema"] == {"const": "tideline-envelope/1"})
+listed = {l.split()[1].lstrip("*") for l in open(os.path.join(sd, "SHA256SUMS")) if l.strip()}
+ok("sumslist", listed == {n for n in os.listdir(sd) if n.endswith(".json")})
+PYFRZ
+assert_grep "$B6/frozen.txt" '^envelope True$'   "frozen: the envelope schema is tideline-envelope/1"
+assert_grep "$B6/frozen.txt" '^header True$'     "frozen: the signature travels as 'Tideline-Signature: alg=ES256; enc=der; sig=<base64>'"
+assert_grep "$B6/frozen.txt" '^sensor True$'     "frozen: the sensor is the URI SAN urn:tideline:sensor:<id> (1-64 of A-Z a-z 0-9 . _ -)"
+assert_grep "$B6/frozen.txt" '^endpoints True$'  "frozen: the /v1/runs endpoints"
+assert_grep "$B6/frozen.txt" '^schemaids True$'  "frozen: every schema's \$id is urn:tideline:schema:<id>, its file <id>.json, major version 1"
+assert_grep "$B6/frozen.txt" '^sumslist True$'   "schemas/SHA256SUMS lists every schema file, and only those"
+if ( cd "$SCHEMAS6" && sha256sum --quiet -c SHA256SUMS ) >/dev/null 2>&1; then _pass "the frozen schemas match schemas/SHA256SUMS (a change needs a new major id, or x-minor and new sums)"
+else _fail "the frozen schemas match schemas/SHA256SUMS  [a frozen schema changed: add a field as x-minor+1 and regenerate the sums, or make a /2]"; fi
+T6="$B6/tenant"; mkdir -p "$T6"
+_t6cert(){ # <name> <subjectAltName>: a sensor certificate from the test intermediate
+  openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$T6/$1.key" 2>/dev/null; chmod 600 "$T6/$1.key"
+  openssl req -new -key "$T6/$1.key" -subj "/CN=$1" -out "$T6/$1.csr" 2>/dev/null
+  printf 'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\nsubjectAltName=%s\n' "$2" > "$T6/$1.ext"
+  openssl x509 -req -in "$T6/$1.csr" -CA "$P6/int.pem" -CAkey "$P6/int.key" -CAserial "$T6/int.srl" -CAcreateserial -days 7 \
+    -out "$T6/$1.crt" -extfile "$T6/$1.ext" 2>/dev/null
+  cat "$T6/$1.crt" "$P6/int.pem" > "$T6/$1.pem"
+}
+_t6cert tenant 'URI:urn:tideline:sensor:rr-t1,URI:urn:tideline:tenant:acme'
+_t6cert combined 'URI:urn:tideline:sensor:acme:rr-t1'
+_rc=0; _ship check --url "https://127.0.0.1:9" --cert "$T6/tenant.pem" --key "$T6/tenant.key" --ca "$P6/root.pem" || _rc=$?
+_rc_is "$_rc" 0                                                        "a certificate that also carries urn:tideline:tenant:acme passes"
+assert_grep "$B6/ship.err" 'settings ok: sensor rr-t1,'                "...and the sensor is its urn:tideline:sensor: URI, not the tenant"
+_rc=0; _ship envelope "$B6/run1/r.csv" --cert "$T6/tenant.pem" || _rc=$?
+if [ "$_rc" = 0 ] && python3 -c 'import json,sys; e=json.load(open(sys.argv[1])); sys.exit(0 if e["sensor"] == "rr-t1" and "acme" not in json.dumps(e) else 1)' "$B6/ship.out"; then
+  _pass "the envelope names the sensor and carries no tenant (ingest takes it from the certificate)"; else _fail "the envelope names the sensor and carries no tenant"; fi
+_rc=0; _ship check --url "https://127.0.0.1:9" --cert "$T6/combined.pem" --key "$T6/combined.key" --ca "$P6/root.pem" || _rc=$?
+_rc_is "$_rc" 1                                                        "a combined urn:tideline:sensor:<tenant>:<id> is refused (no colon in a sensor id)"
 
 # --- 53) service health check: --resolvers catches dead resolvers ----------
 # (placed last: swaps the dig mock for one that reports no reply)

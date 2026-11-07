@@ -17,6 +17,8 @@
 #   db.nsec3.test.signed  nsec3.test signed with NSEC3: CoreDNS's file plugin cannot serve
 #                       NSEC3, so BIND (the `bind` service, sharing this container's network)
 #                       serves it on :5353 and this server forwards the zone there
+#   db.posture.test     posture.test: the email/DNS posture fixtures (permissive SPF, DMARC p=none,
+#                       MTA-STS testing, dangling MX and NS, a lame NS) and good.posture.test (clean)
 #   db.127              reverse zone for 127.0.0.0/8: PTR fixtures for --enrich
 #                       (127.0.0.1 -> ingress.lab.test, LAB_ORIGIN_IP -> origin-nginx.lab.test)
 # The file plugin reloads a zone when its serial changes; the reload plugin picks
@@ -33,6 +35,12 @@ xfr.test:53 {
     }
     transfer {
         to *
+    }
+    errors
+}
+posture.test:53 {
+    file /lab/db.posture.test {
+        reload 2s
     }
     errors
 }

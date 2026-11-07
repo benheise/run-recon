@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tideline:schema:run-recon.screenshot/1",
+  "title": "run-recon screenshot",
+  "description": "One screenshot and its class: ok, blank, failed or suspect (a row of <out>.screenshots.tsv). Values are strings, as in the TSV.",
+  "x-tideline-schema": "run-recon.screenshot/1",
+  "x-minor": 0,
+  "type": "object",
+  "properties": {
+    "host": {
+      "type": "string"
+    },
+    "file": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string"
+    },
+    "reason": {
+      "type": "string"
+    },
+    "bytes": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "host",
+    "file",
+    "status",
+    "reason",
+    "bytes"
+  ],
+  "additionalProperties": {
+    "type": "string"
+  }
+}

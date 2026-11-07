@@ -1284,7 +1284,7 @@ Tracked in `PLAN.md` (B2.1–B2.7). Every item has a suite test and a lab fixtur
 - [x] **Repository:** the toolkit is now a git repository (`benheise/run-recon`, `main` = v1.18.0); Batch 2 is
       on `batch-2-http-fields`.
 
-## v1.20.0 (unreleased) — the v1.18 follow-ups (F1–F10)
+## v1.20.0 — the v1.18 follow-ups (F1–F10)
 
 Tracked in `PLAN.md` (§3). Every item has a suite test; F1, F4, F5, F6 and F10 were also checked against the
 lab with the real tools. Numbers in `BENCHMARK.md` (v1.20 follow-ups section).
@@ -1339,3 +1339,200 @@ lab with the real tools. Numbers in `BENCHMARK.md` (v1.20 follow-ups section).
 - [x] Tests: 533 → **590/590** (origin candidates and reasons, ORIGIN_PORTS, range-cert, VT/urlscan history,
       zone AAAA/unreachable/walk-on/DS, gowitness, host-resolver-rules, edge list, dangling-CNAME warning, chain
       dedupe, extras single pass with link/data/HTML icons, CPE split, report).
+
+## v1.20.0 — Batch 3: email and DNS posture, cloud inventory, TLD variants, vulnx
+
+Tracked in `PLAN.md` (B3.1–B3.5), on `batch-3-email-dns` (stacked on the follow-ups). Every item has suite
+tests; B3.1, B3.2, B3.3 and B3.5 were checked against the lab with the real tools.
+
+- [x] **B3.1 `--dns-posture`** (in `--all`): per seed and zone apex, in the main process before the workers,
+      through your resolvers. SPF (`+all`/`?all`/no `all`, missing, multiple, more than 10 lookups following
+      `include:`/`redirect=`, an include with no record, an include of a domain that does not exist, `ptr`),
+      DMARC (own record or the organizational domain's, `sp=` for subdomains; missing, multiple, invalid,
+      `p=none`, `pct` < 100, no `rua`), MTA-STS (record, then the policy over HTTPS with certificate
+      verification and no redirects; `--mta-sts-ca FILE` adds a CA without disabling verification; not fetched
+      under `--passive-only`; testing/none/invalid modes, MX hosts the policy does not list), TLS-RPT, CAA at
+      the apex. Mail checks only for names with MX or SPF, and the apex; a name that sends no mail gets the
+      `[low]` advice (`v=spf1 -all`, `p=reject`). → `<out>.dnsposture.txt`, `<out>.dnsposture.tsv`.
+- [x] **B3.2 dangling MX/NS, lame NS**: MX and NS hosts that do not exist (`[high]` when their domain does not
+      exist either: whoever registers it takes the mail or the zone), MX hosts with no address, and lame
+      delegations (each name server asked `SOA +norec` directly: refused, failing, timing out or answering
+      without authority). If no name server answers from where the scan runs, one `ns-unreachable [info]`
+      line replaces a lame finding per server.
+- [x] **B3.3 `--cloudlist [CONFIG]`**: cloudlist lists your accounts' assets; `cloud-asset-unseen [info]` for an
+      asset the scan did not find (`scope=in` under a seed), `cloud-ip-unaccounted [low]` for an address in a
+      cloud provider's ranges (`--enrich`) that no listed account owns. Internal addresses are listed, not
+      reported. → `<out>.cloud.txt`, `<out>.cloud-assets.tsv`.
+- [x] **B3.4 `--tld-variants`** (tldfinder `-dm tld`): the seed's name under other TLDs with a `same_ns` ownership
+      hint; listed only, never in scope (it queries public DNS whatever `-r` says). **`--vulnx`** (vulnx 2.0.2):
+      for each product in the `cpe` column, the CVE and KEV counts and the top CVEs by EPSS, as `[info]` leads
+      (no version matching; the version-matched join stays `recon-db.sh vulns`). → `<out>.tld-variants.txt`,
+      `<out>.vulnx.txt`, `<out>.vulnx.tsv`.
+- [x] **B3.5 lab coverage** (`bench-run-recon.sh discovery`): naabu finds an alternate port (8443), alterx
+      guesses `grafana.nginx.test`, shuffledns + massdns find `backup-db.nginx.test` from the lab wordlist,
+      cdncheck's output format is the one `--origin` parses, uncover without keys gives the message run-recon
+      now turns into one warning, and `--monitor --notify` posts one message to a loopback webhook.
+- [x] **Found by the discovery check:** with `--ports`, `--origin` took the first https record of a host as its
+      reference, which could be another service on another port (`:8443`); it now prefers the default port.
+- [x] **notify**: one message per run (`-bulk`) with a summary line; `NOTIFY_CONFIG` → `-pc`; `--proxy` passed.
+- [x] **uncover without keys**: one warning ("uncover has no API keys for its engines") instead of an empty
+      result with no explanation.
+- [x] **Report**: "Email and DNS posture" table and posture findings in the findings table; cloud inventory
+      findings; vulnx advisories and TLD variants as context.
+- [x] **Lab**: `posture.test` (everything wrong) and `good.posture.test` (everything right) in a new zone, MTA-STS
+      policies on the ingress, a Terraform state for cloudlist, the 8443 port, the discovery names and wordlist;
+      `bench-run-recon.sh posture` and `discovery`, both in `checks`.
+- [x] **Setup**: cloudlist 1.5.1, tldfinder 0.0.2, vulnx 2.0.2 (`github.com/projectdiscovery/vulnx/v2`) pinned.
+- [x] **Checks:** suite 590 → **635/635**; `bench-run-recon.sh checks` **PASS** on all six fixtures; A/B vs the
+      follow-ups: lab identical; `--dns-posture` on the farm +0.8 s wall, +2.5 s CPU, CSV identical.
+
+## v1.20.0 — Batch 4: evidence and history (scope, manifest, delta, history, resume)
+
+Tracked in `PLAN.md` (B4.1–B4.5), on `batch-4-evidence` (stacked on Batch 3). Every item has suite tests; B4.1,
+B4.3, B4.4 and B4.5 were checked against the lab with the real tools, and B4.4 against a real PostgreSQL 16.
+
+- [x] **B4.1 `--scope FILE`** (WebInventory `-Scope`), fail-closed. Entries: `name` (it and below), `*.name`
+      (below only), IPv4/IPv6 addresses and CIDRs, `AS<n>`; `!`/`-` exclusions win. Before anything is sent:
+      a malformed entry (URL, host bits set, a whole TLD), an out-of-scope seed or an invalid input line
+      (bare address, `host:port`) stops the run with exit 2; `--drop-out-of-scope` skips them with a warning.
+      CIDR seeds lose their excluded addresses (and the allowed ASNs' ranges theirs).
+      - names: every discovered name and URL passes `scope_filter`'s exclusions (zone names too);
+      - address exclusions: names resolving into them are dropped (dnsx) before the certificate harvest,
+        the takeover list and the probe; fail-closed when the check cannot run (no dnsx: refused up front);
+      - addresses run-recon picks itself: `--origin` candidates, `--favicon`/certificate-search hits and
+        range-certificate names (also needing a name entry) only inside the allowed ranges;
+      - crawl: katana `-cs` (allowed names; with address exclusions the live hosts already checked) and
+        `-cos` (exclusions), verified on a loopback server: `-cs` applies on top of `-fs rdn`, `-cos` first;
+      - browser: Chrome host-resolver rules map the seed's names and `MAP * ~NOTFOUND` the rest (proxy host
+        excluded); gowitness, which cannot take them, is not used under `--scope`;
+      - redirects: nuclei `-dr`, whatweb `--follow-redirect=never`, cmseek without `--follow-redirect`;
+        gospider/hakrawler skipped; xnLinkFinder fetches only JS on the seed's live hosts; the MTA-STS policy
+        only from an in-scope name.
+      → `<out>.scope.txt` (scope file and SHA-256, each seed and its entry, everything held back and why);
+      run.json `scope`; the report's run header. Without `--scope`, ignored input lines are now named in a
+      warning (they were dropped silently).
+- [x] **`--list-targets`** (WebInventory `-ListTargets`): the plan on stdout (each seed: in scope and by which
+      entry, or why not), exit 0 if the run would start and 2 if it would refuse; no tool is started, no work
+      dir is made.
+- [x] **B4.2 `<out>.manifest.sha256`**: written last, `sha256sum -c` format, paths relative to the CSV's
+      directory; the CSV, every `<out>.*` file the run wrote, run.json, the report and the screenshots. A file
+      with the same prefix older than the run is left out and named in a warning.
+- [x] **B4.3 field-by-field delta** (WebInventory `_delta.csv`): `--monitor` also writes `<out>.delta.tsv`
+      (`change seed service field old new`), per service (`scheme://host:port`) within its seed: new and
+      removed only under seeds both runs covered; 17 fields compared, each only when the stage filling it ran
+      in both runs (judged by a field that stage always fills), multi-valued fields as sets, an address change
+      inside the same ASN not reported. Report: "Changes since the previous run"; notify: a summary line;
+      run.json `delta_changes`. Offline: `recon-db.sh diff OLD.csv NEW.csv`.
+- [x] **B4.4 history in recon-db**: `recon-db.sh history [PATTERN]` (first/last seen, runs seen of the seed's
+      runs, present or "gone since <run>") and `changes [PATTERN] [--since TS]` (events between each run of a
+      seed and its previous run), from the store or, with `--csv`, from run CSVs. The store keeps the compared
+      fields per run (schema migrated in place) and `recon_runs` (the seeds each run covered, the columns its
+      CSV had: a 1.19 run is not compared on fields it never had).
+- [x] **B4.5 resume**: the work dir's `state` (status; SHA-256 of the command line, the input and the scope
+      file; no values) and an `flock` held while the run lives. SIGINT/SIGTERM freeze, list and stop the whole
+      process tree, mark the run interrupted and keep the work dir (exit 130/143). The same command with
+      `--resume` keeps the finished seeds (done markers, parts, raw dirs) and reruns the rest and the
+      main-process stages; a run still holding its lock, another command line or a finished run is refused.
+      run.json `sessions`, `seeds_resumed`.
+- [x] **`--monitor --db` re-measures**: under `--monitor`, every target-facing result (probe, enrichment, crawl,
+      ports, TLS, JARM, certificates, screenshots) is measured afresh and only stored (`CACHE_FRESH_ACTIVE`);
+      before, the cache's 7-day TTL could hide a change. Passive lookups still come from the cache.
+- [x] **Lab**: `bench-run-recon.sh scope`, `resume`, `history` (all in `checks`).
+- [x] **Checks:** suite 635 → **762/762**; `bench-run-recon.sh checks` **PASS** on all nine; A/B vs Batch 3:
+      output identical on the lab and the farm, timing inside the lab's spread (BENCHMARK.md).
+- [x] **Found while building this**: see BENCHMARK.md (`--monitor --db` hiding changes, a pipefail abort in a
+      new screenshot pipeline, the heartbeat's `sleep` holding the lock, children forked during the kill, a
+      resume racing a live run).
+
+## v1.20.0 — Batch 5: redirect chains, login forms, TLS version matrix, certificate strength, CPE aliases
+
+Tracked in `PLAN.md` (B2.8, T1, T2, X1), on `batch-5-redirects-tls` (stacked on Batch 4). Every item has suite
+tests and was checked against new lab fixtures with the real tools.
+
+- [x] **B2.8 redirect chain** (WebInventory `FinalUrl` / `RedirectChain`): `final_url` (the last URL of the
+      chain that answered) and `redirect_chain` (`code->absolute URL`, joined ` | `), built by the aggregator
+      from the run's own enrichment records (no request); same-host hops followed up to `REDIRECT_MAX` (5), a
+      hop to another host listed and never followed, a loop stopped when it comes back. `--extras` fetches the
+      same-host hops the run did not probe, with the enrichment request itself (`_hx_enrich`, cached), into
+      `parts/hops.*.jsonl`: evidence for the chain, never URL rows.
+- [x] **B2.8 password forms** (WebInventory `Auth=Form`, `_CleartextAuth`): httpx `-er` on the enrichment
+      request lists the page's `<form>` tags and password inputs in page order (no extra request; cache key
+      `httpx_json_v3`). The form before the first password field gives `login_form` (absolute; the page
+      itself without `action`, entities decoded), on the page the URL ends on; `auth` gains `Form`;
+      `CleartextAuth` when the form posts to `http://` or sits on a plain-HTTP page and does not post to
+      `https://`. Report: one finding per (login page, form target).
+- [x] **T1 `--tls-enum`** (`--tls-full` kept as its alias; in `--all`): `tls_enum_probe`, WebInventory's
+      plan in stdlib Python: one ClientHello per version (TLS 1.3, 1.2, 1.1, 1.0, SSL 3.0) and one at TLS 1.2
+      offering only weak suites (NULL, EXPORT, anon, RC4, DES, 3DES, RC2), each stopped at the ServerHello;
+      only host:port keys tlsx completed a handshake with, at the address tlsx used; cached as `tls_enum_v1`.
+      → `tls_supported`, `tls_ciphers` (the suite chosen per version), `tls_weak_cipher` (`version:suite`);
+      `WeakTLS` for SSL 3.0/TLS 1.0/1.1 accepted, `WeakCipher` for an accepted weak suite. tlsx `-ve`/`-ce`
+      are no longer used: `-ci` cannot offer weak suites (ctls refuses their names; ztls sends an empty
+      cipher list), and the local OpenSSL can no longer offer SSL 3.0 or RC4.
+- [x] **T2 the leaf certificate**: tlsx `-cert` on the posture call (cache key `tlsx_posture_v2`); a stdlib
+      DER reader → `cert_key` (`RSA 2048`, `EC P-256`, `Ed25519`, …), `cert_sig_alg`, `cert_not_before`;
+      flags `WeakKey` (RSA/DSA < 2048, EC < 224), `WeakSig` (MD2/MD5/SHA-1), `CertNotYetValid` (tlsx sets no
+      `expired` for it), `DefaultCert` (WebInventory's rules: Splunk, Nessus, pfSense, VMware installer,
+      OpenSSL's `Internet Widgits`, mod_ssl's `SomeOrganization`; plus ingress-nginx's fake certificate and
+      Traefik's default). `CertExpired` also from the dates. Report: the detail in each finding's text;
+      `WeakTLS` with SSL 3.0 graded high.
+- [x] **Chain check retry**: when the local OpenSSL refuses the handshake below its security level (a small
+      key, TLS 1.0), the chain check tries once more at level 0 so the verification answers
+      (`legacy.tls.test`: `self-signed certificate` → `CertUntrusted`; before, no verdict).
+- [x] **X1 CPE aliases**: `cpe-aliases.json` (WebInventory's 184 groups, commit a8383ec, with its NVD
+      notice) next to `recon-db.sh`; `vulns` joins a CVE filed under any name of a group to the services
+      carrying another (exact names first; `CPE_ALIASES_FILE=` off); provenance records the file's SHA-256.
+      The setup scripts install it next to `recon-db.sh`, and `recon-db` finds it through its symlink.
+- [x] **Lab**: `bench-run-recon.sh tls` (new; in `checks`): four nginx fixtures on their own loopback
+      addresses (legacy TLS 1.0–1.2 + NULL-SHA + RSA 1024/SHA-1, not-yet-valid, OpenSSL default subject,
+      modern control), certificates from `lab/gen-tls-certs.py`, cross-checked against tlsx per version and
+      the container's openssl. `http` extended with the redirect and login-form fixtures (Caddyfile).
+      The setup scripts install python3-cryptography for the fixtures.
+- [x] **Checks:** suite 762 → **831/831**; `bench-run-recon.sh checks` **PASS** on all ten; A/B vs Batch 4: the
+      default path's output identical on the farm, and on the lab except WordPress's plain-HTTP login page
+      (`Form`, `CleartextAuth`: the new detection); timing equal run by run (BENCHMARK.md).
+- [x] **Found while building this**: see BENCHMARK.md (`--tls-full` gave no CSV with tlsx 1.4.0 since 1.17,
+      tlsx cannot offer weak suites, `expired` is false for a not-yet-valid certificate, the chain check's
+      missing verdict on weak hosts, tlsx's `auto` mode reading an open stdin).
+
+## v1.20.0 — Batch 6: JSON output and shipping to Tideline
+
+Tracked in `PLAN.md` section 8 (P1–P3), on `batch-6-json-ship` (stacked on Batch 5). The run-recon side of
+recon-platform-plan §11; the protocol, exit codes, schemas and enrollment are in `SHIPPING.md`.
+
+- [x] **P1 `--json`**: `<out>.<kind>.jsonl`, one JSON object per line, the CSV's and the TSVs' own field
+      names. `urls` and `services` come from the CSV builder itself, from the rows it writes, before the
+      formula guard (`'=` in the CSV, `=` in the JSON); a service is `scheme://host[:port]` under a seed with
+      its root URL's values (recon-db.sh diff's rule), `port` and `url_count` integers. `findings` parses every
+      `<out>.<kind>.txt` line (seed, check, severity, host, `key=value` fields, note, text); the TSV kinds
+      (dnsposture, edges, cnames, zone-names, screenshots, cloud-assets, vulnx, delta) keep their headers;
+      `warnings` holds every warning (run.json keeps 200); `seeds` the per-seed counts. Written before the
+      manifest, so each file is hashed there. JSON Schemas (2020-12) in `schemas/`, one per kind, plus
+      `tideline-envelope/1`; the setup scripts install them.
+- [x] **P2 identifiers**: `run_id` (UUID v4) on every run, in the work dir's state and run.json, kept by
+      `--resume`; `--engagement` and `--job-id` (1–128 of `A-Z a-z 0-9 . _ : -`) in run.json.
+- [x] **P3 `--ship`**: `ship-recon.sh` sends the finished run (signed `tideline-envelope/1`, ES256 over the
+      manifest's exact bytes in `Tideline-Signature`; one gzip part per JSONL file, the run's manifest and
+      each screenshot, each part's SHA-256 the one in `<out>.manifest.sha256`) over mTLS: TLS 1.2+,
+      ECDHE + AES-GCM, the client certificate's URI SAN `urn:tideline:sensor:<id>` as the identity, the
+      server checked against `--ship-ca` alone. Open (201/200/409), PUT the missing parts, complete;
+      `<out>.ship-state.json` after the manifest; resume and idempotent re-ship; `status`, `export` (a bundle
+      for a hand-carried upload), `envelope`, `check`. Settings checked before the scan (exit 2, nothing
+      sent); a failed delivery exits 4 with the run complete locally. Shipping connects directly unless
+      `--ship-proxy` (the scan's `--proxy` is not used).
+- [x] **Mock ingest**: `lab/mock-tideline.py` (loopback only) checks the certificate chain and sensor, the
+      manifest's sensor and signature (DER or P1363), part hashes, sizes and records against the schemas;
+      `faults.json` injects a status or a dropped connection. `lab/gen-ship-certs.sh` makes a
+      step-ca-shaped PKI and the misfits (another CA, no sensor URI, RSA, a server from another CA).
+- [x] **Lab**: `bench-run-recon.sh ship` (new; in `checks`).
+- [x] **Frozen identifiers** (decided 2026-11-06): `tideline-envelope/1`, `Tideline-Signature`,
+      `urn:tideline:sensor:<id>` (with `urn:tideline:tenant:<label>` carried but not read), `urn:tideline:schema:<id>`,
+      the `/v1/runs` endpoints. `schemas/SHA256SUMS`; the suite pins each identifier and checks the sums, and that a
+      tenant-carrying certificate passes while a combined `sensor:<tenant>:<id>` is refused (SHIPPING.md).
+- [x] **Checks:** suite 831 → **946/946**; `bench-run-recon.sh checks` **PASS** on all eleven on the final code
+      (`history` with the PostgreSQL 16 store, after a fix to the check's baseline run: it read a stale `--db`
+      cache). A/B vs Batch 5 on the lab: the default path's CSV
+      identical every round (noise floor applied), timing equal; `--json` +0.1 s CPU, CSV identical; shipping
+      the lab run 0.9 s (BENCHMARK.md).
+- [x] **Found while building this**: curl's `--cacert` alone still trusts the system CA directory (pinned with an
+      empty `--capath`); a connection reset mid-upload is not retried by curl (exit 4, resumed next time).

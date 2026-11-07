@@ -15,12 +15,18 @@ control; never point the scanner anywhere else.
 
 | file | what it is |
 |---|---|
-| `docker-compose.yml` | the range: `dns` (CoreDNS), `bind` (BIND 9.18, for the NSEC3 zone), `ingress` (Caddy TLS vhost router), `nginx`, `wordpress` + `db`, `spa`, `jenkins` — all pinned. `nginx` is also published directly on `LAB_ORIGIN_IP:80` (default `127.0.0.5`): the "forgotten origin" fixture. The ingress also answers `403` to everything on `LAB_PROTECTED_IP:80` (default `127.0.0.6`): the "protected origin". BIND answers as `ns.nsec3.test` on `LAB_NSEC3_IP:53` (default `127.0.0.7`) |
+| `docker-compose.yml` | the range: `dns` (CoreDNS), `bind` (BIND 9.18, for the NSEC3 zone), `ingress` (Caddy TLS vhost router), `nginx`, `wordpress` + `db`, `spa`, `jenkins` — all pinned. `nginx` is also published directly on `LAB_ORIGIN_IP:80` (default `127.0.0.5`): the "forgotten origin" fixture. The ingress also answers `403` to everything on `LAB_PROTECTED_IP:80` (default `127.0.0.6`): the "protected origin". BIND answers as `ns.nsec3.test` on `LAB_NSEC3_IP:53` (default `127.0.0.7`). `tlslab` (nginx 1.21.6) serves the TLS fixtures, each on its own address: `LAB_TLS_LEGACY_IP` … `LAB_TLS_MODERN_IP` (default `127.0.0.9`–`127.0.0.12`) |
+| `tls-nginx.conf` | the TLS fixtures' nginx: one listener per fixture, its own protocols and ciphers (see "TLS fixtures" below) |
+| `gen-tls-certs.py` | makes the TLS fixtures' certificates at `up` (needs `openssl` and `python3-cryptography`) |
+| `mock-tideline.py` | a stand-in for Tideline's ingest service (loopback only): mutual TLS, the sensor from the certificate, ES256 manifest signatures, part hashes and schema validation, fault injection; used by `ship` and the suite |
+| `gen-ship-certs.sh` | a throwaway step-ca-shaped PKI for `mock-tideline.py`: root, intermediate, server and sensor certificates, plus the misfits the tests need (needs `openssl`) |
 | `Caddyfile` | vhost routing; serves every name on both `http://` and `https://` with certificates from Caddy's local CA, plus the HTTP-detail fixtures below |
 | `Corefile` | CoreDNS: authoritative for `test.`, `walk.test.` and `xfr.test.` from the generated zone files; forwards `nsec3.test.` to BIND |
 | `named.conf` | BIND: authoritative only, for `nsec3.test.`, transfers refused; shares the `dns` container's network and listens on `:5353` |
 | `resolvers.txt` | the lab DNS server, passed to run-recon as `--resolvers` (dnsx/tlsx/httpx use it) |
 | `targets.txt` | lab seeds: `nginx.test wp.test spa.test ci.test` |
+| `targets-http.txt`, `targets-tls.txt` | *generated*: the seeds of the `http` and `tls` checks |
+| `tls/` | *generated*: the TLS fixtures' certificates and throwaway keys (gitignored) |
 | `expected.csv` | ground truth for the lab seeds (status, technologies, CPEs, TLS flags, IPv6) |
 | *generated at `up`* | |
 | `spa/index.html` | the 120 KB single-bundle SPA (WebInventory's SPA size) |
@@ -30,6 +36,10 @@ control; never point the scanner anywhere else.
 | `db.walk.test`, `db.walk.test.signed` | `walk.test.`, DNSSEC-signed with NSEC by `ldns-signzone` (throwaway keys in `dnssec/`) |
 | `db.xfr.test` | `xfr.test.`, unsigned, zone transfers allowed to anyone |
 | `db.nsec3.test`, `db.nsec3.test.signed` | `nsec3.test.`, signed with NSEC3 (1 0 5 1A2B3C4D) by `ldns-signzone -n`, served by BIND |
+| `db.posture.test` | `posture.test.` and `good.posture.test`: the email/DNS posture fixtures |
+| `cloud.tfstate`, `cloudlist.yaml` | a Terraform state and the cloudlist provider config that reads it (offline) |
+| `brute-wordlist.txt` | the `--brute` wordlist of the discovery check |
+| `targets-posture.txt`, `targets-discovery.txt` | seeds for the posture and discovery checks |
 | `db.127` | reverse zone for `127.0.0.0/8`: PTR fixtures for `--enrich` |
 | `targets-takeover.txt` | seeds for the takeover check: `nginx.test alias.test orphan.test` |
 | `targets-zone.txt` | seeds for the zone check: `walk.test xfr.test nsec3.test nginx.test` |
@@ -65,16 +75,25 @@ sudo sh -c './bench-run-recon.sh hosts >> /etc/hosts'   # once: names for tools 
 ./bench-run-recon.sh takeover                                                  # CNAME fixtures, real dnsx/subzy
 ./bench-run-recon.sh zone                                                      # AXFR / NSEC fixtures, real dig
 ./bench-run-recon.sh origin                                                    # forgotten-origin fixture
-./bench-run-recon.sh http                                                      # headers, cookies, auth, robots/security.txt, favicon, PTR
-./bench-run-recon.sh checks                                                    # all four; non-zero if any fails
+./bench-run-recon.sh http                                                      # headers, cookies, auth, robots/security.txt, favicon, PTR, redirects, login forms
+./bench-run-recon.sh tls                                                       # --tls-enum: version matrix, weak suites, weak/default/future certificates
+./bench-run-recon.sh posture                                                   # SPF/DMARC/MTA-STS/CAA, dangling MX/NS, lame NS, cloudlist
+./bench-run-recon.sh discovery                                                 # naabu, alterx, shuffledns, cdncheck, uncover, notify
+./bench-run-recon.sh scope                                                     # --scope / --list-targets; proved at the origin's access log
+./bench-run-recon.sh resume                                                    # SIGTERM mid-run, --resume, CSV equals an uninterrupted run
+RECON_DB_DSN=postgresql://... ./bench-run-recon.sh history                     # --monitor delta + recon-db history (store with RECON_DB_DSN)
+./bench-run-recon.sh ship                                                      # --ship to a mock Tideline ingest: round trip, re-ship, resume
+./bench-run-recon.sh checks                                                    # all eleven; non-zero if any fails
 
 ./bench-run-recon.sh down                # tear down and remove volumes
 ```
 
 `up` needs **ldnsutils** (`sudo apt install ldnsutils`; the setup scripts install it) to sign
 `walk.test` and `nsec3.test`; without it the zones are served unsigned and `zone` skips the NSEC and
-NSEC3 cases. If `127.0.0.5`, `127.0.0.6` or `127.0.0.7` is taken, set `LAB_ORIGIN_IP`,
-`LAB_PROTECTED_IP` or `LAB_NSEC3_IP` to another loopback address for `up` and the checks.
+NSEC3 cases. It also needs **python3-cryptography** and `openssl` for the TLS fixtures' certificates
+(the setup scripts install it too). If `127.0.0.5`, `127.0.0.6`, `127.0.0.7` or `127.0.0.9`–`127.0.0.12` is taken,
+set `LAB_ORIGIN_IP`, `LAB_PROTECTED_IP`, `LAB_NSEC3_IP` or `LAB_TLS_LEGACY_IP` … `LAB_TLS_MODERN_IP` to
+another loopback address for `up` and the checks.
 
 First boot takes a minute or two (WordPress install, Jenkins start). `up`
 installs WordPress with a throwaway admin password that is generated, used once
@@ -148,6 +167,73 @@ that `<out>.edge.tsv` names the edge and the origin software.
 expects `origin-protected [info] host=spa.test origin=127.0.0.6 via=origin.spa.test
 reason=443:refused,80:status-403-other-content`, and nothing at all for `wp.test`.
 
+## Email/DNS posture fixtures (run-recon 1.20)
+
+`posture.test` gets everything wrong and its subdomain `good.posture.test` everything right. Both are
+served by CoreDNS from `db.posture.test`; the MTA-STS policies come from the Caddy ingress, whose
+certificates are issued by Caddy's local CA, so `bench-run-recon.sh posture` reads that CA out of the
+ingress container and passes it with `--mta-sts-ca` (certificate verification stays on).
+
+| Record | posture.test | expected | good.posture.test |
+|---|---|---|---|
+| NS | `ns` (CoreDNS), `ns-gone.nowhere.test` (`nowhere.test` does not exist), `ns-lame` → `LAB_NSEC3_IP` (BIND refuses the zone) | `ns-dangling [high]`, `ns-lame [medium] reason=refused`; CoreDNS not lame | (the zone's) |
+| MX | `mx1` (exists), `mx-old.gone-mail.test` (`gone-mail.test` does not exist) | `mx-dangling [high]` | `mx1` |
+| SPF | `include:_spf.posture.test +all` | `spf-permissive [high]` | `mx -all` |
+| DMARC | `p=none`, no `rua` | `dmarc-none [low]`, `dmarc-no-rua [info]` | `p=reject; rua=...` |
+| MTA-STS | `testing`, lists `mx1` only | `mta-sts-testing [info]`, `mta-sts-mx-mismatch [medium]` | `enforce`, lists `mx1` |
+| TLS-RPT | none | `tlsrpt-missing [info]` | present |
+| CAA | `0 issue "letsencrypt.org"` | nothing | (the zone's) |
+
+`good.posture.test` must have no finding at all. The same check runs `--cloudlist` against `cloud.tfstate`
+(cloudlist's Terraform provider reads it offline): `127.0.0.1` is matched to the scan's inventory, and
+`127.0.0.8`, which nothing in the lab serves, is `cloud-asset-unseen [info]`.
+
+## Discovery fixtures (run-recon 1.20)
+
+`bench-run-recon.sh discovery` runs the discovery tools for real: a baseline run on `nginx.test`, then a
+second with `--ports --port-spec 80,443,8443 --permute --brute --origin --monitor --notify` against it.
+
+| Tool | Fixture | Expected |
+|---|---|---|
+| naabu | the ingress also serves `https://nginx.test:8443` (published on 127.0.0.1:8443) | a `https://nginx.test:8443` row |
+| alterx | `grafana.nginx.test` exists in `db.test`; alterx guesses it from `nginx.test` | a row with source `alterx` |
+| shuffledns + massdns | `backup-db.nginx.test` exists; `brute-wordlist.txt` holds `backup-db` | a row with source `bruteforce` |
+| cdncheck | the loopback edge; and `104.16.0.1` checked directly | no CDN tag; `104.16.0.1 [waf] [cloudflare]` in the format `--origin` parses |
+| notify | a webhook on a random loopback port, `NOTIFY_CONFIG` pointing at it | one message (`-bulk`) naming the new `:8443` asset |
+| uncover | run with an empty `HOME` (no keys) | the "requires keys" message that run-recon turns into a warning |
+
+The baseline run must not have the alterx or wordlist names. massdns has no package on most systems; the
+setup scripts build it from source (`github.com/blechschmidt/massdns`).
+
+## Scope, resume and history checks (run-recon 1.20)
+
+These need no new fixtures; they use the lab's names and the origin fixture.
+
+`bench-run-recon.sh scope`:
+1. `--list-targets` with `ci.test` outside the scope: exit 2, and `ci.test` is shown as out of scope.
+2. A scope with names only, and `--origin --screenshots`: the origin candidates (`127.0.0.5`, `127.0.0.6`)
+   are listed in `<out>.scope.txt` and not contacted. The browser, held to the seed's names, still
+   renders `nginx.test`.
+3. The same with the two origin addresses allowed: `origin-exposed` for nginx.test and `origin-protected`
+   for spa.test, as without `--scope`.
+4. `!127.0.0.5` and `!backup-db.nginx.test`, with a wordlist that finds `direct.nginx.test` (127.0.0.5) and
+   `backup-db.nginx.test`: neither name is in the CSV. The proof is the nginx container's own log. A
+   request to `LAB_ORIGIN_IP` arrives from the docker bridge gateway, so the count of such lines must not
+   change during the run. The same run without `--scope` must change it, which shows the check can see
+   that traffic.
+5. MTA-STS: with `!mta-sts.posture.test`, the posture table says the policy was not fetched.
+
+`bench-run-recon.sh resume`: two uninterrupted runs of the lab targets with `-t 1 --tls`, then a third one
+stopped by SIGTERM after two seeds (exit 143, state `interrupted`) and resumed. The resumed CSV must equal
+the first run's under `compare --exact`, with the second run as the noise floor.
+
+`bench-run-recon.sh history`:
+1. A run of the lab targets, then the `spa` backend is stopped and a second run is made with `--monitor`.
+2. `<out>.delta.tsv` must show `spa.test` status `200` → `502` and nothing for the other three hosts, and
+   the report must have the Changes section. `recon-db.sh changes --csv` must find the same event.
+3. With `RECON_DB_DSN` set (a PostgreSQL database), both runs also go to the store (`--db`), and
+   `recon-db.sh changes` / `history` must find the event and nginx.test's first/last seen there.
+
 ## HTTP-detail fixtures (run-recon 1.19)
 
 | name | what the lab serves | run-recon must report |
@@ -162,6 +248,64 @@ reason=443:refused,80:status-403-other-content`, and nothing at all for `wp.test
 
 The basic-auth password in the Caddyfile is a throwaway lab value. katana reads robots.txt too, so
 `/private/` and the sitemap URL also appear in default runs of the lab, for every version alike.
+
+## Redirect and login-form fixtures (run-recon 1.20)
+
+Part of `bench-run-recon.sh http` (`--extras`), from the Caddyfile:
+
+| URL | what the lab serves | run-recon must report |
+|---|---|---|
+| `https://redir.test/` | `302` → `/login`, a page with a password form whose `action` is `http://redir.test/session` | `final_url=https://redir.test/login`, `redirect_chain=302->https://redir.test/login` (`/login` is a hop `--extras` fetched, not a URL row), `login_form=http://redir.test/session`, `auth=Form`, `CleartextAuth` on the HTTPS row |
+| `http://redir.test/session` | found by the crawl in that form; `301` → `https://redir.test/session` (`200`) | the http:// → https:// hop followed |
+| `https://redir.test/old` | `301` → `https://elsewhere.test/` (no such site) | the hop listed in `redirect_chain`, not followed; `final_url` stays `https://redir.test/old` |
+| `http://plainlogin.redir.test/` | a password form on a plain-HTTP page | `login_form=http://plainlogin.redir.test/login`, `http_flags=PlainHttp;CleartextAuth` |
+
+## TLS fixtures (run-recon 1.20)
+
+`bench-run-recon.sh tls` runs `--tls-enum` against `targets-tls.txt`. One nginx 1.21.6 (OpenSSL 1.1.1n)
+serves four names, each on its own loopback address so each has its own protocol and cipher policy
+(`tls-nginx.conf`). The certificates are made at `up` by `gen-tls-certs.py`; the legacy one with the
+`openssl` command, since python3-cryptography refuses to sign with SHA-1.
+
+| name | what it serves | run-recon must report |
+|---|---|---|
+| `legacy.tls.test` | TLS 1.0–1.2; CBC-SHA suites, and `NULL-SHA` when a client offers only weak suites; RSA 1024 / SHA-1, self-signed | `tls_supported=TLS 1.2;TLS 1.1;TLS 1.0`, `tls_weak_cipher=TLS 1.2:TLS_RSA_WITH_NULL_SHA`, `cert_key=RSA 1024`; `WeakTLS`, `WeakCipher`, `WeakKey`, `WeakSig`, `SelfSigned`, `CertUntrusted` |
+| `future.tls.test` | a certificate valid from 30 days after `up` | `CertNotYetValid` (tlsx sets no `expired` for it) |
+| `default.tls.test` | OpenSSL's default subject, `O=Internet Widgits Pty Ltd` | `DefaultCert` |
+| `modern.tls.test` | TLS 1.2–1.3, ECDSA P-256: the control | `tls_supported=TLS 1.3;TLS 1.2`, `cert_key=EC P-256`, none of the flags above |
+
+The check also reads the matrix a second way, with tlsx's own per-version handshakes
+(`-min-version`/`-max-version`), and asks the container's openssl whether `legacy.tls.test` negotiates
+`NULL-SHA`. Debian's OpenSSL 1.1.1 is built without 3DES and RC4, so `NULL-SHA` stands in for them: the
+same `WeakCipher`. Nothing here can serve SSL 3.0; the probe's SSL 3.0 hello is covered by the suite's
+local TLS speaker instead.
+
+`legacy.tls.test` also shows why the chain check retries: the local OpenSSL refuses its key size
+and protocol before it gets to the chain, so the first handshake fails without a verdict. The
+second try, at security level 0, reaches one (`self-signed certificate` → `CertUntrusted`).
+
+## Tideline shipping check (run-recon 1.20)
+
+`bench-run-recon.sh ship` sends a lab run to `mock-tideline.py`, a stand-in for Tideline's ingest
+service, over mutual TLS on loopback. The run is `--tls --ipv6 --takeover --dns-posture --screenshots
+--engagement lab-ship --ship ...`. The PKI is a throwaway one made by `gen-ship-certs.sh` in the
+check's temporary directory, shaped like step-ca's: a root, an intermediate, ECDSA P-256 keys, and
+the sensor ID as a URI SAN. The mock checks what the real ingest checks: the client certificate and
+its sensor, the manifest's ES256 signature, each part's SHA-256 and size, and every record against
+its schema in `schemas/`.
+
+| Step | Passes when |
+|---|---|
+| the lab run with `--ship` | exit 0; `ship-state.json` complete; Tideline verified the run |
+| what Tideline stored | every part equals the local file byte for byte; the URL records equal the CSV row for row and field for field; the screenshots arrive as `image/png` artifacts; the manifest names the engagement and the certificate's sensor |
+| the exchange | one open (201), one PUT per part (204), one complete (202) |
+| shipping it again | Tideline answers 200 and nothing is re-sent |
+| the same files under a new `run_id`, Tideline answering 503 on part 2 | exit 4 |
+| the retry | the run is re-opened (200) and only the parts Tideline lacks are sent |
+
+The suite covers the refusals: a changed file, a conflicting manifest, another sensor's run, a client
+certificate from another CA, a server from another CA, and a trust store in `SSL_CERT_DIR` that
+must not be used. See [SHIPPING.md](../SHIPPING.md).
 
 ## Accuracy notes
 

@@ -23,7 +23,7 @@
 #
 set -euo pipefail
 
-VERSION="1.20.0-dev"
+VERSION="1.20.0"
 
 # Resolve our own directory early (BEFORE the worker-dispatch block below) so we
 # can locate sibling helper scripts (recon-db.sh, generate-report.sh) in both the
@@ -81,10 +81,20 @@ RECON_DIR="$(dirname "$RECON_SELF")"
 : "${ORIGIN_MAX_CHECKS:=200}" # cap on (host, candidate IP) pairs verified per seed
 : "${CERT_WARN_DAYS:=30}"   # --tls: CertExpiring when the certificate expires within this many days (WebInventory's default)
 : "${TLS_CHAIN_CHECK:=1}"   # --tls: validate each chain against the system trust store (CertUntrusted)
+: "${DNS_POSTURE:=0}"      # 1 = email/DNS posture per seed: SPF, DMARC, MTA-STS, TLS-RPT, CAA, dangling MX/NS, lame NS
+: "${MTA_STS_CA:=}"        # extra CA file for MTA-STS policy fetches (a lab's private CA); verification stays on
+: "${CLOUDLIST:=0}"        # 1 = diff your cloud accounts (cloudlist) against what the scan found
+: "${CLOUDLIST_CONFIG:=}"  # cloudlist provider config (default: ~/.config/cloudlist/provider-config.yaml)
+: "${TLD_VARIANTS:=0}"     # 1 = list the seed's name registered under other TLDs (tldfinder); never scanned
+: "${VULNX:=0}"            # 1 = product advisories for the CPEs seen (vulnx, ProjectDiscovery's CVE API)
+: "${VULNX_LIMIT:=10}"     # CVEs listed per product (most likely exploited first)
+: "${VULNX_MAX_PRODUCTS:=40}" # products looked up per run
 : "${ZONE_EXPOSURE:=0}"    # 1 = per seed zone: open AXFR, walkable NSEC chain, NSEC3 params -> side artifact
 : "${ZONE_WALK_MAX:=5000}" # stop an NSEC walk after this many names
 : "${TLS_POSTURE:=0}"      # 1 = TLS posture via tlsx (neg. version/cipher, cert expiry, self-signed, name mismatch)
-: "${TLS_ENUM:=0}"         # 1 = also enumerate TLS versions + ciphers (noisier; adds WeakTLS/WeakCipher flags)
+: "${TLS_ENUM:=0}"         # 1 = TLS version matrix + weak-cipher probe (--tls-enum; 6 short handshakes per https host)
+: "${TLS_ENUM_TIMEOUT:=8}" # --tls-enum: seconds per handshake
+: "${REDIRECT_MAX:=5}"     # redirect hops followed per URL (same host; --extras fetches the ones the run did not probe)
 : "${IPV6:=0}"             # 1 = resolve AAAA records (dnsx) -> ipv6 column
 : "${ENRICH:=0}"           # 1 = per-IP cloud provider + RDAP network org -> cloud, rdap_org columns
 : "${GEO_DB:=}"            # path to a MaxMind GeoLite2 .mmdb for the geo column (implies --enrich; needs mmdblookup)
@@ -113,6 +123,9 @@ RECON_DIR="$(dirname "$RECON_SELF")"
 : "${MONITOR:=0}"          # 1 = diff discovered assets against a prior CSV (--monitor)
 : "${MONITOR_PREV:=}"      # prior CSV to diff against (default: newest recon-*.csv in out-dir)
 : "${NOTIFY:=0}"           # 1 = pipe the new-asset diff through 'notify' if configured
+: "${NOTIFY_CONFIG:=}"     # notify provider config (default: ~/.config/notify/provider-config.yaml)
+: "${CACHE_FRESH_ACTIVE:=}" # 1 = with --db, re-measure every target-facing result instead of reading it from the
+                           # cache (default: 1 under --monitor, so a change is seen the run it happens)
 : "${GITHUB:=0}"           # 1 = mine GitHub for subdomains + endpoints (needs a token)
 : "${GITHUB_TOKEN_FILE:=}" # file with GitHub token(s), 1/line; else env GITHUB_TOKEN is used
 : "${BUCKETS:=0}"          # 1 = cloud bucket enumeration (cloud_enum: S3/Azure/GCP) -> side artifact
@@ -156,6 +169,14 @@ RECON_DIR="$(dirname "$RECON_SELF")"
 : "${CB_SERIALIZE:=github-endpoints github-subdomains wpscan virustotal}"  # sources serialized across workers (rate-limit safety)
 : "${PROXY:=}"             # optional HTTP(S) proxy URL for GET-heavy stages (--proxy); e.g. a caching squid
 : "${REPORT:=1}"           # 1 = build an HTML report at the end (default on; --no-report to skip)
+
+# --- JSON output and result shipping to Tideline (the recon results platform) -----
+: "${JSON_OUT:=0}"         # 1 = also write <out>.<kind>.jsonl, one JSON record per line (--json)
+: "${SHIP_URL:=}"          # Tideline ingest base URL, https only (--ship URL); implies --json
+: "${SHIP_CERT:=}"         # this sensor's client certificate (PEM, chain), from step-ca (--ship-cert)
+: "${SHIP_KEY:=}"          # its ECDSA P-256 key (PEM, unencrypted, readable only by this user) (--ship-key)
+: "${SHIP_CA:=}"           # the Tideline root CA the ingest server is checked against, pinned (--ship-ca)
+: "${SHIP_PROXY:=}"        # proxy for shipping only (--ship-proxy); default: direct (the scan's --proxy is never used)
 
 # --- IP + ASN attribution (adds ip/asn/asn_org columns to the CSV) -----------
 # Surface each host's resolved IP and the IP's origin ASN (number + org, via the
@@ -287,7 +308,9 @@ cache_split() {
   local src="$1" keyf="$2" hitval="$3" misskeys="$4"
   : > "$hitval"; : > "$misskeys"
   [ -s "$keyf" ] || return 0
-  if [ "$USE_DB" != "1" ]; then cp "$keyf" "$misskeys"; return 0; fi
+  # every cache_split source is a target-facing result (probe, enrichment, crawl, ports,
+  # TLS, JARM): under --monitor they are measured afresh (CACHE_FRESH_ACTIVE) and only stored
+  if [ "$USE_DB" != "1" ] || [ "${CACHE_FRESH_ACTIVE:-0}" = 1 ]; then cp "$keyf" "$misskeys"; return 0; fi
   local pos="$keyf.pos" neg="$keyf.neg"
   db_cache_mget "$src" "$CACHE_TTL" "$keyf" > "$pos" 2>/dev/null || : > "$pos"
   db_cache_mget "${src}!neg" "$NEG_TTL" "$keyf" > "$neg" 2>/dev/null || : > "$neg"
@@ -488,26 +511,41 @@ def key(j):
     except Exception:
         port = 443
     return (str(j.get("ip") or host), port, host)
+def _ctx(legacy):
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False            # name mismatch has its own flag
+    if legacy:
+        # the local OpenSSL refuses a small key or an old protocol below its security level
+        # before it gets to the chain (a handshake failure, not a verdict): the second try at
+        # level 0 lets the verification answer. Weak keys and signatures have flags of their own.
+        import warnings
+        ctx.set_ciphers("DEFAULT:@SECLEVEL=0")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            ctx.minimum_version = ssl.TLSVersion.TLSv1
+    return ctx
 def verify(k):
     # one handshake per (address, port, name): seeds that share hosts are checked once
     addr, port, host = k
     r = {}
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False            # name mismatch has its own flag
-    try:
-        with socket.create_connection((addr, port), timeout=6) as sock:
-            with ctx.wrap_socket(sock, server_hostname=host):
+    for legacy in (False, True):
+        try:
+            with socket.create_connection((addr, port), timeout=6) as sock:
+                with _ctx(legacy).wrap_socket(sock, server_hostname=host):
+                    r["chain_trusted"] = True
+        except ssl.SSLCertVerificationError as e:
+            code = getattr(e, "verify_code", 0)
+            if code in (9, 10):            # not yet valid / expired: the chain itself is fine
                 r["chain_trusted"] = True
-    except ssl.SSLCertVerificationError as e:
-        code = getattr(e, "verify_code", 0)
-        if code in (9, 10):                # not yet valid / expired: the chain itself is fine
-            r["chain_trusted"] = True
-        else:
-            r["chain_trusted"] = False
-            r["chain_error"] = (getattr(e, "verify_message", "") or str(e))[:120]
-            r["untrusted"] = True
-    except Exception:
-        pass                               # no handshake: say nothing
+            else:
+                r["chain_trusted"] = False
+                r["chain_error"] = (getattr(e, "verify_message", "") or str(e))[:120]
+                r["untrusted"] = True
+        except ssl.SSLError:
+            continue                       # refused below the local security level: try level 0
+        except Exception:
+            pass                           # no handshake: say nothing
+        break
     return r
 keys = sorted(set(key(j) for j in recs if isinstance(j, dict) and j.get("host")))
 with ThreadPoolExecutor(max_workers=16) as ex:
@@ -523,6 +561,327 @@ with open(path + ".chk", "w", encoding="utf-8") as fh:
 import os
 os.replace(path + ".chk", path)
 PYCHAIN
+  return 0
+}
+
+# tls_enum_probe KEYS TLSXJSON : the TLS version matrix and weak-cipher probe (--tls-enum),
+# WebInventory's plan (engine.cs Scan): one ClientHello per version (TLS 1.3, 1.2, 1.1, 1.0,
+# SSL 3.0), then one at TLS 1.2 offering only weak suites (NULL, EXPORT, anon, RC4, DES, 3DES,
+# RC2). Each handshake stops at the ServerHello: nothing is negotiated past it, so the result
+# does not depend on the local OpenSSL build (which can no longer offer SSL 3.0 or RC4) or on
+# tlsx -cipher-input (ctls refuses weak suite names; ztls sends an empty cipher list).
+# Only host:port keys tlsx completed a handshake with, at the address tlsx connected to: the
+# names and addresses the scope already allowed, and no resolution of its own. One JSON record
+# per key: tls_supported (in plan order), tls_ciphers (version -> the suite the server chose),
+# tls_weak_cipher ("version:suite" when it accepted a weak one).
+tls_enum_probe() {
+  local keys="$1" tlsx="$2"
+  [ -s "$keys" ] || return 0
+  _to "$STAGE_TIMEOUT" python3 - "$keys" "$tlsx" <<'PYENUM'
+# TLSENUM-PROBE (the suite extracts this program by that marker)
+import sys, os, socket, struct, json, ipaddress
+from concurrent.futures import ThreadPoolExecutor
+keys_path, tlsx_path = sys.argv[1], sys.argv[2]
+TIMEOUT = float(os.environ.get("TLS_ENUM_TIMEOUT") or 8)
+NAMES = {
+    0x1301: "TLS_AES_128_GCM_SHA256", 0x1302: "TLS_AES_256_GCM_SHA384", 0x1303: "TLS_CHACHA20_POLY1305_SHA256",
+    0xC02B: "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", 0xC02C: "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+    0xC02F: "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", 0xC030: "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+    0xCCA8: "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256", 0xCCA9: "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+    0xC023: "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256", 0xC024: "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
+    0xC027: "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256", 0xC028: "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384",
+    0xC009: "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA", 0xC00A: "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA",
+    0xC013: "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA", 0xC014: "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA",
+    0x009E: "TLS_DHE_RSA_WITH_AES_128_GCM_SHA256", 0x009F: "TLS_DHE_RSA_WITH_AES_256_GCM_SHA384",
+    0xCCAA: "TLS_DHE_RSA_WITH_CHACHA20_POLY1305_SHA256", 0x0067: "TLS_DHE_RSA_WITH_AES_128_CBC_SHA256",
+    0x006B: "TLS_DHE_RSA_WITH_AES_256_CBC_SHA256", 0x0033: "TLS_DHE_RSA_WITH_AES_128_CBC_SHA",
+    0x0039: "TLS_DHE_RSA_WITH_AES_256_CBC_SHA", 0x009C: "TLS_RSA_WITH_AES_128_GCM_SHA256",
+    0x009D: "TLS_RSA_WITH_AES_256_GCM_SHA384", 0x003C: "TLS_RSA_WITH_AES_128_CBC_SHA256",
+    0x003D: "TLS_RSA_WITH_AES_256_CBC_SHA256", 0x002F: "TLS_RSA_WITH_AES_128_CBC_SHA",
+    0x0035: "TLS_RSA_WITH_AES_256_CBC_SHA", 0x0041: "TLS_RSA_WITH_CAMELLIA_128_CBC_SHA",
+    0x0084: "TLS_RSA_WITH_CAMELLIA_256_CBC_SHA",
+    0xC012: "TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA", 0xC008: "TLS_ECDHE_ECDSA_WITH_3DES_EDE_CBC_SHA",
+    0x0016: "TLS_DHE_RSA_WITH_3DES_EDE_CBC_SHA", 0x000A: "TLS_RSA_WITH_3DES_EDE_CBC_SHA",
+    0xC011: "TLS_ECDHE_RSA_WITH_RC4_128_SHA", 0xC007: "TLS_ECDHE_ECDSA_WITH_RC4_128_SHA",
+    0x0005: "TLS_RSA_WITH_RC4_128_SHA", 0x0004: "TLS_RSA_WITH_RC4_128_MD5",
+    0x0009: "TLS_RSA_WITH_DES_CBC_SHA", 0x0015: "TLS_DHE_RSA_WITH_DES_CBC_SHA",
+    0x0003: "TLS_RSA_EXPORT_WITH_RC4_40_MD5", 0x0006: "TLS_RSA_EXPORT_WITH_RC2_CBC_40_MD5",
+    0x0008: "TLS_RSA_EXPORT_WITH_DES40_CBC_SHA", 0x0014: "TLS_DHE_RSA_EXPORT_WITH_DES40_CBC_SHA",
+    0x0062: "TLS_RSA_EXPORT1024_WITH_DES_CBC_SHA", 0x0064: "TLS_RSA_EXPORT1024_WITH_RC4_56_SHA",
+    0x0001: "TLS_RSA_WITH_NULL_MD5", 0x0002: "TLS_RSA_WITH_NULL_SHA", 0x003B: "TLS_RSA_WITH_NULL_SHA256",
+    0xC010: "TLS_ECDHE_RSA_WITH_NULL_SHA", 0xC006: "TLS_ECDHE_ECDSA_WITH_NULL_SHA",
+    0x0018: "TLS_DH_anon_WITH_RC4_128_MD5", 0x001B: "TLS_DH_anon_WITH_3DES_EDE_CBC_SHA",
+    0x0034: "TLS_DH_anon_WITH_AES_128_CBC_SHA", 0x003A: "TLS_DH_anon_WITH_AES_256_CBC_SHA",
+    0xC018: "TLS_ECDH_anon_WITH_AES_128_CBC_SHA", 0xC019: "TLS_ECDH_anon_WITH_AES_256_CBC_SHA",
+    0xC016: "TLS_ECDH_anon_WITH_RC4_128_SHA",
+}
+TLS13 = (0x1301, 0x1302, 0x1303)
+MODERN = (0xC02B, 0xC02F, 0xC02C, 0xC030, 0xCCA9, 0xCCA8, 0x009E, 0x009F, 0xCCAA, 0xC023, 0xC027, 0xC024,
+          0xC028, 0xC009, 0xC013, 0xC00A, 0xC014, 0x0067, 0x006B, 0x0033, 0x0039, 0x009C, 0x009D, 0x003C,
+          0x003D, 0x002F, 0x0035, 0x0041, 0x0084, 0xC012, 0xC008, 0x0016, 0x000A, 0xC011, 0xC007, 0x0005, 0x0004)
+WEAK = (0xC011, 0xC007, 0x0005, 0x0004, 0xC012, 0xC008, 0x0016, 0x000A, 0x0009, 0x0015, 0x0003, 0x0006,
+        0x0008, 0x0014, 0x0062, 0x0064, 0x0001, 0x0002, 0x003B, 0xC010, 0xC006, 0x0018, 0x001B, 0x0034,
+        0x003A, 0xC018, 0xC019, 0xC016)
+VNAME = {0x0304: "TLS 1.3", 0x0303: "TLS 1.2", 0x0302: "TLS 1.1", 0x0301: "TLS 1.0", 0x0300: "SSL 3.0"}
+PLAN = (("tls13", "TLS 1.3"), ("tls12", "TLS 1.2"), ("tls11", "TLS 1.1"), ("tls10", "TLS 1.0"), ("ssl3", "SSL 3.0"))
+
+def suite_name(s):
+    return NAMES.get(s, "0x%04X" % s)
+def is_weak(s):
+    n = suite_name(s)
+    return any(w in n for w in ("_NULL_", "EXPORT", "_anon_", "RC4", "_DES_", "3DES", "RC2"))
+def u16(v):
+    return struct.pack(">H", v)
+def ext(t, body):
+    return u16(t) + u16(len(body)) + body
+def is_ip(s):
+    try:
+        ipaddress.ip_address(s)
+        return True
+    except ValueError:
+        return False
+
+def client_hello(mode, sni):
+    ver = {"tls13": 0x0303, "tls12": 0x0303, "weak": 0x0303, "tls11": 0x0302, "tls10": 0x0301, "ssl3": 0x0300}[mode]
+    suites = (TLS13 + MODERN) if mode == "tls13" else WEAK if mode == "weak" else MODERN
+    body = u16(ver) + os.urandom(32)
+    body += b"\x00" if mode == "ssl3" else b"\x20" + os.urandom(32)
+    cs = list(suites) + ([] if mode == "ssl3" else [0x00FF])        # + TLS_EMPTY_RENEGOTIATION_INFO_SCSV
+    body += u16(2 * len(cs)) + b"".join(u16(s) for s in cs) + b"\x01\x00"
+    if mode != "ssl3":
+        e = b""
+        if sni and not is_ip(sni):
+            h = sni.rstrip(".").encode("ascii", "ignore")
+            e += ext(0x0000, u16(len(h) + 3) + b"\x00" + u16(len(h)) + h)
+        e += ext(0x000a, bytes.fromhex("000a001d0017001800190100"))   # groups
+        e += ext(0x000b, b"\x01\x00")                                   # ec_point_formats
+        if mode in ("tls13", "tls12", "weak"):
+            e += ext(0x000d, bytes.fromhex("001a0403050306030804080508060401050106010203020104020202"))   # sigalgs
+        if mode in ("tls13", "tls12"):
+            e += ext(0x0010, b"\x00\x0c\x02h2\x08http/1.1")
+        e += ext(0x0017, b"") + ext(0xff01, b"\x00")                     # EMS, renegotiation_info
+        if mode == "tls13":
+            e += ext(0x002b, b"\x02\x03\x04")                            # supported_versions: TLS 1.3 only
+            e += ext(0x002d, b"\x01\x01")                                # psk_key_exchange_modes
+            e += ext(0x0033, u16(36) + u16(0x001d) + u16(32) + os.urandom(32))   # any 32 bytes: an x25519 share
+        body += u16(len(e)) + e
+    hs = b"\x01" + struct.pack(">I", len(body))[1:] + body
+    return b"\x16" + u16(0x0300 if mode == "ssl3" else 0x0301) + u16(len(hs)) + hs
+
+def read_exact(s, n):
+    b = b""
+    while len(b) < n:
+        c = s.recv(n - len(b))
+        if not c:
+            return None
+        b += c
+    return b
+
+def server_hello(d, r):
+    if len(d) < 38:
+        return
+    ver = (d[0] << 8) | d[1]
+    q = 34
+    q += 1 + d[q]
+    if q + 3 > len(d):
+        return
+    r["cipher"] = (d[q] << 8) | d[q + 1]
+    q += 3
+    if q + 2 <= len(d):
+        ee = min(len(d), q + 2 + ((d[q] << 8) | d[q + 1]))
+        q += 2
+        while q + 4 <= ee:
+            et, el = (d[q] << 8) | d[q + 1], (d[q + 2] << 8) | d[q + 3]
+            if q + 4 + el > ee:
+                break
+            if et == 0x002b and el == 2:                                 # TLS 1.3 (also a HelloRetryRequest)
+                ver = (d[q + 4] << 8) | d[q + 5]
+            q += 4 + el
+    r["version"] = ver
+
+def probe(ip, port, sni, mode):
+    r = {"connected": False}
+    try:
+        s = socket.create_connection((ip, port), timeout=TIMEOUT)
+    except OSError:
+        return r
+    r["connected"] = True
+    try:
+        s.settimeout(TIMEOUT)
+        s.sendall(client_hello(mode, sni))
+        buf = b""
+        while len(buf) < 262144:
+            hdr = read_exact(s, 5)
+            if hdr is None:
+                break
+            ct, rl = hdr[0], (hdr[3] << 8) | hdr[4]
+            if ct < 20 or ct > 23 or hdr[1] > 3:
+                r["not_tls"] = True
+                break
+            if rl > 18432:
+                break
+            frag = read_exact(s, rl)
+            if frag is None:
+                break
+            r["tls"] = True
+            if ct != 22:
+                break                                                    # an alert, or nothing to read
+            buf += frag
+            if len(buf) >= 4 and len(buf) >= 4 + int.from_bytes(buf[1:4], "big"):
+                if buf[0] == 2:
+                    server_hello(buf[4:4 + int.from_bytes(buf[1:4], "big")], r)
+                break
+    except OSError:
+        pass
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+    return r
+
+def scan(job):
+    host, port, ip = job
+    versions, ciphers, is_tls = [], {}, False
+    for mode, label in PLAN:
+        h = probe(ip, port, host, mode)
+        if not h["connected"]:
+            if mode == "tls13":
+                return None                                              # gone since the posture: say nothing
+            continue
+        if h.get("not_tls") and not is_tls:
+            return None
+        is_tls = is_tls or bool(h.get("tls"))
+        if h.get("cipher") is not None and VNAME.get(h.get("version")) == label:
+            versions.append(label)
+            ciphers[label] = suite_name(h["cipher"])
+    weak = ""
+    if is_tls:
+        w = probe(ip, port, host, "weak")
+        if w.get("cipher") is not None and is_weak(w["cipher"]):
+            weak = VNAME.get(w.get("version"), "0x%04X" % (w.get("version") or 0)) + ":" + suite_name(w["cipher"])
+    return {"host": host, "port": str(port), "ip": ip, "tls_supported": versions,
+            "tls_ciphers": ciphers, "tls_weak_cipher": weak}
+
+addr = {}
+try:
+    for line in open(tlsx_path, encoding="utf-8", errors="replace"):
+        try:
+            j = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(j, dict) and j.get("host") and j.get("ip"):
+            addr.setdefault("%s:%s" % (str(j["host"]).lower(), j.get("port") or 443), str(j["ip"]))
+except OSError:
+    pass
+jobs = []
+for line in open(keys_path, encoding="utf-8", errors="replace"):
+    k = line.strip().lower()
+    host, _, port = k.rpartition(":")
+    if not host or not port.isdigit() or k not in addr:
+        continue
+    jobs.append((host, int(port), addr[k]))
+if jobs:
+    with ThreadPoolExecutor(max_workers=min(16, len(jobs))) as ex:
+        for rec in ex.map(scan, sorted(set(jobs))):
+            if rec:
+                print(json.dumps(rec, sort_keys=True))
+PYENUM
+}
+
+# _hx_enrich [ARGS...] : the per-URL enrichment request (httpx -json), one definition for the
+# enrichment pass, its late retry and the redirect hops (--extras), so every record has the
+# same fields. -er: the <form> tags and password inputs of the page, in page order (httpx
+# lists each distinct match once), for login_form / CleartextAuth; no extra request.
+LOGIN_FORM_RE='(?is)<form[^>]*>|<input[^>]+type\s*=\s*["'"'"']?password'
+_hx_enrich() {
+  _to "$STAGE_TIMEOUT" "$HTTPX_BIN" -silent -json -status-code -content-length -title -tech-detect -web-server \
+    -irh -hash sha256 -nfs -er "$LOGIN_FORM_RE" -timeout 10 -retries "$HTTP_RETRIES" -rl "$RATE" "$@"
+}
+
+# redirect_hops DOMAIN RAW ENRICHED HOPS [HTTPX-ARGS...] : --extras. The same-host redirect
+# targets the run did not probe itself, fetched with the enrichment request, up to REDIRECT_MAX
+# hops deep, so final_url / redirect_chain / login_form follow a chain past them (http:// ->
+# https:// -> /login). A target on another host is listed in redirect_chain, never fetched
+# (WebInventory's rule). Same host = the same name, so the scope already allowed it.
+redirect_hops() {
+  local domain="$1" raw="$2" enr="$3" hops="$4" round=0
+  shift 4
+  local next="$raw/hops_next.txt" asked="$raw/hops_asked.txt"
+  : > "$asked"
+  while [ "$round" -lt "${REDIRECT_MAX:-5}" ]; do
+    round=$((round + 1))
+    # after the first round, only the hops just fetched can lead further
+    if [ "$round" -gt 1 ] && ! grep -qE '"status_code": ?30[12378][,}]' "$hops" 2>/dev/null; then break; fi
+    python3 - "$enr" "$hops" "$asked" > "$next" <<'PYHOPS' || : > "$next"
+import sys, json
+from urllib.parse import urljoin, urlparse
+enr, hops, asked = sys.argv[1:4]
+def key(u):             # the aggregator's urlkey(): scheme/host case, default port, trailing slash
+    try:
+        p = urlparse(u)
+        s, h, port = (p.scheme or "").lower(), (p.hostname or "").lower(), p.port
+        if (s, port) in (("http", 80), ("https", 443)):
+            port = None
+        return "%s://%s%s%s%s" % (s, h, ":%d" % port if port else "", (p.path or "").rstrip("/"),
+                                  ("?" + p.query) if p.query else "")
+    except ValueError:
+        return u.rstrip("/")
+known, recs = set(), []
+for path in (enr, hops):
+    try:
+        for line in open(path, encoding="utf-8", errors="replace"):
+            try:
+                j = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(j, dict):
+                recs.append(j)
+                known.update(key(str(j[k])) for k in ("input", "url") if j.get(k))
+    except OSError:
+        pass
+try:
+    known.update(key(l.strip()) for l in open(asked, encoding="utf-8", errors="replace") if l.strip())
+except OSError:
+    pass
+out = set()
+for j in recs:
+    try:
+        if int(j.get("status_code") or 0) not in (301, 302, 303, 307, 308):
+            continue
+    except (TypeError, ValueError):
+        continue
+    hd = j.get("header") if isinstance(j.get("header"), dict) else {}
+    loc = j.get("location") or hd.get("location") or ""
+    loc = str(loc[0] if isinstance(loc, list) and loc else loc).strip()
+    base = str(j.get("input") or j.get("url") or "")
+    if not loc or not base:
+        continue
+    nxt = urljoin(base, loc).split("#", 1)[0]
+    try:
+        pb, pn = urlparse(base), urlparse(nxt)
+        if pn.scheme.lower() not in ("http", "https") or (pn.hostname or "").lower() != (pb.hostname or "").lower():
+            continue
+        pn.port
+    except ValueError:
+        continue
+    if key(nxt) not in known:
+        out.add(nxt)
+for u in sorted(out):
+    print(u)
+PYHOPS
+    [ -s "$next" ] || break
+    cat "$next" >> "$asked"
+    local _hh="$raw/hops_hit.jsonl" _hm="$raw/hops_miss.txt" _hf="$raw/hops_fresh.jsonl" _hrc=0
+    cache_split httpx_json_v3 "$next" "$_hh" "$_hm"
+    cat "$_hh" >> "$hops" 2>/dev/null || true
+    if [ -s "$_hm" ]; then
+      _hx_enrich "$@" < "$_hm" 2>>"$raw/httpx.err" > "$_hf" || _hrc=$?
+      cat "$_hf" >> "$hops" 2>/dev/null || true
+      [ "$_hrc" -eq 0 ] && cache_store httpx_json_v3 "$_hm" "$_hf" httpxjson noneg
+    fi
+  done
+  [ -s "$hops" ] && log "[$domain] redirect hops: $(grep -c . "$hops") same-host target(s) fetched"
   return 0
 }
 
@@ -636,7 +995,18 @@ stage() {
 # Pure string suffix match (no regex) so dotted domains can't over-match.
 # ---------------------------------------------------------------------------
 scope_filter() {
-  awk -v d="$1" '
+  # --scope exclusions (SCOPE_DENY: lines "name" = it and below, "*.name" = below only)
+  awk -v d="$1" -v sf="${SCOPE_DENY:-}" '
+    function denied(h,  s, i) {
+      s = h
+      while (1) {
+        if (s in dall) return 1
+        if (s != h && (s in dsub)) return 1
+        i = index(s, "."); if (i == 0) return 0
+        s = substr(s, i + 1)
+      }
+    }
+    BEGIN { nd = 0; if (sf != "") while ((getline l < sf) > 0) { if (substr(l, 1, 2) == "*.") dsub[substr(l, 3)] = 1; else dall[l] = 1; nd++ } }
     {
       u=$0
       h=u
@@ -646,10 +1016,117 @@ scope_filter() {
       sub(/:[0-9]+$/,"",h)                          # strip :port
       hl=tolower(h)
       if (hl=="") next
+      if (nd && denied(hl)) next
       if (hl==d) { print u; next }
       suf="." d
       if (length(hl) > length(suf) && substr(hl, length(hl)-length(suf)+1)==suf) { print u }
     }'
+}
+
+# ---------------------------------------------------------------------------
+# --scope helpers. Names are held to the scope by scope_filter (exclusions; the seeds were
+# checked before the run started). Two more checks need data that only exists at run time:
+#   scope_addr_filter IN OUT SEED  names that resolve into an excluded range are dropped
+#                                  before anything connects to them (non-resolving names
+#                                  stay: the takeover check needs them)
+#   scope_ip_filter SEED KIND      addresses run-recon picks itself (internet-scan hits,
+#                                  origin candidates) must be inside an allowed range
+# Everything held back is recorded in parts/scopeskip.<seed>.tsv (-> <out>.scope.txt).
+# ---------------------------------------------------------------------------
+scope_addr_filter() {
+  local in="$1" out="$2" seed="$3" safe
+  if [ "${SCOPE_DENY_NETS:-0}" != 1 ] || [ ! -s "$in" ]; then
+    [ "$in" = "$out" ] || { cat "$in" > "$out" 2>/dev/null || : > "$out"; }
+    return 0
+  fi
+  safe="$(printf '%s' "$seed" | tr -c 'A-Za-z0-9.-' '_')"
+  local rf=(); [ -n "$RESOLVERS" ] && [ -s "$RESOLVERS" ] && rf=(-r "$RESOLVERS")
+  _to "$STAGE_TIMEOUT" dnsx -l "$in" -silent -json -a -aaaa "${rf[@]}" < /dev/null 2>/dev/null > "$in.scope.json" || true
+  if ! python3 - "$in" "$in.scope.json" "$SCOPE_DIR/nets.txt" "$out.scope.tmp" "$WORKDIR/parts/scopeskip.$safe.tsv" "$seed" <<'PYSAF'
+import sys, json, ipaddress
+inf, js, nets_f, out, skip, seed = sys.argv[1:7]
+deny = [ipaddress.ip_network(l.split()[1]) for l in open(nets_f) if l.startswith("deny ")]
+bad = {}
+for line in open(js, encoding="utf-8", errors="replace"):
+    try:
+        j = json.loads(line)
+    except Exception:
+        continue
+    if not isinstance(j, dict):
+        continue
+    h = str(j.get("host") or "").lower().rstrip(".")
+    for a in list(j.get("a") or []) + list(j.get("aaaa") or []):
+        try:
+            ip = ipaddress.ip_address(str(a))
+        except ValueError:
+            continue
+        if any(ip in n for n in deny):
+            bad.setdefault(h, str(ip))
+kept = [n.strip() for n in open(inf, encoding="utf-8", errors="replace") if n.strip() and n.strip().lower() not in bad]
+open(out, "w").write("".join(x + "\n" for x in kept))
+with open(skip, "a") as f:
+    for h, a in sorted(bad.items()):
+        f.write("\t".join([seed, "name", h, "address=" + a, "resolves into an excluded range"]) + "\n")
+PYSAF
+  then
+    # fail closed: a name whose addresses could not be checked is not contacted
+    warn "[$seed] --scope: could not check the names' addresses; $(grep -c . "$in" 2>/dev/null || echo 0) name(s) held back"
+    : > "$out"; rm -f "$in.scope.json" "$out.scope.tmp"; return 0
+  fi
+  mv "$out.scope.tmp" "$out"; rm -f "$in.scope.json"
+  return 0
+}
+
+scope_ip_filter() {
+  if [ "${SCOPE_ON:-0}" != 1 ]; then cat; return 0; fi
+  local safe; safe="$(printf '%s' "$1" | tr -c 'A-Za-z0-9.-' '_')"
+  python3 -c '
+import sys, ipaddress
+nets_f, skip, seed, kind = sys.argv[1:5]
+allow, deny = [], []
+for l in open(nets_f):
+    f = l.split()
+    if len(f) == 2:
+        (allow if f[0] == "allow" else deny).append(ipaddress.ip_network(f[1]))
+held = []
+for line in sys.stdin:
+    t = line.strip()
+    if not t:
+        continue
+    a = t[1:].split("]", 1)[0] if t.startswith("[") else (t if t.count(":") > 1 else t.split(":", 1)[0])
+    try:
+        ip = ipaddress.ip_address(a)
+    except ValueError:
+        held.append((t, "not an address")); continue
+    if any(ip in n for n in deny):
+        held.append((t, "inside an excluded range"))
+    elif any(ip in n for n in allow):
+        sys.stdout.write(t + "\n")
+    else:
+        held.append((t, "outside the allowed ranges"))
+with open(skip, "a") as f:
+    for t, why in held:
+        f.write("\t".join([seed, kind, t, "", why]) + "\n")
+' "$SCOPE_DIR/nets.txt" "$WORKDIR/parts/scopeskip.$safe.tsv" "$1" "$2" || true
+}
+
+# scope_url_regex: one katana -cs regex for the scope's allowed names (or, with address
+# exclusions, for the live hosts already checked), and one -cos regex for its exclusions
+scope_url_regex() {
+  local mode="$1" f="$2" any="" sub=""
+  [ -s "$f" ] || return 0
+  if [ "$mode" = hosts ]; then
+    any="$(sed -E 's/:[0-9]+$//' "$f" | sort -u | sed 's/\./\\./g' | paste -sd'|' -)"
+    [ -n "$any" ] && printf '^https?://(%s)(:[0-9]+)?([/?#]|$)' "$any"
+    return 0
+  fi
+  any="$(grep -v '^\*\.' "$f" | sed 's/\./\\./g' | paste -sd'|' -)"
+  sub="$(grep '^\*\.' "$f" | sed 's/^\*\.//; s/\./\\./g' | paste -sd'|' -)"
+  local alt=""
+  [ -n "$any" ] && alt="([^/?#@]*\\.)?($any)"
+  [ -n "$sub" ] && alt="${alt:+$alt|}[^/?#@]*\\.($sub)"
+  [ -n "$alt" ] && printf '^https?://(%s)(:[0-9]+)?([/?#]|$)' "$alt"
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -971,13 +1448,17 @@ PYON
   # 3. pair hosts with candidates and verify
   python3 - "$domain" "$ref" "$jarm" "$cdn" "$res" "$txt" "$etsv" "$cand" "$ORIGIN_MAX_CHECKS" "$raw/favicon_hits.txt" \
       "${dres#@}" "${RANGE_CERTS_FILE:-}" "$WORKDIR/parts/virustotal.$(printf '%s' "$domain" | tr -c 'A-Za-z0-9.-' '_').txt" \
-      "$WORKDIR/parts/urlscan.$(printf '%s' "$domain" | tr -c 'A-Za-z0-9.-' '_').txt" <<'PYOC' || true
+      "$WORKDIR/parts/urlscan.$(printf '%s' "$domain" | tr -c 'A-Za-z0-9.-' '_').txt" \
+      "$([ "${SCOPE_ON:-0}" = 1 ] && printf '%s' "$SCOPE_DIR/nets.txt")" \
+      "$WORKDIR/parts/scopeskip.$(printf '%s' "$domain" | tr -c 'A-Za-z0-9.-' '_').tsv" <<'PYOC' || true
 import sys, json, re, ipaddress, subprocess
 seed, ref, jarm_f, cdn_f, res_f, txt_f, etsv, cand_f, maxc = sys.argv[1:10]
 fav_f = sys.argv[10] if len(sys.argv) > 10 else ""
 resolver = sys.argv[11] if len(sys.argv) > 11 else ""
 range_f = sys.argv[12] if len(sys.argv) > 12 else ""
 hist_files = [x for x in sys.argv[13:15]]
+nets_f = sys.argv[15] if len(sys.argv) > 15 else ""
+skip_f = sys.argv[16] if len(sys.argv) > 16 else ""
 EDGE_HEADERS = [("cf-ray", "Cloudflare"), ("cf_ray", "Cloudflare"), ("x_amz_cf_id", "CloudFront"), ("x_amz_cf_pop", "CloudFront"),
                 ("x_served_by", "Fastly"), ("x_fastly_request_id", "Fastly"), ("akamai_grn", "Akamai"), ("x_akamai_transformed", "Akamai"),
                 ("x_azure_ref", "Azure Front Door"), ("x_msedge_ref", "Azure Front Door"), ("x_sucuri_id", "Sucuri"),
@@ -1015,6 +1496,14 @@ for line in open(ref, encoding="utf-8", errors="replace"):
         "sha": (h.get("body_sha256") or "") if isinstance(h, dict) else "", "len": j.get("content_length"),
         "ip": j.get("host_ip") or "", "edge": clean(edge), "osw": clean(osw), "ev": ",".join(dict.fromkeys(ev)),
         "fav": clean(j.get("favicon") or "")})
+def pick(rs):
+    # the host's reference response: its default port first (with --ports a host also has
+    # e.g. :8443, a different service), then https
+    def k(x):
+        hp = x["url"].split("://", 1)[-1].split("/", 1)[0]
+        port = hp.rsplit(":", 1)[1] if re.search(r":\d+$", hp) else ""
+        return (0 if port in ("", "443" if x["scheme"] == "https" else "80") else 1, 0 if x["scheme"] == "https" else 1)
+    return sorted(rs, key=k)[0]
 jarm = {}
 for l in open(jarm_f, encoding="utf-8", errors="replace"):
     m = re.match(r"^\s*([^\s:]+):\d+\s+\[?([0-9a-f]{62})\]?", l)
@@ -1025,7 +1514,7 @@ for l in open(cdn_f, encoding="utf-8", errors="replace"):
     if f: cdn[f[0].lower()] = " ".join(x.strip("[]") for x in f[1:])
 with open(etsv, "a") as o:
     for host, rs in sorted(refs.items()):
-        r = next((x for x in rs if x["scheme"] == "https"), rs[0])
+        r = pick(rs)
         o.write("\t".join([seed, host, r["edge"], r["osw"], r["ev"], jarm.get(host, ""), clean(cdn.get(host, "")),
                            r["fav"], r["title"], r["ip"]]) + "\n")
 # candidate IPs with the source that named them
@@ -1113,10 +1602,28 @@ for hf in hist_files:
                 add(m.group(1), "history:virustotal")
     except (OSError, TypeError):
         pass
+# --scope: an address run-recon picked itself is contacted only inside the allowed ranges
+if nets_f:
+    allow, deny = [], []
+    for l in open(nets_f):
+        f = l.split()
+        if len(f) == 2:
+            (allow if f[0] == "allow" else deny).append(ipaddress.ip_network(f[1]))
+    held = []
+    for ip in sorted(cands):
+        a = ipaddress.ip_address(ip)
+        why = ("inside an excluded range" if any(a in x for x in deny) else
+               "" if any(a in x for x in allow) else "outside the allowed ranges")
+        if why:
+            held.append((ip, ",".join(sorted(cands.pop(ip))), why))
+    if held and skip_f:
+        with open(skip_f, "a") as o:
+            for ip, src, why in held:
+                o.write("\t".join([seed, "origin-candidate", ip, "via=" + src, why]) + "\n")
 pairs, n = [], 0
 for host, rs in sorted(refs.items()):
     edge_ips = {x["ip"] for x in rs if x["ip"]}
-    r = next((x for x in rs if x["scheme"] == "https"), rs[0])
+    r = pick(rs)
     for ip, src in sorted(cands.items()):
         if ip in edge_ips: continue
         if n >= int(maxc or 200): break
@@ -1256,8 +1763,11 @@ favicon_pivot() {
     uq=(-shodan "http.favicon.hash:$mm" -fofa "icon_hash=\"$mm\"")
     [ -n "$md5" ] && uq+=(-censys "services.http.response.favicons.md5_hash: \"$md5\"")
     f="$raw/fav_hits.$n.txt"
-    _to "$STAGE_TIMEOUT" uncover "${uq[@]}" -silent -duc -l "$FAVICON_LIMIT" "${ucp[@]}" 2>/dev/null \
+    _to "$STAGE_TIMEOUT" uncover "${uq[@]}" -silent -duc -l "$FAVICON_LIMIT" "${ucp[@]}" 2>"$raw/uncover.err" \
       | grep -oE '^([0-9]{1,3}\.){3}[0-9]{1,3}(:[0-9]{1,5})?' | sort -u > "$f" || : > "$f"
+    if grep -q 'requires keys but no keys' "$raw/uncover.err" 2>/dev/null && seen_once uncover nokeys; then
+      warn "--favicon: uncover has no API keys for its engines (SHODAN_API_KEY, CENSYS_API_ID + CENSYS_API_SECRET, FOFA_KEY, or ~/.config/uncover/provider-config.yaml): the internet-scan pivot finds nothing"
+    fi
     hosts="$(awk -F'\t' -v m="$mm" '$2 == m { print $1 }' "$fav" | sort -u | paste -sd, -)"
     printf '[%s] favicon-pivot host=%s mmh3=%s md5=%s hits=%s\n' "$domain" "$hosts" "$mm" "${md5:--}" \
       "$(grep -c . "$f" || true)" >> "$out"
@@ -1265,11 +1775,13 @@ favicon_pivot() {
   done < <(cut -f2,3 "$fav" | sort -u)
   sort -u "$hits" -o "$hits"
   [ -s "$hits" ] && have tlsx || return 0
-  awk -F: '{ print $1 ":" ($2 == "" ? 443 : $2) }' "$hits" | sort -u > "$raw/favicon_hits_hp.txt"
+  awk -F: '{ print $1 ":" ($2 == "" ? 443 : $2) }' "$hits" | sort -u | scope_ip_filter "$domain" internet-scan-hit > "$raw/favicon_hits_hp.txt"
+  [ -s "$raw/favicon_hits_hp.txt" ] || return 0
   local ftl=(-l "$raw/favicon_hits_hp.txt" -san -cn -resp-only -silent -timeout 10)
   { [ -n "$RESOLVERS" ] && [ -s "$RESOLVERS" ]; } && ftl+=(-r "$RESOLVERS")
   _to "$STAGE_TIMEOUT" tlsx "${ftl[@]}" < /dev/null 2>/dev/null | scope_filter "$domain" | sort -u > "$raw/favpivot.raw" || : > "$raw/favpivot.raw"
   comm -13 <(sort -u "$raw/hosts.txt" 2>/dev/null) "$raw/favpivot.raw" > "$raw/favpivot.new" 2>/dev/null || cp "$raw/favpivot.raw" "$raw/favpivot.new"
+  scope_addr_filter "$raw/favpivot.new" "$raw/favpivot.new" "$domain"
   if [ "$RESOLVE" = "1" ] && [ -s "$raw/favpivot.new" ]; then
     resolve_hosts "$raw/favpivot.new" "$raw/host_faviconpivot.txt" "$domain"
   else
@@ -1567,11 +2079,13 @@ analyze_hosts() {
     if [ -s "$_tlskeys" ]; then
       stage "$domain" "TLS posture (tlsx)"
       local _tlshit="$raw/tls_hit.jsonl" _tlsmiss="$raw/tls_miss.txt"
-      cache_split tlsx_posture "$_tlskeys" "$_tlshit" "$_tlsmiss"   # reuse cached posture
+      # -cert: the leaf certificate (PEM) for cert_key / cert_sig_alg and the WeakKey, WeakSig
+      # and DefaultCert flags (1.20); the cache key moved to tlsx_posture_v2 with it, so records
+      # cached before carry the certificate too
+      cache_split tlsx_posture_v2 "$_tlskeys" "$_tlshit" "$_tlsmiss"   # reuse cached posture
       cat "$_tlshit" >> "$P/tlsx.$safe.jsonl" 2>/dev/null || true
       if [ -s "$_tlsmiss" ]; then
-        local _tlsargs=(-l "$_tlsmiss" -json -tls-version -cipher -expired -self-signed -mismatched -untrusted -wildcard-cert -silent -timeout 10)
-        [ "$TLS_ENUM" = "1" ] && _tlsargs+=(-version-enum -cipher-enum)
+        local _tlsargs=(-l "$_tlsmiss" -json -tls-version -cipher -expired -self-signed -mismatched -untrusted -wildcard-cert -cert -silent -timeout 10)
         _tlsargs+=("${rr2[@]}")
         local _tlsfresh="$raw/tls_fresh.jsonl" _tlsrc=0
         _to "$STAGE_TIMEOUT" tlsx "${_tlsargs[@]}" 2>>"$raw/tlsx.err" > "$_tlsfresh" || _tlsrc=$?
@@ -1588,7 +2102,20 @@ analyze_hosts() {
           fi
         fi
         cat "$_tlsfresh" >> "$P/tlsx.$safe.jsonl" 2>/dev/null || true
-        [ "$_tlsrc" -eq 0 ] && cache_store tlsx_posture "$_tlsmiss" "$_tlsfresh" jsonauthority noneg
+        [ "$_tlsrc" -eq 0 ] && cache_store tlsx_posture_v2 "$_tlsmiss" "$_tlsfresh" jsonauthority noneg
+      fi
+      # TLS version matrix + weak-cipher probe (--tls-enum, see tls_enum_probe): cached per
+      # host:port like the posture; only hosts tlsx reached, at the address it used
+      if [ "$TLS_ENUM" = "1" ]; then
+        stage "$domain" "TLS version matrix + weak-cipher probe"
+        local _enhit="$raw/tlsenum_hit.jsonl" _enmiss="$raw/tlsenum_miss.txt" _enfresh="$raw/tlsenum_fresh.jsonl" _enrc=0
+        cache_split tls_enum_v1 "$_tlskeys" "$_enhit" "$_enmiss"
+        cat "$_enhit" >> "$P/tlsenum.$safe.jsonl" 2>/dev/null || true
+        if [ -s "$_enmiss" ]; then
+          tls_enum_probe "$_enmiss" "$P/tlsx.$safe.jsonl" > "$_enfresh" 2>>"$raw/tlsenum.err" || _enrc=$?
+          cat "$_enfresh" >> "$P/tlsenum.$safe.jsonl" 2>/dev/null || true
+          [ "$_enrc" -eq 0 ] && cache_store tls_enum_v1 "$_enmiss" "$_enfresh" jsonauthority noneg
+        fi
       fi
     fi
   fi
@@ -1640,7 +2167,7 @@ for ln in sys.stdin:
   if [ "$SCREENSHOTS" = "1" ] && [ -s "$livehosts" ]; then
     local _ssdir="$WORKDIR/screenshots"; mkdir -p "$_ssdir/screenshot"
     local _sstarget="$livehosts"
-    if [ "$USE_DB" = "1" ]; then
+    if [ "$USE_DB" = "1" ] && [ "${CACHE_FRESH_ACTIVE:-0}" != 1 ]; then
       local _ssmiss="$raw/ss_miss.txt"
       _ss_restore "$livehosts" "$_ssdir/screenshot" "$_ssmiss"   # cached PNGs -> run dir
       _sstarget="$_ssmiss"
@@ -1663,11 +2190,18 @@ for ln in sys.stdin:
         # your resolvers know (split horizon, the lab) failed to render, or rendered another
         # host. Chrome's --host-resolver-rules maps each name to the address those resolvers
         # gave, so the capture shows the host httpx probed.
-        if [ -n "$RESOLVERS" ] && [ -s "$RESOLVERS" ] && have dnsx; then
-          local _hrr
-          sed -E 's/:[0-9]+$//' "$_sstarget" | sort -u > "$raw/ss_names.txt"
-          _hrr="$(_to 60 dnsx -l "$raw/ss_names.txt" -a -json -silent -r "$RESOLVERS" < /dev/null 2>/dev/null | python3 -c '
-import sys, json, re
+        # Under --scope the same rules hold the browser to the scope: every name this seed
+        # knows (all in scope) is mapped, and "MAP * ~NOTFOUND" makes any other name (a
+        # redirect elsewhere, third-party assets) fail to resolve, so nothing outside the
+        # scope is contacted. The proxy's own name is excluded from the rules.
+        if { { [ -n "$RESOLVERS" ] && [ -s "$RESOLVERS" ]; } || [ "${SCOPE_ON:-0}" = 1 ]; } && have dnsx; then
+          local _hrr _hrf=() _hra=(-a)
+          [ -n "$RESOLVERS" ] && [ -s "$RESOLVERS" ] && _hrf=(-r "$RESOLVERS")
+          [ "${SCOPE_ON:-0}" = 1 ] && _hra+=(-aaaa)
+          { sed -E 's/:[0-9]+$//' "$_sstarget"; if [ "${SCOPE_ON:-0}" = 1 ]; then cat "$raw/hosts.txt" 2>/dev/null || true; fi; } | sort -u > "$raw/ss_names.txt"
+          _hrr="$(_to 60 dnsx -l "$raw/ss_names.txt" "${_hra[@]}" -json -silent "${_hrf[@]}" < /dev/null 2>/dev/null | python3 -c '
+import sys, json, re, os
+scoped = sys.argv[1] == "1"
 rules = []
 for line in sys.stdin:
     try:
@@ -1676,9 +2210,16 @@ for line in sys.stdin:
         continue
     h = str(j.get("host") or "").lower()
     a = [x for x in (j.get("a") or []) if isinstance(x, str) and re.fullmatch(r"[0-9.]{7,15}", x)]
-    if h and a and re.fullmatch(r"[a-z0-9_.-]{1,253}", h) and len(rules) < 2000:
-        rules.append("MAP %s %s" % (h, a[0]))
-print(", ".join(rules))' 2>/dev/null)" || _hrr=""
+    a6 = [x for x in (j.get("aaaa") or []) if isinstance(x, str) and re.fullmatch(r"[0-9a-fA-F:]{2,39}", x)] if scoped else []
+    if h and (a or a6) and re.fullmatch(r"[a-z0-9_.-]{1,253}", h) and len(rules) < 2000:
+        rules.append("MAP %s %s" % (h, a[0] if a else "[%s]" % a6[0]))
+if scoped:
+    rules.append("MAP * ~NOTFOUND")
+    for k in ("SS_PROXY_SERVER", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        m = re.match(r"^(?:[a-z][a-z0-9+.-]*://)?(?:[^@/]*@)?(\[[^\]]+\]|[^:/]+)", os.environ.get(k) or "", re.I)
+        if m and "EXCLUDE " + m.group(1) not in rules:
+            rules.append("EXCLUDE " + m.group(1))
+print(", ".join(rules))' "${SCOPE_ON:-0}" 2>/dev/null)" || _hrr=""
           [ -n "$_hrr" ] && _ssargs+=(-ho "--host-resolver-rules=$_hrr")
         fi
         _to "$STAGE_TIMEOUT" "$HTTPX_BIN" "${_ssargs[@]}" "${rr2[@]}" >/dev/null 2>>"$raw/ss.err" || true
@@ -1873,7 +2414,8 @@ cms_scan() {
     [ -z "$u" ] && continue
     fp=""
     if have whatweb; then
-      fp="$(_to "$STAGE_TIMEOUT" whatweb --no-errors --color=never "$u" 2>/dev/null || true)"
+      local _wwr=(); [ "${SCOPE_ON:-0}" = 1 ] && _wwr=(--follow-redirect=never)
+      fp="$(_to "$STAGE_TIMEOUT" whatweb --no-errors --color=never "${_wwr[@]}" "$u" 2>/dev/null || true)"
     elif have nuclei; then
       nuclei_oast_args
       fp="$(printf '%s\n' "$u" | _to "$STAGE_TIMEOUT" nuclei -tags tech -silent "${_NO[@]}" "${rr2[@]}" 2>/dev/null || true)"
@@ -1953,7 +2495,8 @@ cms_scan() {
   # --- generic/unknown: cmseek auto-detects many CMSs ---
   if [ -s "$ot" ] && have cmseek; then
     while IFS= read -r u; do [ -z "$u" ] && continue
-      _to "$STAGE_TIMEOUT" cmseek -u "$u" --follow-redirect 2>/dev/null < /dev/null \
+      local _cmr=(--follow-redirect); [ "${SCOPE_ON:-0}" = 1 ] && _cmr=()
+      _to "$STAGE_TIMEOUT" cmseek -u "$u" "${_cmr[@]}" 2>/dev/null < /dev/null \
         | grep -aiE 'detected|version|cms' | sed "s#^#[$domain] cmseek #" >> "$out" || true
     done < "$ot"
   fi
@@ -2170,6 +2713,8 @@ nuclei_oast_args(){
             if [ -n "${NUCLEI_ITOKEN:-}" ]; then _NO+=(-itoken "$NUCLEI_ITOKEN"); fi;;
     *)      _NO=(-ni);;
   esac
+  # --scope: a template's redirect could lead off the scope
+  if [ "${SCOPE_ON:-0}" = 1 ]; then _NO+=(-dr); fi
   return 0   # set -e: a false last test must not abort the worker
 }
 
@@ -2297,8 +2842,9 @@ process_one() {
 
   # cert SAN/CN harvest, phase 1: candidate hosts, pre-probe (tlsx)
   if [ "$CERTS" = "1" ] && have tlsx; then
+    scope_addr_filter "$hosts" "$hosts" "$domain"
     local _certc=0
-    if [ "$USE_DB" = "1" ]; then
+    if [ "$USE_DB" = "1" ] && [ "${CACHE_FRESH_ACTIVE:-0}" != 1 ]; then
       local _cc; _cc="$(db_cache_get certsan "$domain" "$CACHE_TTL" || true)"
       if [ -n "$_cc" ]; then printf '%s\n' "$_cc" > "$raw/host_tlsx.txt"; _certc=1; fi
     fi
@@ -2319,8 +2865,14 @@ process_one() {
   if [ "$FAVICON" = "1" ] && have uncover; then
     local favips="$raw/favicon_ips.txt"; : > "$favips"
     local _ucp=(); [ -n "$PROXY" ] && _ucp=(-proxy "$PROXY")
-    _to "$STAGE_TIMEOUT" uncover -q "ssl:\"$domain\"" -silent -duc "${_ucp[@]}" 2>/dev/null \
+    _to "$STAGE_TIMEOUT" uncover -q "ssl:\"$domain\"" -silent -duc "${_ucp[@]}" 2>"$raw/uncover.err" \
       | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u > "$favips" || : > "$favips"
+    if grep -q 'requires keys but no keys' "$raw/uncover.err" 2>/dev/null && seen_once uncover nokeys; then
+      warn "--favicon: uncover has no API keys for its engines (SHODAN_API_KEY, CENSYS_API_ID + CENSYS_API_SECRET, FOFA_KEY, or ~/.config/uncover/provider-config.yaml): the internet-scan pivot finds nothing"
+    fi
+    if [ "${SCOPE_ON:-0}" = 1 ] && [ -s "$favips" ]; then
+      scope_ip_filter "$domain" internet-scan-hit < "$favips" > "$favips.in"; mv "$favips.in" "$favips"
+    fi
     if [ -s "$favips" ] && have tlsx; then
       local ftl=(-l "$favips" -san -cn -resp-only -silent -timeout 10)
       { [ -n "$RESOLVERS" ] && [ -s "$RESOLVERS" ]; } && ftl+=(-r "$RESOLVERS")
@@ -2335,11 +2887,13 @@ process_one() {
   # names harvested by --zone-exposure (AXFR / NSEC walk) at or under this seed
   if [ "$ZONE_EXPOSURE" = "1" ] && [ -s "$WORKDIR/zone_names.txt" ]; then
     awk -F'\t' -v d="$domain" '{ n=$2; if (n == d || (length(n) > length(d) && substr(n, length(n)-length(d)) == "." d)) print n }' \
-      "$WORKDIR/zone_names.txt" | sort -u > "$raw/host_zone.txt" || : > "$raw/host_zone.txt"
+      "$WORKDIR/zone_names.txt" | { if [ "${SCOPE_ON:-0}" = 1 ]; then scope_filter "$domain"; else cat; fi; } \
+      | sort -u > "$raw/host_zone.txt" || : > "$raw/host_zone.txt"
     [ -s "$raw/host_zone.txt" ] && log "[$domain] zone exposure: $(wc -l < "$raw/host_zone.txt" | tr -d ' ') name(s) from AXFR/NSEC added to the candidates"
     cat "$raw/host_zone.txt" >> "$hosts" 2>/dev/null || true
   fi
   sort -u "$hosts" -o "$hosts"
+  scope_addr_filter "$hosts" "$hosts" "$domain"
   # the takeover check needs every candidate, including names that no longer resolve
   # (a dangling CNAME returns NXDOMAIN), so keep the list from before the resolve gate
   [ "$TAKEOVER" = "1" ] && cp "$hosts" "$raw/hosts_all.txt" 2>/dev/null
@@ -2525,6 +3079,16 @@ process_one() {
           [ -n "$RESOLVERS" ] && [ -s "$RESOLVERS" ] && katargs+=(-r "$RESOLVERS")
           [ -n "$PROXY" ] && katargs+=(-proxy "$PROXY")
           [ "$FILTER_STATIC" = "1" ] && katargs+=(-ef "$STATIC_EXT")
+          # --scope: the crawl follows links only inside the scope (katana applies -cs on
+          # top of -fs rdn, and -cos before both); with address exclusions, only the live
+          # hosts already checked
+          if [ "${SCOPE_ON:-0}" = 1 ]; then
+            local _kcs _kcos
+            if [ "${SCOPE_DENY_NETS:-0}" = 1 ]; then _kcs="$(scope_url_regex hosts "$_khosts")"
+            else _kcs="$(scope_url_regex names "$SCOPE_DIR/allow_names.txt")"; fi
+            _kcos="$(scope_url_regex names "$SCOPE_DIR/deny_names.txt")"
+            katargs+=(-cs "${_kcs:-^$}"); [ -n "$_kcos" ] && katargs+=(-cos "$_kcos")
+          fi
           local _kfresh="$raw/kat_fresh.txt" _krc=0
           _to "$STAGE_TIMEOUT" katana "${katargs[@]}" 2>/dev/null > "$_kfresh" || _krc=$?
           cat "$_kfresh" >> "$k" 2>/dev/null || true
@@ -2547,6 +3111,13 @@ process_one() {
       have subjs && { cat "$live" | _to "$STAGE_TIMEOUT" subjs 2>/dev/null >> "$jsfiles" || true; }
       have getJS && { _to "$STAGE_TIMEOUT" getJS --input "$live" --complete 2>/dev/null >> "$jsfiles" || true; }
       sort -u "$jsfiles" -o "$jsfiles" 2>/dev/null || true
+      # --scope: xnLinkFinder fetches the JS files; only those on this seed's live hosts
+      if [ "${SCOPE_ON:-0}" = 1 ] && [ -s "$jsfiles" ]; then
+        awk 'FILENAME == ARGV[1] { h = $0; sub(/:[0-9]+$/, "", h); ok[tolower(h)] = 1; next }
+             { h = $0; sub(/^[A-Za-z][A-Za-z0-9+.-]*:\/\//, "", h); sub(/[\/?#].*$/, "", h); sub(/:[0-9]+$/, "", h); if (tolower(h) in ok) print }' \
+          "$livehosts" "$jsfiles" > "$jsfiles.in" 2>/dev/null || : > "$jsfiles.in"
+        mv "$jsfiles.in" "$jsfiles"
+      fi
       if [ -s "$jsfiles" ]; then
         have xnLinkFinder && { _to "$STAGE_TIMEOUT" xnLinkFinder -i "$jsfiles" -sf "$domain" -o cli 2>/dev/null | grep -oE 'https?://[^ ]+' >> "$js" || true; }
         cat "$jsfiles" >> "$js" || true   # the JS file URLs are themselves assets
@@ -2589,6 +3160,7 @@ process_one() {
            -mc 200,204,301,302,307,401,403 -t "$FUZZ_THREADS" -rate "$RATE" 2>/dev/null \
         | awk -v d="$domain" 'NF{print $0"."d}' | scope_filter "$domain" | sort -u \
         > "$raw/host_vhost.txt" || : > "$raw/host_vhost.txt"
+      scope_addr_filter "$raw/host_vhost.txt" "$raw/host_vhost.txt" "$domain"
     fi
 
     # cert feedback loop (phase 2): grab certs off the LIVE hosts, harvest new
@@ -2598,6 +3170,7 @@ process_one() {
       { [ -n "$RESOLVERS" ] && [ -s "$RESOLVERS" ]; } && tl2+=(-r "$RESOLVERS")
       _to "$STAGE_TIMEOUT" tlsx "${tl2[@]}" 2>>"$raw/tlsx.err" | scope_filter "$domain" | sort -u > "$raw/tlsxlive.raw" || : > "$raw/tlsxlive.raw"
       comm -13 <(sort -u "$hosts") <(sort -u "$raw/tlsxlive.raw") > "$raw/tlsxlive.new" 2>/dev/null || : > "$raw/tlsxlive.new"
+      scope_addr_filter "$raw/tlsxlive.new" "$raw/tlsxlive.new" "$domain"
       if [ "$RESOLVE" = "1" ] && [ -s "$raw/tlsxlive.new" ]; then
         resolve_hosts "$raw/tlsxlive.new" "$raw/host_tlsxlive.txt" "$domain"
       else
@@ -2727,7 +3300,7 @@ process_one() {
     local _hxout="$WORKDIR/parts/httpx.$safe.jsonl"; : > "$_hxout"
     local _enrkeys="$raw/enrich_keys.txt" _enrhit="$raw/enrich_hit.jsonl" _enrmiss="$raw/enrich_miss.txt"
     cut -f1 "$mapurls" | head -n "$capped" > "$_enrkeys"
-    cache_split httpx_json_v2 "$_enrkeys" "$_enrhit" "$_enrmiss"   # reuse cached per-URL JSON
+    cache_split httpx_json_v3 "$_enrkeys" "$_enrhit" "$_enrmiss"   # reuse cached per-URL JSON
     cat "$_enrhit" >> "$_hxout" 2>/dev/null || true
     if [ -s "$_enrmiss" ]; then
       local _enrfresh="$raw/enrich_fresh.jsonl" _enrrc=0
@@ -2738,14 +3311,13 @@ process_one() {
       # -irh -hash sha256: the response headers and body hash of the SAME request feed the
       # HTTP columns (redirect target, security headers, cookies, HSTS, Alt-Svc, auth, body
       # SHA-256); no extra request. The cache key moved to httpx_json_v2 so records cached
-      # before 1.19 (no headers) are fetched again instead of leaving those columns blank.
+      # before 1.19 (no headers) are fetched again instead of leaving those columns blank,
+      # and to httpx_json_v3 in 1.20 for the login-form matches (-er, see _hx_enrich).
       # -nfs (-no-fallback-scheme): probe each URL with ITS OWN scheme. Without it
       # httpx tries HTTPS first even for an http:// input, so http:// rows were
       # silently enriched with the HTTPS response (wrong status/title for plain-HTTP
       # services, redirects, or hosts that serve different content per scheme).
-      cat "$_enrmiss" \
-        | _to "$STAGE_TIMEOUT" "$HTTPX_BIN" -silent -json -status-code -content-length -title -tech-detect -web-server \
-                -irh -hash sha256 -nfs -timeout 10 -retries "$HTTP_RETRIES" -rl "$RATE" "${rr[@]}" 2>>"$raw/httpx.err" > "$_enrfresh" || _enrrc=$?
+      cat "$_enrmiss" | _hx_enrich "${rr[@]}" 2>>"$raw/httpx.err" > "$_enrfresh" || _enrrc=$?
       # late retry: httpx's own retries fire back to back, so a URL that failed
       # during a load spike usually fails all of them (the farm at -t 20 on 2 vCPU
       # blanked 1-3 hosts per run). URLs with no record get one more pass after a
@@ -2756,16 +3328,20 @@ process_one() {
         if [ -s "$_enrlate" ]; then
           log "[$domain] enrichment: $(wc -l < "$_enrlate" | tr -d ' ') URL(s) got no response; retrying once after a pause"
           late_pause
-          cat "$_enrlate" \
-            | _to "$STAGE_TIMEOUT" "$HTTPX_BIN" -silent -json -status-code -content-length -title -tech-detect -web-server \
-                    -irh -hash sha256 -nfs -timeout 10 -retries "$HTTP_RETRIES" -t 5 -rl "$RATE" "${rr[@]}" 2>>"$raw/httpx.err" >> "$_enrfresh" || true
+          cat "$_enrlate" | _hx_enrich -t 5 "${rr[@]}" 2>>"$raw/httpx.err" >> "$_enrfresh" || true
         fi
       fi
       cat "$_enrfresh" >> "$_hxout" 2>/dev/null || true
       # cache each fresh record by its input URL. No negative entries: these URLs
       # belong to hosts the live probe just confirmed, so a missing record is a
       # failed request, not an absent page (see cache_store).
-      [ "$_enrrc" -eq 0 ] && cache_store httpx_json_v2 "$_enrmiss" "$_enrfresh" httpxjson noneg
+      [ "$_enrrc" -eq 0 ] && cache_store httpx_json_v3 "$_enrmiss" "$_enrfresh" httpxjson noneg
+    fi
+    # --extras: follow redirects past the targets the run did not probe (same host only); a
+    # seed with no redirect in its records starts nothing
+    if [ "$EXTRAS" = "1" ] && grep -qE '"status_code": ?30[12378][,}]' "$_hxout" 2>/dev/null; then
+      stage "$domain" "redirect hops (same host)"
+      redirect_hops "$domain" "$raw" "$_hxout" "$WORKDIR/parts/hops.$safe.jsonl" "${rr[@]}"
     fi
     # surface a clear hint if nothing (cached or fresh) came back at all
     if [ ! -s "$_hxout" ] && [ -s "$mapurls" ]; then
@@ -2815,6 +3391,22 @@ USAGE:
 REQUIRED:
   -i, --input FILE        Text file with one domain per line (# comments ok)
 
+SCOPE (checked before anything is sent):
+      --scope FILE        Hold the run to the names and ranges FILE allows (one entry per line, # comments):
+                            example.com      the name and every name under it
+                            *.example.com    the names under it, not example.com itself
+                            192.0.2.0/24     an address or CIDR (IPv4 or IPv6)    AS64500  an ASN
+                            !dev.example.com an exclusion (any form above, ! or -); exclusions win
+                          A seed outside the scope, an invalid input line or a malformed entry stops the
+                          run (exit 2). Discovered names outside it are dropped; names resolving into an
+                          excluded range are not contacted; addresses run-recon picks itself (--origin
+                          candidates, --favicon hits, range sweeps) are contacted only inside the allowed
+                          ranges; the crawl, nuclei (no redirects) and the screenshot browser stay inside
+                          it. What was held back -> <out>.scope.txt
+      --list-targets      Print the plan (each seed: in scope or why not) and exit; nothing is sent.
+                          Exit 0 if the run would start, 2 if it would refuse.
+      --drop-out-of-scope Skip out-of-scope and invalid seed lines (with a warning) instead of stopping.
+
 OUTPUT:
   -o, --output FILE       CSV output path (default: <out-dir>/recon-<timestamp>.csv)
   -D, --out-dir DIR       Working/output directory (default: ./recon-output)
@@ -2853,6 +3445,9 @@ DISCOVERY (host expansion; active techniques -- assets you are authorized to ass
                           security.txt (RFC 9116 Contact/Expires) and one random-path 404 probe
                           (catch-all 200, error-page versions), plus favicon hashes. 3-5 extra
                           requests per host -> robots, security_txt, favicon_* columns, <out>.extras.txt
+                          Also fetches the same-host redirect targets the run did not probe
+                          (REDIRECT_MAX=5 hops), so final_url / redirect_chain / login_form follow
+                          http:// -> https:// -> /login. Off-host targets are listed, not fetched.
       --resolvers FILE    Custom resolver list (else a built-in dedicated set is used;
                           both bypass a local Pi-hole and its rate limits). Resolvers are
                           health-checked at startup; a dead set is warned about, not silently
@@ -2871,6 +3466,19 @@ ANALYSIS / TRIAGE (side artifacts written next to the CSV; not URL rows):
                           authoritative name server and walk the DNSSEC NSEC chain; flag NSEC3.
                           Names found feed the seeds they fall under   -> <out>.zone.txt,
                           <out>.zone-names.txt. Queries only the zones' own name servers.
+      --dns-posture       Email and DNS posture of each seed and its zone apex: SPF (permissive, no all,
+                          too many lookups, dangling include), DMARC, MTA-STS (policy fetched with
+                          certificate checks; --mta-sts-ca FILE adds a CA), TLS-RPT, CAA, dangling MX and
+                          NS hosts, lame delegations -> <out>.dnsposture.txt, <out>.dnsposture.tsv
+      --cloudlist [CFG]   Diff your cloud accounts (cloudlist, provider config CFG) against what the scan
+                          found: cloud assets it did not see, cloud addresses it saw that no listed
+                          account owns -> <out>.cloud.txt, <out>.cloud-assets.tsv
+      --tld-variants      List the seed's name registered under other TLDs (tldfinder; uses public DNS),
+                          with an ownership hint (same name servers). Listed only, never scanned
+                          -> <out>.tld-variants.txt
+      --vulnx             Product advisories for the CPEs found (vulnx: CVEs filed against each product,
+                          most likely exploited first; any version, so verify yours) -> <out>.vulnx.txt,
+                          <out>.vulnx.tsv. PDCP_API_KEY raises the API's rate limit.
       --takeover          Subdomain-takeover check: CNAMEs of EVERY candidate name (live or not,
                           dnsx), dangling targets (NXDOMAIN), takeover-prone services; subzy and
                           nuclei -tags takeover fingerprint them -> <out>.takeover.txt, <out>.cname.tsv
@@ -2883,11 +3491,19 @@ ANALYSIS / TRIAGE (side artifacts written next to the CSV; not URL rows):
                           title) -> <out>.origin.txt (findings), <out>.edge.tsv (per-host edge, origin
                           software, JARM, CDN, favicon mmh3)
       --tls               TLS posture (tlsx) -> CSV cols: tls_version, tls_cipher, cert_not_after,
-                          cert_issuer, tls_flags (CertExpired/CertExpiring/SelfSigned/CertNameMismatch/
-                          CertUntrusted/Wildcard). Joined to https rows. CertExpiring: within
-                          CERT_WARN_DAYS (30). CertUntrusted: the chain does not verify against the
-                          system trust store (TLS_CHAIN_CHECK=0 skips that check).
-      --tls-full          ...also enumerate TLS versions + ciphers (adds WeakTLS/WeakCipher; noisier).
+                          cert_issuer, tls_flags (CertExpired/CertExpiring/CertNotYetValid/SelfSigned/
+                          DefaultCert/CertNameMismatch/CertUntrusted/WeakKey/WeakSig/Wildcard),
+                          cert_key, cert_sig_alg, cert_not_before. Joined to https rows. CertExpiring:
+                          within CERT_WARN_DAYS (30). CertUntrusted: the chain does not verify against
+                          the system trust store (TLS_CHAIN_CHECK=0 skips that check). WeakKey: RSA/DSA
+                          under 2048 bits, EC under 224. WeakSig: MD2/MD5/SHA-1. DefaultCert: a vendor's
+                          or OpenSSL's placeholder certificate (Splunk, Nessus, pfSense, VMware, ...).
+      --tls-enum          --tls plus the version matrix: one short handshake per version (TLS 1.3 down
+                          to SSL 3.0) and one offering only weak suites, each stopped at the
+                          ServerHello -> tls_supported, tls_ciphers (the suite chosen per version),
+                          tls_weak_cipher; WeakTLS for SSL 3.0/TLS 1.0/1.1, WeakCipher for an accepted
+                          NULL/EXPORT/anon/RC4/DES/3DES/RC2 suite. 6 handshakes per https host.
+      --tls-full          Same as --tls-enum.
       --ipv6              Resolve AAAA records (dnsx) -> ipv6 CSV column.
       --enrich            Per-IP cloud provider (AWS/Azure/GCP/Cloudflare/Oracle/DO IP-range feeds) +
                           RDAP network org + reverse DNS -> cloud, rdap_org, ptr CSV columns. PTR
@@ -2925,7 +3541,9 @@ ANALYSIS / TRIAGE (side artifacts written next to the CSV; not URL rows):
       --social-user NAME  Username to search with --social (instead of the domain-derived brand).
 
 MONITORING:
-      --monitor           Diff discovered URLs against a prior CSV  -> <out>.new-assets.txt
+      --monitor           Diff discovered URLs against a prior CSV  -> <out>.new-assets.txt, and each
+                          service field by field (new / removed / status, title, server, tech, CPE,
+                          redirect, auth, HTTP flags, address, TLS, certificate, favicon) -> <out>.delta.tsv
       --monitor-prev F    Prior CSV to diff against (default: newest recon-*.csv in out-dir).
       --notify            Pipe the new-asset list through 'notify' (if configured).
 
@@ -2955,12 +3573,34 @@ REPORT & CACHE:
                           (.test/.internal/.local/...). Default 1 skips them: they cannot exist
                           on the internet, so the queries only cost time.
 
+JSON OUTPUT & TIDELINE (the recon results platform; see SHIPPING.md):
+      --json              Also write each record kind as JSON lines, same field names as the CSV and
+                          TSV files: <out>.urls.jsonl, .services.jsonl, .findings.jsonl, .warnings.jsonl,
+                          .seeds.jsonl, plus .dnsposture/.edges/.cnames/.zone-names/.screenshots/
+                          .cloud-assets/.vulnx/.delta.jsonl when those stages ran. Schemas: schemas/.
+      --ship URL          After the run, send it to Tideline's ingest (https only; implies --json):
+                          a signed manifest (ES256) and gzip parts over mutual TLS. Resumable; state in
+                          <out>.ship-state.json. The settings are checked before the scan starts; a
+                          failed delivery leaves the run complete locally and exits 4.
+      --ship-cert FILE    This sensor's client certificate from step-ca (PEM; its URI SAN
+                          urn:tideline:sensor:<id> names the sensor).          (env SHIP_CERT)
+      --ship-key FILE     Its ECDSA P-256 key (PEM, unencrypted, mode 0600 or tighter). (env SHIP_KEY)
+      --ship-ca FILE      Tideline's root CA: the ingest server must chain to it, and to nothing
+                          else (the system trust store is not used).           (env SHIP_CA)
+      --ship-proxy URL    Proxy for shipping only (default: a direct connection; the scan's
+                          --proxy and the HTTP(S)_PROXY environment are not used). (env SHIP_PROXY)
+      --engagement ID     Engagement ID, written to <out>.run.json and the Tideline manifest.
+      --job-id ID         Tideline job ID (set by the Tideline runner), likewise.
+      Every run records a run_id (UUID v4, kept by --resume) in <out>.run.json.
+      ship-recon.sh ship|status|export|check re-sends, inspects or bundles a finished run.
+
 UMBRELLA:
       --all               Enable the full discovery + defensive set: --subs --resolve --certs
                           --permute --brute --ports --js --crawlers-all --takeover
-                          --zone-exposure --screenshots --origin --extras --active --activescan
-                          --osint --tls --ipv6 --enrich. (Scanning stages nuclei/params/secrets and
-                          favicon/vhost/monitor stay opt-in.)
+                          --zone-exposure --dns-posture --screenshots --origin --extras --active
+                          --activescan --osint --tls-enum --ipv6 --enrich. (Scanning stages
+                          nuclei/params/secrets and favicon/vhost/monitor/cloudlist/tld-variants/vulnx
+                          stay opt-in.)
 
 INPUT MODES:
       Seeds may be domains, or ASN ("AS13335") / CIDR ("192.0.2.0/24") lines. Ranges are
@@ -2973,6 +3613,10 @@ INPUT MODES:
       --fuzz-ext LIST     Extra extensions to probe, e.g. php,bak,json (default: none).
       --no-filter-static  Keep image/font/css URLs (default: filtered out).
       --keep-work         Do not delete the intermediate _work tree.
+      --resume            Continue an interrupted run (Ctrl-C, SIGTERM, a crash): run the SAME command
+                          again with --resume. The seeds that had finished are kept; the others and the
+                          main-process stages run again. Matched by the command line, the input and the
+                          scope file (hashes kept in the work dir's state file; no values are stored).
       --no-progress       Suppress stage timers and the progress heartbeat.
       --no-asn            Skip host IP + ASN resolution (leave ip/asn/asn_org columns blank).
       --limits FILE       Load per-source OSINT timeouts/delays from FILE (generate with
@@ -2999,30 +3643,44 @@ CSV columns:
   asn_org, tls_version, tls_cipher, cert_not_after, cert_issuer, tls_flags, ipv6, cloud, rdap_org, geo, cpe,
   redirect_location, response_ms, body_sha256, content_type, powered_by, auth, cookies, cookie_issues,
   missing_sec_headers, hsts_max_age, alt_svc, http_flags, favicon_mmh3, favicon_md5, ptr, robots,
-  security_txt   (the HTTP columns come from the enrichment request itself: no extra traffic)
+  security_txt, final_url, redirect_chain, login_form, tls_supported, tls_ciphers, tls_weak_cipher,
+  cert_key, cert_sig_alg, cert_not_before   (the HTTP columns come from the enrichment request itself:
+  no extra traffic)
 
 Side-artifact files (when the matching flag is set): <out>.takeover.txt, <out>.cname.tsv, <out>.zone.txt,
-<out>.zone-names.txt, <out>.origin.txt, <out>.edge.tsv, <out>.extras.txt, <out>.favicon.txt,
+<out>.zone-names.txt, <out>.dnsposture.txt, <out>.dnsposture.tsv, <out>.cloud.txt, <out>.cloud-assets.tsv,
+<out>.tld-variants.txt, <out>.vulnx.txt, <out>.vulnx.tsv,
+<out>.origin.txt, <out>.edge.tsv, <out>.extras.txt, <out>.favicon.txt,
 <out>.screenshots.tsv, screenshots-<ts>/,
 <out>.nuclei.txt, <out>.params.txt, <out>.secrets.txt, <out>.buckets.txt, <out>.cms.txt,
 <out>.activescan.txt, <out>.osint.txt, <out>.virustotal.txt, <out>.urlscan.txt, <out>.social.txt,
-<out>.new-assets.txt. Always: <out>.run.json (version, command line, tool versions, per-seed counts,
-warnings, exit status) and <out>.report.html (unless --no-report).
+<out>.new-assets.txt, <out>.delta.tsv (--monitor), <out>.scope.txt (--scope), <out>.<kind>.jsonl (--json),
+<out>.ship-state.json (--ship; written after the manifest, not listed in it). Always: <out>.run.json (version, command line, tool versions, per-seed counts,
+warnings, exit status), <out>.report.html (unless --no-report) and <out>.manifest.sha256 (SHA-256 of
+every file the run wrote; check with sha256sum -c).
 
-Exit status: 0 finished with results; 2 bad arguments or input; 3 finished with NO results (0 URL rows).
+Exit status: 0 finished with results; 2 bad arguments or input (or refused by --scope, or unusable --ship
+settings); 3 finished with NO results (0 URL rows); 4 finished with results, but --ship could not deliver
+them (retry with ship-recon.sh ship <csv>); 130/143 interrupted by SIGINT/SIGTERM (resumable with --resume).
 EOF
 }
 
 INPUT=""
+SCOPE_FILE=""; LIST_TARGETS=0; DROP_OUT_OF_SCOPE=0; RESUME=0
 OUT_DIR="./recon-output"
 KEEP_WORK=0
 RESOLVERS_FILE=""
 RUN_ARGS=("$@"); RUN_T0="$(date +%s 2>/dev/null || echo 0)"; RUN_STARTED="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
 RUN_DNS_CHECK="not run"; RUN_EXIT=0
+ENGAGEMENT=""; JOB_ID=""; RUN_ID=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
     -i|--input)        INPUT="${2:?}"; shift 2;;
+    --scope)           SCOPE_FILE="${2:?}"; shift 2;;
+    --list-targets)    LIST_TARGETS=1; shift;;
+    --drop-out-of-scope) DROP_OUT_OF_SCOPE=1; shift;;
+    --resume)          RESUME=1; shift;;
     -o|--output)       OUTPUT="${2:?}"; shift 2;;
     -D|--out-dir)      OUT_DIR="${2:?}"; shift 2;;
     -t|--threads)      THREADS="${2:?}"; shift 2;;
@@ -3036,7 +3694,7 @@ while [ $# -gt 0 ]; do
     --resolve)         RESOLVE=1; shift;;
     --certs)           CERTS=1; shift;;
     --tls)             TLS_POSTURE=1; shift;;
-    --tls-full)        TLS_POSTURE=1; TLS_ENUM=1; shift;;
+    --tls-enum|--tls-full) TLS_POSTURE=1; TLS_ENUM=1; shift;;
     --ipv6)            IPV6=1; shift;;
     --enrich)          ENRICH=1; shift;;
     --geodb)           GEO_DB="${2:?}"; ENRICH=1; shift 2;;
@@ -3054,6 +3712,13 @@ while [ $# -gt 0 ]; do
     --screenshots)     SCREENSHOTS=1; shift;;
     --origin)          ORIGIN=1; shift;;
     --zone-exposure)   ZONE_EXPOSURE=1; shift;;
+    --dns-posture)     DNS_POSTURE=1; shift;;
+    --mta-sts-ca)      MTA_STS_CA="${2:?}"; shift 2;;
+    --cloudlist)       CLOUDLIST=1
+                       # optional CONFIG argument (a provider config file)
+                       if [ -n "${2:-}" ] && [ "${2#-}" = "$2" ] && [ -f "$2" ]; then CLOUDLIST_CONFIG="$2"; shift 2; else shift; fi;;
+    --tld-variants)    TLD_VARIANTS=1; shift;;
+    --vulnx)           VULNX=1; shift;;
     --favicon)         FAVICON=1; shift;;
     --extras)          EXTRAS=1; shift;;
     --rounds)          ROUNDS="${2:?}"; shift 2;;
@@ -3080,7 +3745,7 @@ while [ $# -gt 0 ]; do
     --social-user)     SOCIAL_USER="${2:?}"; SOCIAL=1; shift 2;;
     --all)             DO_SUBS=1; RESOLVE=1; CERTS=1; PERMUTE=1; BRUTE=1; PORTS=1; \
                        JS=1; CRAWLERS_ALL=1; TAKEOVER=1; SCREENSHOTS=1; ORIGIN=1; ACTIVE=1; \
-                       ACTIVESCAN=1; OSINT=1; TLS_POSTURE=1; IPV6=1; ENRICH=1; ZONE_EXPOSURE=1; EXTRAS=1; shift;;
+                       ACTIVESCAN=1; OSINT=1; TLS_POSTURE=1; TLS_ENUM=1; IPV6=1; ENRICH=1; ZONE_EXPOSURE=1; EXTRAS=1; DNS_POSTURE=1; shift;;
     --fuzz)            FUZZ=1; shift;;
     --wordlist)        WORDLIST="${2:?}"; shift 2;;
     --fuzz-threads)    FUZZ_THREADS="${2:?}"; shift 2;;
@@ -3092,6 +3757,14 @@ while [ $# -gt 0 ]; do
     --db)              USE_DB=1; shift;;
     --proxy)           PROXY="${2:?}"; shift 2;;
     --no-report)       REPORT=0; shift;;
+    --json)            JSON_OUT=1; shift;;
+    --ship)            SHIP_URL="${2:?}"; shift 2;;
+    --ship-cert)       SHIP_CERT="${2:?}"; shift 2;;
+    --ship-key)        SHIP_KEY="${2:?}"; shift 2;;
+    --ship-ca)         SHIP_CA="${2:?}"; shift 2;;
+    --ship-proxy)      SHIP_PROXY="${2:?}"; shift 2;;
+    --engagement)      ENGAGEMENT="${2:?}"; shift 2;;
+    --job-id)          JOB_ID="${2:?}"; shift 2;;
     --limits)          LIMITS_FILE="${2:?}"; shift 2;;
     -h|--help)         usage; exit 0;;
     --version)         echo "run-recon.sh v$VERSION"; exit 0;;
@@ -3119,6 +3792,255 @@ if [ -z "$INPUT" ]; then err "Missing required --input FILE"; usage; exit 2; fi
 # so every tool started below inherits a closed stdin.
 exec < /dev/null
 if [ ! -f "$INPUT" ]; then err "Input file not found: $INPUT"; exit 2; fi
+
+# --- scope (--scope FILE) and the dry run (--list-targets) -------------------------
+# Before anything is sent: the scope file is parsed (a malformed entry stops the run),
+# every input line is classified (domain, ASN, IPv4 CIDR, or invalid) and every seed is
+# checked against the scope. An out-of-scope or invalid seed stops the run (exit 2)
+# unless --drop-out-of-scope; CIDR seeds lose the excluded addresses. The compiled scope
+# (allowed and excluded names, address ranges, ASNs) guides every later stage.
+# --list-targets prints the same plan and exits without sending anything.
+SCOPE_ON=0; SCOPE_DIR=""; SCOPE_TMP=""; SCOPE_DENY=""; SCOPE_DENY_NETS=0; INPUT_ORIG="$INPUT"
+if [ -n "$SCOPE_FILE" ] || [ "$LIST_TARGETS" = "1" ]; then
+  if ! have python3; then err "python3 is required"; exit 1; fi
+  if [ -n "$SCOPE_FILE" ] && [ ! -f "$SCOPE_FILE" ]; then err "Scope file not found: $SCOPE_FILE"; exit 2; fi
+  SCOPE_TMP="$(mktemp -d "${TMPDIR:-/tmp}/run-recon-scope.XXXXXX")" || { err "cannot create a temporary directory"; exit 1; }
+  trap '[ -n "${HEARTBEAT_PID:-}" ] && kill "$HEARTBEAT_PID" 2>/dev/null; [ -n "${SCOPE_TMP:-}" ] && rm -rf "$SCOPE_TMP"; true' EXIT
+  _scrc=0
+  python3 - "$INPUT" "${SCOPE_FILE:-}" "$SCOPE_TMP" "$DROP_OUT_OF_SCOPE" <<'PYSCOPE' || _scrc=$?
+import sys, os, re, json, hashlib, ipaddress
+inp, scope_f, outd, drop = sys.argv[1:5]
+NAME = re.compile(r"^[a-z0-9_]([a-z0-9_-]{0,62})(\.[a-z0-9_]([a-z0-9_-]{0,62}))*$")
+SEED_NAME = re.compile(r"^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$")   # the input normalizer's rule
+def w(name, lines):
+    with open(os.path.join(outd, name), "w", encoding="utf-8") as f:
+        f.write("".join(l + "\n" for l in lines))
+allow_n, deny_n, allow_net, deny_net, allow_as, deny_as, errors = [], [], [], [], set(), set(), []
+summary = {"file": scope_f, "sha256": "", "entries": 0}
+if scope_f:
+    data = open(scope_f, "rb").read()
+    summary["sha256"] = hashlib.sha256(data).hexdigest()
+    for no, line in enumerate(data.decode("utf-8", "replace").splitlines(), 1):
+        t = line.split("#", 1)[0].strip()
+        if not t:
+            continue
+        neg = t[0] in "!-"
+        v = t[1:].strip() if neg else t
+        low = v.lower().rstrip(".")
+        if re.fullmatch(r"(?i)as\d{1,10}", v):
+            (deny_as if neg else allow_as).add("AS%d" % int(v[2:]))
+        elif re.fullmatch(r"[0-9a-fA-F:.]+(/\d{1,3})?", v) and (":" in v or re.fullmatch(r"[0-9.]+(/\d{1,2})?", v) and v.count(".") == 3):
+            try:
+                net = ipaddress.ip_network(v, strict=True)
+            except ValueError as e:
+                try:
+                    fix = ipaddress.ip_network(v, strict=False)
+                    errors.append("line %d: %s has host bits set (did you mean %s?)" % (no, v, fix))
+                except ValueError:
+                    errors.append("line %d: %s is not a valid address or CIDR (%s)" % (no, v, e))
+                continue
+            (deny_net if neg else allow_net).append(net)
+        else:
+            sub = low.startswith("*.")
+            base = low[2:] if sub else low
+            if "://" in base or "/" in base or ":" in base or " " in base:
+                errors.append("line %d: %s: write a bare name (example.com, *.example.com), an address or CIDR, or an ASN" % (no, v))
+                continue
+            if not NAME.match(base) or len(base) > 253:
+                errors.append("line %d: %s is not a valid name" % (no, v))
+                continue
+            if "." not in base:
+                errors.append("line %d: %s is a whole top-level domain; list the domains you own" % (no, v))
+                continue
+            (deny_n if neg else allow_n).append(("*." if sub else "") + base)
+        summary["entries"] += 1
+    if not (allow_n or allow_net or allow_as) and not errors:
+        errors.append("the scope file allows nothing (only exclusions or comments)")
+if errors:
+    sys.stderr.write("scope file %s:\n" % scope_f + "".join("  %s\n" % e for e in errors))
+    sys.exit(2)
+def covers(entries, n):
+    for e in entries:
+        if e.startswith("*."):
+            if n.endswith("." + e[2:]):
+                return e
+        elif n == e or n.endswith("." + e):
+            return e
+    return ""
+def collapse(nets, v):
+    return list(ipaddress.collapse_addresses([x for x in nets if x.version == v]))
+A4, D4 = collapse(allow_net, 4), collapse(deny_net, 4)
+plan, seeds, seen = [], [], set()
+n_in = n_out = n_bad = 0
+for no, raw in enumerate(open(inp, encoding="utf-8", errors="replace").read().splitlines(), 1):
+    t = raw.replace("\r", "").split("#", 1)[0].strip()
+    if not t:
+        continue
+    show = t[:80]
+    compact = t.replace(" ", "")
+    kind = status = why = ""
+    if re.fullmatch(r"(?i)as\d{1,10}", compact):
+        kind, val = "asn", "AS%d" % int(compact[2:])
+        show = val
+        if val in seen:
+            continue
+        seen.add(val)
+        if not scope_f:
+            status, why = "in", "no --scope"
+        elif val in deny_as:
+            status, why = "out", "excluded by !" + val
+        elif val in allow_as:
+            status, why = "in", val
+        else:
+            status, why = "out", "no ASN entry for it"
+        if status == "in":
+            seeds.append(val)
+    elif re.fullmatch(r"([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}", compact):
+        kind, show = "cidr", compact
+        try:
+            net = ipaddress.ip_network(compact, strict=True)
+        except ValueError:
+            try:
+                fix = ipaddress.ip_network(compact, strict=False)
+                status, why = "invalid", "host bits set (did you mean %s?)" % fix
+            except ValueError:
+                status, why = "invalid", "not a valid CIDR"
+            net = None
+        if net is not None:
+            if str(net) in seen:
+                continue
+            seen.add(str(net))
+            if not scope_f:
+                status, why, keep = "in", "no --scope", [net]
+            else:
+                host = next((a for a in A4 if net.subnet_of(a)), None)
+                if host is None:
+                    status, why, keep = "out", "not inside an allowed range", []
+                else:
+                    keep = [net]
+                    for d in D4:
+                        nxt = []
+                        for r in keep:
+                            if r.subnet_of(d):
+                                continue
+                            if d.subnet_of(r):
+                                nxt.extend(r.address_exclude(d))
+                            else:
+                                nxt.append(r)
+                        keep = nxt
+                    keep = list(ipaddress.collapse_addresses(keep))
+                    if not keep:
+                        status, why = "out", "every address is excluded"
+                    elif keep == [net]:
+                        status, why = "in", str(host)
+                    else:
+                        status, why = "in", "%s, minus the exclusions: %d range(s) scanned" % (host, len(keep))
+            if status == "in":
+                seeds.extend(str(k) for k in keep)
+    else:
+        d = re.sub(r"^(https?://)?", "", t.lower())
+        d = re.sub(r"/.*$", "", d).strip()
+        if SEED_NAME.match(d):
+            kind, show = "domain", d
+            if d in seen:
+                continue
+            seen.add(d)
+            if not scope_f:
+                status, why = "in", "no --scope"
+            else:
+                den = covers(deny_n, d)
+                ok = covers(allow_n, d)
+                if den:
+                    status, why = "out", "excluded by !" + den
+                elif ok:
+                    status, why = "in", ok
+                else:
+                    status, why = "out", "no entry covers it"
+            if status == "in":
+                seeds.append(d)
+        else:
+            kind, status = "-", "invalid"
+            if re.fullmatch(r"[0-9.]+", compact) and compact.count(".") == 3:
+                why = "a bare address: write it as %s/32" % compact
+            elif ":" in compact and re.fullmatch(r"[0-9a-fA-F:./\[\]]+", compact):
+                why = "IPv6 seeds are not supported"
+            elif re.search(r":\d+$", d):
+                why = "a port is not part of a seed (--ports scans ports)"
+            else:
+                why = "not a domain, an ASN or an IPv4 CIDR"
+    if status == "in":
+        n_in += 1
+    elif status == "out":
+        n_out += 1
+    else:
+        n_bad += 1
+    plan.append("\t".join([str(no), show.replace("\t", " "), kind, status, why]))
+w("plan.tsv", plan)
+w("seeds.txt", seeds)
+w("allow_names.txt", allow_n)
+w("deny_names.txt", deny_n)
+w("nets.txt", ["allow %s" % n for n in allow_net] + ["deny %s" % n for n in deny_net])
+w("asns.txt", ["allow %s" % a for a in sorted(allow_as)] + ["deny %s" % a for a in sorted(deny_as)])
+summary.update({"allow_names": len(allow_n), "deny_names": len(deny_n), "allow_ranges": len(allow_net),
+                "deny_ranges": len(deny_net), "asns": len(allow_as), "deny_asns": len(deny_as),
+                "seeds_in": n_in, "seeds_out": n_out, "seeds_invalid": n_bad, "dropped": drop == "1" and (n_out + n_bad) > 0})
+json.dump(summary, open(os.path.join(outd, "summary.json"), "w"))
+if scope_f and (n_out or n_bad) and drop != "1":
+    sys.exit(3)
+if not seeds:
+    sys.exit(4)
+PYSCOPE
+  if [ "$_scrc" = 2 ]; then err "the scope file has errors (see above); nothing was sent."; exit 2; fi
+  _scsum="$(python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); print("%d entr%s (%d name(s), %d range(s), %d ASN(s); %d exclusion(s))" % (s["entries"], "y" if s["entries"]==1 else "ies", s["allow_names"], s["allow_ranges"], s["asns"], s["deny_names"]+s["deny_ranges"]+s["deny_asns"]))' "$SCOPE_TMP/summary.json" 2>/dev/null || echo '?')"
+  if [ "$LIST_TARGETS" = "1" ]; then
+    {
+      printf 'run-recon %s --list-targets: the plan; nothing is sent\n' "$VERSION"
+      printf 'input  : %s\n' "$INPUT"
+      if [ -n "$SCOPE_FILE" ]; then printf 'scope  : %s (sha256 %s): %s\n' "$SCOPE_FILE" "$(sha256sum "$SCOPE_FILE" | cut -c1-16)" "$_scsum"
+      else printf 'scope  : none (no --scope: every seed runs)\n'; fi
+      printf '\n%-6s %-40s %-7s %-13s %s\n' LINE SEED KIND STATUS WHY
+      awk -F'\t' '{ st = ($4 == "in") ? "in scope" : ($4 == "out") ? "OUT OF SCOPE" : "INVALID"
+                    printf "%-6s %-40s %-7s %-13s %s\n", $1, $2, $3, st, $5 }' "$SCOPE_TMP/plan.tsv"
+      _pin="$(awk -F'\t' '$4=="in"' "$SCOPE_TMP/plan.tsv" | wc -l | tr -d ' ')"
+      _pbad="$(awk -F'\t' '$4!="in"' "$SCOPE_TMP/plan.tsv" | wc -l | tr -d ' ')"
+      printf '\n%s seed(s) in scope' "$_pin"
+      if [ "$_pbad" -gt 0 ] && [ -n "$SCOPE_FILE" ] && [ "$DROP_OUT_OF_SCOPE" != 1 ]; then
+        printf ', %s out of scope or invalid: the run would REFUSE to start (--drop-out-of-scope skips them)\n' "$_pbad"
+      elif [ "$_pbad" -gt 0 ]; then printf ', %s skipped (out of scope or invalid)\n' "$_pbad"
+      else printf '\n'; fi
+      printf 'traffic: %s\n' "$([ "$PASSIVE_ONLY" = 1 ] && echo 'passive sources only (--passive-only): nothing is sent to the targets' || echo 'live probes and crawling of the names found under these seeds')"
+      if [ -n "$SCOPE_FILE" ]; then
+        printf 'scope  : names are kept to the allowed names minus the exclusions; addresses run-recon picks itself\n'
+        printf '         (origin candidates, internet-scan hits, range scans) only inside the allowed ranges\n'
+      fi
+      [ "${#RUN_ARGS[@]}" -gt 0 ] && printf 'options: %s\n' "$(printf '%s ' "${RUN_ARGS[@]}" | sed -E 's#(://)[^/@ ]*@#\1***@#g; s/ $//')"
+    }
+    _lrc=0
+    [ "$_scrc" = 3 ] && _lrc=2
+    [ "$_scrc" = 4 ] && _lrc=2
+    exit "$_lrc"
+  fi
+  if [ "$_scrc" = 3 ]; then
+    err "--scope $SCOPE_FILE: these seeds are not allowed (nothing was sent):"
+    awk -F'\t' '$4 != "in" { printf "  line %s: %s: %s: %s\n", $1, $2, ($4 == "out" ? "out of scope" : "invalid"), $5 }' "$SCOPE_TMP/plan.tsv" >&2
+    err "Fix the input or the scope file, check with --list-targets, or pass --drop-out-of-scope to skip them."
+    exit 2
+  fi
+  if [ "$_scrc" = 4 ]; then err "no seed left to run (see --list-targets)."; exit 2; fi
+  if [ "$_scrc" != 0 ]; then err "the scope check failed (python exit $_scrc); nothing was sent."; exit 2; fi
+  if [ -n "$SCOPE_FILE" ]; then
+    SCOPE_ON=1
+    INPUT="$SCOPE_TMP/seeds.txt"
+    if [ -s "$SCOPE_TMP/deny_names.txt" ]; then SCOPE_DENY=1; fi
+    grep -q '^deny ' "$SCOPE_TMP/nets.txt" 2>/dev/null && SCOPE_DENY_NETS=1
+    # an address exclusion keeps out every name that resolves into it: that needs dnsx
+    if [ "$SCOPE_DENY_NETS" = 1 ] && [ "$PASSIVE_ONLY" != 1 ] && ! have dnsx; then
+      err "--scope: the scope excludes addresses, and checking which names resolve into them needs dnsx (not installed). Nothing was sent."
+      exit 2
+    fi
+    awk -F'\t' '$4 != "in" { printf "--scope: skipped line %s: %s: %s: %s\n", $1, $2, ($4 == "out" ? "out of scope" : "invalid"), $5 }' "$SCOPE_TMP/plan.tsv" > "$SCOPE_TMP/dropped.txt"
+  fi
+fi
 
 # --- dependency check ------------------------------------------------------
 if ! have python3; then err "python3 is required (run the PowerShell setup first)"; exit 1; fi
@@ -3285,6 +4207,26 @@ case "$NUCLEI_OAST" in
         case "$NUCLEI_ISERVER" in *[[:space:]]*|-*) err "Invalid --interactsh-server value."; exit 2;; esac ;;
   *) err "NUCLEI_OAST must be off, self or public (got: $NUCLEI_OAST)"; exit 2;;
 esac
+if [ "$DNS_POSTURE$ZONE_EXPOSURE" != "00" ] && ! have dig; then
+  [ "$DNS_POSTURE" = "1" ] && warn "--dns-posture needs dig (dnsutils/bind-utils); skipping."
+  DNS_POSTURE=0
+fi
+if [ -n "$MTA_STS_CA" ] && [ ! -f "$MTA_STS_CA" ]; then err "--mta-sts-ca: not found: $MTA_STS_CA"; exit 2; fi
+if [ "$CLOUDLIST" = "1" ]; then
+  [ -n "$CLOUDLIST_CONFIG" ] || CLOUDLIST_CONFIG="${HOME:-/root}/.config/cloudlist/provider-config.yaml"
+  if ! have cloudlist; then
+    warn "--cloudlist needs cloudlist (go install github.com/projectdiscovery/cloudlist/cmd/cloudlist@latest); skipping."; CLOUDLIST=0
+  elif [ ! -s "$CLOUDLIST_CONFIG" ]; then
+    warn "--cloudlist: no provider config at $CLOUDLIST_CONFIG (pass --cloudlist FILE); skipping."; CLOUDLIST=0
+  fi
+fi
+if [ "$TLD_VARIANTS" = "1" ] && ! have tldfinder; then
+  warn "--tld-variants needs tldfinder (go install github.com/projectdiscovery/tldfinder/cmd/tldfinder@latest); skipping."; TLD_VARIANTS=0
+fi
+if [ "$VULNX" = "1" ] && ! have vulnx; then
+  warn "--vulnx needs vulnx (go install github.com/projectdiscovery/vulnx/v2/cmd/vulnx@latest); skipping."; VULNX=0
+fi
+case "$VULNX_LIMIT$VULNX_MAX_PRODUCTS" in *[!0-9]*|'') err "VULNX_LIMIT and VULNX_MAX_PRODUCTS must be numbers"; exit 2;; esac
 case "$SCREENSHOT_TOOL" in auto|httpx|gowitness) ;; *) err "SCREENSHOT_TOOL must be auto, httpx or gowitness (got: $SCREENSHOT_TOOL)"; exit 2;; esac
 printf '%s' "$ORIGIN_PORTS" | grep -qE '^ *[0-9]{1,5}( +[0-9]{1,5})* *$' \
   || { err "ORIGIN_PORTS must be a space-separated port list, e.g. \"443 80 8443\" (got: $ORIGIN_PORTS)"; exit 2; }
@@ -3293,6 +4235,28 @@ if [ "$PARAMS" = "1" ] && ! have arjun; then
 fi
 case "$ROUNDS" in ''|*[!0-9]*) ROUNDS=1;; esac
 [ "$ROUNDS" -lt 1 ] && ROUNDS=1
+# --engagement / --job-id: identifiers for Tideline, written to run.json and the envelope
+for _idv in "engagement:$ENGAGEMENT" "job-id:$JOB_ID"; do
+  _idn="${_idv%%:*}"; _idv="${_idv#*:}"
+  [ -z "$_idv" ] || printf '%s' "$_idv" | grep -qE '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$' \
+    || { err "--$_idn must be 1-128 characters of A-Z a-z 0-9 . _ : - (got: $_idv)"; exit 2; }
+done
+# --ship: checked here, before anything is sent to a target (certificate, key, CA, URL; no
+# connection is made). A run whose shipping fails later still completes locally and exits 4.
+SHIP_SH=""
+if [ -n "$SHIP_URL" ]; then
+  JSON_OUT=1
+  SHIP_SH="$RECON_DIR/ship-recon.sh"
+  [ -f "$SHIP_SH" ] || SHIP_SH="$(command -v ship-recon.sh 2>/dev/null || true)"
+  if [ -z "$SHIP_SH" ] || [ ! -f "$SHIP_SH" ]; then
+    err "--ship needs ship-recon.sh next to run-recon (not found). Nothing was sent."; exit 2
+  fi
+  _shargs=(--url "$SHIP_URL" --cert "$SHIP_CERT" --key "$SHIP_KEY" --ca "$SHIP_CA")
+  [ -n "$SHIP_PROXY" ] && _shargs+=(--proxy "$SHIP_PROXY")
+  if ! bash "$SHIP_SH" check "${_shargs[@]}"; then
+    err "--ship: the shipping settings above are not usable. Nothing was sent."; exit 2
+  fi
+fi
 if [ "$ROUNDS" -gt 1 ] && [ "$DO_SUBS" != "1" ]; then
   warn "--rounds $ROUNDS has no effect without --subs; forcing 1 round."; ROUNDS=1
 fi
@@ -3381,16 +4345,147 @@ if [ "$SOCIAL" = "1" ]; then
 fi
 
 # --- prepare working dirs --------------------------------------------------
+# The work dir holds a state file: what the run was started with (hashes of the command
+# line, the input and the scope file; no values) and whether it finished. A run that is
+# interrupted keeps its work dir; the same command with --resume continues it: the seeds
+# that finished are kept, the rest (and the main-process stages) run again.
 mkdir -p "$OUT_DIR"
-TS="$(date +%Y%m%d-%H%M%S)"
-WORKDIR="$(cd "$OUT_DIR" && pwd)/_work-$TS"
+RUN_ARGS_SHA="$(for _a in "${RUN_ARGS[@]}"; do [ "$_a" = --resume ] || printf '%s\0' "$_a"; done | sha256sum | cut -c1-64)"
+RUN_INPUT_SHA="$(sha256sum < "$INPUT_ORIG" | cut -c1-64)"
+RUN_SCOPE_SHA=-; [ -n "$SCOPE_FILE" ] && RUN_SCOPE_SHA="$(sha256sum < "$SCOPE_FILE" | cut -c1-64)"
+RESUMED=0; RESUME_DONE=0; RUN_SESSIONS=1
+# A running run holds a lock on its work dir (flock on state.lock, released when the run and
+# every process it started are gone, even after kill -9 or a reboot): --resume never takes
+# over a work dir that is still in use.
+if [ "$RESUME" = 1 ]; then
+  _rw=""; _rbusy=""
+  for _st in "$(cd "$OUT_DIR" && pwd)"/_work-*/state; do     # sorted: the newest match wins
+    [ -f "$_st" ] || continue
+    grep -qx 'status=complete' "$_st" && continue
+    grep -qx "args_sha256=$RUN_ARGS_SHA" "$_st" && grep -qx "input_sha256=$RUN_INPUT_SHA" "$_st" \
+      && grep -qx "scope_sha256=$RUN_SCOPE_SHA" "$_st" || continue
+    if have flock && ! ( flock -n 9 ) 9>>"$(dirname "$_st")/state.lock" 2>/dev/null; then _rbusy="$(dirname "$_st")"; continue; fi
+    _rw="$(dirname "$_st")"
+  done
+  if [ -z "$_rw" ] && [ -n "$_rbusy" ]; then
+    err "--resume: the run in $_rbusy is still running (its lock is held); stop it first."
+    exit 2
+  fi
+  if [ -z "$_rw" ]; then
+    err "--resume: no interrupted run in $OUT_DIR was started with this command line, this input and this scope."
+    err "  (Resume with exactly the original options; a finished run is not resumed.)"
+    exit 2
+  fi
+  if have flock; then exec 9>>"$_rw/state.lock"; flock -n 9 || { err "--resume: $_rw was taken by another process"; exit 2; }; fi
+  WORKDIR="$_rw"; TS="$(sed -n 's/^ts=//p' "$WORKDIR/state" | head -n 1)"
+  OUTPUT="$(sed -n 's/^output=//p' "$WORKDIR/state" | head -n 1)"
+  # keep what the finished seeds produced (done/, their parts and raw dirs, screenshots);
+  # everything else is rebuilt, so no stage appends to a half-written file
+  RESUME_DONE="$(python3 - "$WORKDIR" <<'PYRES'
+import os, re, shutil, sys
+wd = sys.argv[1]
+dd = os.path.join(wd, "done")
+done = set(os.listdir(dd)) if os.path.isdir(dd) else set()
+def rm(p):
+    if os.path.isdir(p) and not os.path.islink(p):
+        shutil.rmtree(p, ignore_errors=True)
+    else:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+for e in os.listdir(wd):
+    if e not in ("done", "parts", "raw", "screenshots", "state", "state.lock", "warnings.txt"):
+        rm(os.path.join(wd, e))
+for sub, pat in (("parts", r"^[^.]+\.(.+)\.[^.]+$"), ("raw", r"^(.+)$")):
+    d = os.path.join(wd, sub)
+    os.makedirs(d, exist_ok=True)
+    for e in os.listdir(d):
+        m = re.match(pat, e)
+        if not (m and m.group(1) in done):
+            rm(os.path.join(d, e))
+print(len(done))
+PYRES
+)" || { err "--resume: could not prepare $WORKDIR"; exit 1; }
+  RESUMED=1
+  RUN_SESSIONS=$(( $(grep -c '^session=' "$WORKDIR/state" || true) + 1 ))
+  sed -i 's/^status=.*/status=running/' "$WORKDIR/state"
+  printf 'session=%s\n' "$RUN_STARTED" >> "$WORKDIR/state"
+else
+  TS="$(date +%Y%m%d-%H%M%S)"
+  WORKDIR="$(cd "$OUT_DIR" && pwd)/_work-$TS"
+fi
 mkdir -p "$WORKDIR/raw" "$WORKDIR/parts"
+if [ "$RESUMED" = 0 ] && have flock; then exec 9>>"$WORKDIR/state.lock"; flock -n 9 || true; fi
+# the compiled scope moves into the work dir (workers read it there)
+if [ -n "$SCOPE_TMP" ]; then
+  mv "$SCOPE_TMP" "$WORKDIR/scope" && SCOPE_TMP=""
+  SCOPE_DIR="$WORKDIR/scope"
+  if [ "$SCOPE_ON" = 1 ]; then
+    INPUT="$SCOPE_DIR/seeds.txt"
+    [ "$SCOPE_DENY" = 1 ] && SCOPE_DENY="$SCOPE_DIR/deny_names.txt"
+    while IFS= read -r _l; do [ -n "$_l" ] && warn "$_l"; done < "$SCOPE_DIR/dropped.txt"
+    # stages that cannot be held to the scope
+    if [ "$CRAWLERS_ALL" = 1 ]; then
+      warn "--crawlers-all under --scope: gospider and hakrawler cannot be held to the scope, so they are skipped (katana still crawls, inside the scope)"
+      CRAWLERS_ALL=0
+    fi
+    if [ "$SCREENSHOTS" = 1 ]; then
+      if [ "$SCREENSHOT_TOOL" = gowitness ] || ! have "$HTTPX_BIN" || ! have dnsx; then
+        warn "--screenshots under --scope needs httpx and dnsx: the browser is held to the scope's names with Chrome host-resolver rules, which gowitness cannot take. No screenshots."
+        SCREENSHOTS=0
+      else
+        SCREENSHOT_TOOL=httpx
+      fi
+    fi
+  fi
+fi
 if [ -z "$OUTPUT" ]; then
   OUTPUT="$(cd "$OUT_DIR" && pwd)/recon-$TS.csv"
 else
   case "$OUTPUT" in /*) :;; *) OUTPUT="$(pwd)/$OUTPUT";; esac
   mkdir -p "$(dirname "$OUTPUT")"
 fi
+# run_id: a UUID v4 per run, kept across --resume (Tideline's key for the run; also in run.json)
+_uuid4() {
+  local u=""
+  [ -r /proc/sys/kernel/random/uuid ] && u="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)"
+  printf '%s' "$u" | grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' \
+    || u="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+  printf '%s' "$u"
+}
+if [ "$RESUMED" = 0 ]; then
+  RUN_ID="$(_uuid4)"
+  printf 'version=%s\nts=%s\noutput=%s\nargs_sha256=%s\ninput_sha256=%s\nscope_sha256=%s\nrun_id=%s\nstatus=running\nsession=%s\n' \
+    "$VERSION" "$TS" "$OUTPUT" "$RUN_ARGS_SHA" "$RUN_INPUT_SHA" "$RUN_SCOPE_SHA" "$RUN_ID" "$RUN_STARTED" > "$WORKDIR/state"
+else
+  RUN_ID="$(sed -n 's/^run_id=//p' "$WORKDIR/state" | head -n 1)"
+  if [ -z "$RUN_ID" ]; then RUN_ID="$(_uuid4)"; printf 'run_id=%s\n' "$RUN_ID" >> "$WORKDIR/state"; fi
+fi
+# Ctrl-C / SIGTERM: stop every stage this run started, keep the work dir, say how to resume.
+# The whole tree is frozen first (a stopped process cannot start the next stage), listed
+# again (to catch a child forked meanwhile), then terminated and continued.
+_tree(){ local _c; for _c in $(pgrep -P "$1" 2>/dev/null); do printf '%s\n' "$_c"; _tree "$_c"; done; }
+_on_interrupt(){
+  trap - INT TERM
+  if have pgrep; then
+    local _p
+    _p="$(_tree $$)"
+    if [ -n "$_p" ]; then
+      # shellcheck disable=SC2086  # one PID per word
+      kill -STOP $_p 2>/dev/null || true; _p="$(_tree $$)"
+      # shellcheck disable=SC2086
+      { kill -STOP $_p; kill -TERM $_p; kill -CONT $_p; } 2>/dev/null || true
+    fi
+  fi
+  [ -n "${HEARTBEAT_PID:-}" ] && { kill "$HEARTBEAT_PID" 2>/dev/null || true; HEARTBEAT_PID=""; }
+  sed -i 's/^status=.*/status=interrupted/' "$WORKDIR/state" 2>/dev/null || true
+  err "interrupted: $(find "$WORKDIR/done" -type f 2>/dev/null | wc -l | tr -d ' ') of ${NDOM:-?} seed(s) had finished. The work so far is kept in $WORKDIR;"
+  err "  run the same command again with --resume to continue from there."
+  exit "$1"
+}
+trap '_on_interrupt 130' INT
+trap '_on_interrupt 143' TERM
 
 # --- detect ASN / CIDR seeds (expanded to hostnames after resolvers are set) --
 HAS_RANGES=0
@@ -3446,6 +4541,23 @@ sed 's/\r$//' "$INPUT" \
   | sed -E 's#^\s*(https?://)?##; s#/.*$##; s/^\s+//; s/\s+$//' \
   | grep -E '^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$' \
   | sort -u > "$DOMAINS_FILE" || true
+# lines that are neither a domain nor an ASN/CIDR seed were always dropped silently (counted
+# first, so a clean input costs no python start)
+_ign=""; _nin="$(sed 's/\r$//; s/#.*$//' "$INPUT" | grep -c '[^[:space:]]' || true)"
+_nrg="$(sed 's/\r$//; s/#.*$//' "$INPUT" | tr -d ' ' | grep -cE '^(AS[0-9]+|([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2})$' || true)"
+[ "${_nin:-0}" -gt $(( $(wc -l < "$DOMAINS_FILE") + ${_nrg:-0} )) ] && _ign="$(python3 -c '
+import re, sys
+bad = []
+for l in open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines():
+    t = l.replace("\r", "").split("#", 1)[0].strip()
+    if not t or re.fullmatch(r"AS[0-9]+|([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}", t.replace(" ", "")):
+        continue
+    d = re.sub(r"/.*$", "", re.sub(r"^\s*(https?://)?", "", t.lower())).strip()
+    if not re.fullmatch(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}", d):
+        bad.append(t[:60])
+if bad:
+    print("%d line(s): %s%s" % (len(bad), ", ".join(bad[:5]), ", ..." if len(bad) > 5 else ""))' "$INPUT" 2>/dev/null || true)"
+[ -n "$_ign" ] && warn "input: ignored $_ign (not a domain, an ASN or an IPv4 CIDR; --list-targets shows why)"
 
 # --- ASN/CIDR seed mode: expand owned ranges, cert-scan them for hostnames ---
 # For an asset owner this surfaces forgotten hosts no passive source will show.
@@ -3504,6 +4616,34 @@ if [ "$HAS_RANGES" = "1" ]; then
   have mapcidr && [ -s "$CIDRS" ] && { mapcidr -cl "$CIDRS" -aggregate -silent < /dev/null 2>/dev/null | sort -u > "$CIDRS.agg" && [ -s "$CIDRS.agg" ] && mv "$CIDRS.agg" "$CIDRS"; } || true
   rm -f "$CIDRS.agg"
   sort -u "$CIDRS" -o "$CIDRS" 2>/dev/null || true
+  # --scope: the excluded ranges are taken out of the sweep, and the ranges of the allowed
+  # ASNs (asnmap) become allowed addresses for the later stages (origin candidates, pivots)
+  if [ "$SCOPE_ON" = 1 ] && [ -s "$CIDRS" ]; then
+    python3 - "$CIDRS" "$SCOPE_DIR/nets.txt" <<'PYSCR' || { err "--scope: could not apply the exclusions to the ranges; nothing was scanned."; exit 2; }
+import sys, ipaddress
+cf, nf = sys.argv[1:3]
+deny = [ipaddress.ip_network(l.split()[1]) for l in open(nf) if l.startswith("deny ")]
+keep = []
+for l in open(cf):
+    t = l.strip()
+    if not t:
+        continue
+    parts = [ipaddress.ip_network(t, strict=False)]
+    for d in deny:
+        nxt = []
+        for r in parts:
+            if r.version != d.version or not r.overlaps(d):
+                nxt.append(r)
+            elif not r.subnet_of(d):
+                nxt.extend(r.address_exclude(d))
+        parts = nxt
+    keep.extend(parts)
+keep = list(ipaddress.collapse_addresses(keep))
+open(cf, "w").write("".join("%s\n" % k for k in keep))
+with open(nf, "a") as f:
+    f.write("".join("allow %s\n" % k for k in keep))
+PYSCR
+  fi
   EXPANDED="$WORKDIR/expanded_from_ranges.txt"; : > "$EXPANDED"
   # certificate-scan ports: 443 by default; with --ports, the same port list naabu uses
   if [ -z "$RANGE_TLS_PORTS" ]; then
@@ -3541,6 +4681,35 @@ for line in sys.stdin:
 open(sys.argv[1], "w").write("".join("%s\t%s\n" % p for p in sorted(pairs)))
 print("\n".join(sorted(names)))' "$RANGE_CERTS_FILE" | sort -u > "$EXPANDED" || : > "$EXPANDED"
   fi
+  # --scope: a name found on a range certificate becomes a seed only if the scope allows it
+  if [ "$SCOPE_ON" = 1 ] && [ -s "$EXPANDED" ]; then
+    python3 - "$EXPANDED" "$SCOPE_DIR" "$WORKDIR/parts/scopeskip._ranges.tsv" <<'PYSCN' || : > "$EXPANDED"
+import sys, os
+ef, sd, skip = sys.argv[1:4]
+def load(n):
+    return [l.strip() for l in open(os.path.join(sd, n)) if l.strip()]
+A, D = load("allow_names.txt"), load("deny_names.txt")
+def covers(es, n):
+    return next((e for e in es if (n.endswith("." + e[2:]) if e.startswith("*.") else (n == e or n.endswith("." + e)))), "")
+keep, held = [], []
+for l in open(ef):
+    n = l.strip().lower()
+    if not n:
+        continue
+    d = covers(D, n)
+    if d:
+        held.append((n, "excluded by !" + d))
+    elif covers(A, n):
+        keep.append(n)
+    else:
+        held.append((n, "not among the scope's names"))
+open(ef, "w").write("".join(n + "\n" for n in keep))
+with open(skip, "a") as f:
+    f.write("".join("\t".join(["ranges", "range-certificate-name", n, "", why]) + "\n" for n, why in held))
+PYSCN
+    _rh="$(cut -f3 "$WORKDIR/parts/scopeskip._ranges.tsv" 2>/dev/null | sort -u | grep -c . || true)"
+    [ "${_rh:-0}" -gt 0 ] && warn "--scope: $_rh name(s) on the ranges' certificates are not in the scope and were not added as seeds (listed in <out>.scope.txt)"
+  fi
   if [ -s "$EXPANDED" ]; then
     cat "$EXPANDED" >> "$DOMAINS_FILE"; sort -u "$DOMAINS_FILE" -o "$DOMAINS_FILE"
     ok "ASN/CIDR expansion: added $(wc -l < "$EXPANDED" | tr -d ' ') hostname(s) from cert scan of $(wc -l < "$CIDRS" | tr -d ' ') CIDR(s)."
@@ -3562,12 +4731,14 @@ log " EASM URL enumeration  |  v$VERSION"
 log " Authorization reminder: only assess assets you are permitted to."
 log "--------------------------------------------------------------"
 log " Input domains : $NDOM"
+log " Scope         : $([ "$SCOPE_ON" = 1 ] && echo "$SCOPE_FILE: ${_scsum:-}" || echo 'none (--scope FILE holds the run to a list)')"
 log " Threads       : $THREADS"
 log " Mode          : $([ "$PASSIVE_ONLY" = 1 ] && echo passive-only || { [ "$NO_VALIDATE" = 1 ] && echo 'crawl, no-validate' || echo 'passive + crawl + validate'; })"
 log " Subdomains    : $(onoff $DO_SUBS)    Deep(waymore): $(onoff $DEEP)    Rounds: $ROUNDS"
 log " Discovery     : resolve=$(onoff $RESOLVE)  certs=$(onoff $CERTS)  permute=$(onoff $PERMUTE)  brute=$(onoff $BRUTE)  ports=$(onoff $PORTS)  favicon=$(onoff $FAVICON)$([ -n "$RESOLVERS" ] && echo "  (dedicated resolvers)" || echo "")"
 log " Sources+      : crawlers-all=$(onoff $CRAWLERS_ALL)  js=$(onoff $JS)"
-log " DNS zones     : zone-exposure=$(onoff $ZONE_EXPOSURE)"
+log " DNS zones     : zone-exposure=$(onoff $ZONE_EXPOSURE)  dns-posture=$(onoff $DNS_POSTURE)"
+log " Inventory     : cloudlist=$(onoff $CLOUDLIST)  tld-variants=$(onoff $TLD_VARIANTS)  vulnx=$(onoff $VULNX)"
 log " Analysis      : takeover=$(onoff $TAKEOVER)  screenshots=$(onoff $SCREENSHOTS)  origin=$(onoff $ORIGIN)  extras=$(onoff $EXTRAS)  vhost=$(onoff $VHOST)  nuclei=$(onoff $NUCLEI)  params=$(onoff $PARAMS)  secrets=$(onoff $SECRETS)  active-cms=$(onoff $ACTIVE)  activescan=$(onoff $ACTIVESCAN)"
 if [ "$NUCLEI$ACTIVE$ACTIVESCAN" != "000" ] && have nuclei; then
   case "$NUCLEI_OAST" in
@@ -3685,7 +4856,7 @@ export WORKDIR PASSIVE_ONLY NO_VALIDATE DO_SUBS DEPTH RATE FILTER_STATIC MAX_URL
 export FUZZ WORDLIST FUZZ_THREADS FUZZ_EXT SECLISTS HTTPX_BIN
 export RESOLVE CERTS PERMUTE PERMUTE_MAX RESOLVERS
 export BRUTE BRUTE_WORDLIST BRUTE_MAX PORTS PORT_SPEC CRAWLERS_ALL JS TAKEOVER SCREENSHOTS ORIGIN FAVICON
-export TLS_POSTURE TLS_ENUM IPV6
+export TLS_POSTURE TLS_ENUM TLS_ENUM_TIMEOUT REDIRECT_MAX IPV6
 export ROUNDS VHOST NUCLEI NUCLEI_SEV PARAMS SECRETS
 export GITHUB GITHUB_TOKEN_FILE BUCKETS
 export ACTIVE CMS_WORDLIST CMS_MAX WPSCAN_API_TOKEN
@@ -3694,8 +4865,13 @@ export OSINT VIRUSTOTAL VT_API_KEY URLSCAN URLSCAN_API_KEY OSINT_MAX
 export SOCIAL SOCIAL_USER
 export RDAP_TIMEOUT RDAP_DELAY INTERNETDB_TIMEOUT INTERNETDB_DELAY VT_TIMEOUT VT_DELAY URLSCAN_TIMEOUT URLSCAN_DELAY
 export USE_DB CACHE_TTL RECON_DB_NAME RECON_DB_DSN PGDATABASE PGUSER PGHOST PGPORT PGPASSWORD
-export NEG_TTL CB_THRESHOLD CB_SERIALIZE PROXY HTTP_RETRIES LATE_RETRY SKIP_SPECIAL_USE NUCLEI_OAST NUCLEI_ISERVER ZONE_EXPOSURE
+export NEG_TTL CB_THRESHOLD CB_SERIALIZE PROXY HTTP_RETRIES LATE_RETRY SKIP_SPECIAL_USE NUCLEI_OAST NUCLEI_ISERVER ZONE_EXPOSURE DNS_POSTURE
 export CERT_WARN_DAYS TLS_CHAIN_CHECK EXTRAS FAVICON_LIMIT FAVICON_MAX_HASHES ORIGIN_PORTS RANGE_CERTS_FILE
+export SCOPE_ON SCOPE_DIR SCOPE_DENY SCOPE_DENY_NETS
+# --monitor compares with what the targets answer now: with --db, the cache still serves the
+# passive lookups (archives, subdomain sources, OSINT), never a probe result
+[ -z "$CACHE_FRESH_ACTIVE" ] && { [ "$MONITOR" = 1 ] && CACHE_FRESH_ACTIVE=1 || CACHE_FRESH_ACTIVE=0; }
+export CACHE_FRESH_ACTIVE
 # route GET-heavy stages (curl/whatweb/gau/wget/python) through the proxy if set;
 # ProjectDiscovery tools additionally get an explicit -proxy flag at their call sites.
 if [ -n "$PROXY" ]; then
@@ -3853,8 +5029,442 @@ PYZONE
   fi
 fi
 
+# --- email and DNS posture (main process: per seed and zone apex, before the workers) ---
+# DNS queries through your resolvers (the first of --resolvers, else the system's), SOA
+# queries to each delegated name server for lameness, and one HTTPS GET of each published
+# MTA-STS policy (skipped under --passive-only). Findings -> parts/dnsposture.all.txt.
+if [ "$DNS_POSTURE" = "1" ]; then
+  mkdir -p "$WORKDIR/parts"
+  POSTURE_RES=""; [ -n "$RESOLVERS" ] && [ -s "$RESOLVERS" ] && POSTURE_RES="$(grep -vE '^\s*(#|$)' "$RESOLVERS" | head -n 1 | sed -E 's/:[0-9]+$//')"
+  log "Email/DNS posture: $(grep -c . "$DOMAINS_FILE") seed(s) and their zones${POSTURE_RES:+ (resolver $POSTURE_RES)}"
+  python3 - "$DOMAINS_FILE" "$WORKDIR/parts/dnsposture.all.txt" "$WORKDIR/dnsposture.tsv" "$POSTURE_RES" "$MTA_STS_CA" "$PASSIVE_ONLY" \
+      "$([ "$SCOPE_ON" = 1 ] && printf '%s' "$SCOPE_DIR")" <<'PYPOSTURE' 2>>"$WORKDIR/dnsposture.err" || warn "email/DNS posture check failed (see $WORKDIR/dnsposture.err)"
+import subprocess, sys, re, os
+from concurrent.futures import ThreadPoolExecutor
+seeds_f, out_f, tsv_f, resolver, cafile, passive = sys.argv[1:7]
+scope_d = sys.argv[7] if len(sys.argv) > 7 else ""
+res = ["@" + resolver] if resolver else []
+def _sload(n):
+    try:
+        return [l.strip() for l in open(os.path.join(scope_d, n)) if l.strip()]
+    except OSError:
+        return []
+S_ALLOW, S_DENY = (_sload("allow_names.txt"), _sload("deny_names.txt")) if scope_d else ([], [])
+def _covers(es, n):
+    return any((n.endswith("." + e[2:]) if e.startswith("*.") else (n == e or n.endswith("." + e))) for e in es)
+def in_scope(n):
+    return not scope_d or (_covers(S_ALLOW, n) and not _covers(S_DENY, n))
+FIND, ROWS = [], []
+def dig(name, typ, server=None, norec=False, t=3):
+    """(status, answers, aa): status is NOERROR/NXDOMAIN/SERVFAIL/REFUSED/... or TIMEOUT;
+    answers are (owner, type, rdata text)."""
+    args = ["dig", "+time=%d" % t, "+tries=1", "+noall", "+answer", "+comments"]
+    if norec:
+        args.append("+norec")
+    args += (["@" + server] if server else res) + [typ, name]
+    try:
+        out = subprocess.run(args, capture_output=True, text=True, timeout=t * 3 + 5).stdout
+    except Exception:
+        out = ""
+    m = re.search(r"status: ([A-Z]+)", out)
+    status = m.group(1) if m else "TIMEOUT"
+    fl = re.search(r";; flags: ([^;]*);", out)
+    aa = bool(fl and " aa" in " " + fl.group(1))
+    ans = []
+    for line in out.splitlines():
+        if not line.strip() or line.startswith(";"):
+            continue
+        f = line.split(None, 4)
+        if len(f) >= 5 and f[2] == "IN":
+            ans.append((f[0].rstrip(".").lower(), f[3].upper(), f[4].strip()))
+    return status, ans, aa
+def txt(name):
+    st, ans, _ = dig(name, "TXT")
+    out = []
+    for o, t, r in ans:
+        if t == "TXT":
+            parts = re.findall(r'"((?:[^"\\]|\\.)*)"', r)
+            out.append("".join(parts) if parts else r)
+    return st, out
+def exists(name):
+    """'yes' (has A/AAAA), 'noaddr' (the name exists, no address) or 'nx' (NXDOMAIN)."""
+    sa, aa_, _ = dig(name, "A")
+    if any(t == "A" for o, t, r in aa_):
+        return "yes"
+    s6, a6, _ = dig(name, "AAAA")
+    if any(t == "AAAA" for o, t, r in a6):
+        return "yes"
+    return "nx" if sa == "NXDOMAIN" and s6 == "NXDOMAIN" else ("noaddr" if sa != "TIMEOUT" else "timeout")
+def parent_gone(name):
+    """the domain the name lives in (its last two labels) does not exist: whoever registers it
+    controls the name. Conservative under multi-label suffixes (co.uk exists): then False."""
+    p = ".".join(name.split(".")[-2:])
+    if "." not in p:
+        return False
+    st, _, _ = dig(p, "SOA")
+    return st == "NXDOMAIN"
+def add(bracket, kind, sev, host, note, **kv):
+    extra = "".join(" %s=%s" % (k, str(v).replace(" ", "_")) for k, v in kv.items() if v not in ("", None))
+    FIND.append("[%s] %s [%s] host=%s%s note=%s" % (bracket, kind, sev, host, extra, note))
+SPF_LOOKUP = re.compile(r"^[+?~-]?(include:|a$|a:|a/|mx$|mx:|mx/|ptr|exists:)|^redirect=", re.I)
+def spf_record(name):
+    st, recs = txt(name)
+    return st, [r for r in recs if re.match(r"(?i)^v=spf1(\s|$)", r)]
+def spf_walk(name, depth=0, seen=None, acc=None):
+    """count DNS-querying terms (RFC 7208 4.6.4: at most 10), follow include:/redirect=;
+    records missing or dangling includes"""
+    seen = seen if seen is not None else set()
+    acc = acc if acc is not None else {"lookups": 0, "missing": [], "dangling": [], "ptr": False}
+    if name in seen or depth > 5:
+        return acc
+    seen.add(name)
+    st, recs = spf_record(name)
+    if len(recs) != 1:
+        if depth > 0:
+            (acc["dangling"] if st == "NXDOMAIN" else acc["missing"]).append(name)
+        return acc
+    for term in recs[0].split()[1:]:
+        if SPF_LOOKUP.match(term):
+            acc["lookups"] += 1
+            if term.lower().lstrip("+?~-").startswith("ptr"):
+                acc["ptr"] = True
+            m = re.match(r"(?i)^[+?~-]?include:(\S+)$", term) or re.match(r"(?i)^redirect=(\S+)$", term)
+            if m and "%" not in m.group(1):
+                spf_walk(m.group(1).rstrip(".").lower(), depth + 1, seen, acc)
+    return acc
+def spf_all(name, depth=0):
+    st, recs = spf_record(name)
+    if len(recs) != 1 or depth > 3:
+        return ""
+    terms = recs[0].split()[1:]
+    for t in terms:
+        m = re.match(r"(?i)^([+?~-]?)all$", t)
+        if m:
+            return (m.group(1) or "+") + "all"
+    for t in terms:
+        m = re.match(r"(?i)^redirect=(\S+)$", t)
+        if m:
+            return spf_all(m.group(1).rstrip(".").lower(), depth + 1)
+    return "none"
+def tags(rec):
+    d = {}
+    for part in rec.split(";"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            d[k.strip().lower()] = v.strip()
+    return d
+def mx_hosts(name):
+    st, ans, _ = dig(name, "MX")
+    hs = []
+    for o, t, r in ans:
+        if t == "MX":
+            f = r.split()
+            if len(f) >= 2:
+                hs.append((int(f[0]) if f[0].isdigit() else 0, f[1].rstrip(".").lower()))
+    return st, sorted(hs)
+def mta_sts_policy(name):
+    """fetch https://mta-sts.<name>/.well-known/mta-sts.txt with certificate verification (RFC
+    8461 requires a valid certificate; MTA_STS_CA adds a CA, e.g. a lab's) and no redirects"""
+    host = "mta-sts." + name
+    args = ["curl", "-sS", "--max-time", "10", "-o", "-", "-w", "\n%{http_code}", "--proto", "=https"]
+    if cafile:
+        args += ["--cacert", cafile]
+    st, ans, _ = dig(host, "A")
+    ip = next((r for o, t, r in ans if t == "A"), "")
+    if ip:
+        args += ["--resolve", "%s:443:%s" % (host, ip)]
+    args.append("https://%s/.well-known/mta-sts.txt" % host)
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=20)
+    except Exception:
+        return None, "timeout"
+    body, _, code = p.stdout.rpartition("\n")
+    if p.returncode != 0:
+        why = {6: "no-address", 7: "refused", 28: "timeout", 35: "tls-error", 60: "untrusted-certificate"}.get(p.returncode, "curl-%d" % p.returncode)
+        return None, why
+    if code != "200":
+        return None, "status-" + code
+    pol = {"mx": []}
+    for line in body.splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            k, v = k.strip().lower(), v.strip()
+            if k == "mx":
+                pol["mx"].append(v.lower().rstrip("."))
+            else:
+                pol[k] = v
+    return pol, ""
+def mx_match(pattern, host):
+    if pattern.startswith("*."):
+        return host.count(".") >= 1 and host.split(".", 1)[1] == pattern[2:]
+    return host == pattern
+def mail_checks(bracket, name, apex, row):
+    st, mx = mx_hosts(name)
+    nullmx = len(mx) == 1 and mx[0][1] in ("", ".")
+    real_mx = [h for p, h in mx if h not in ("", ".")]
+    row["mx"] = "null" if nullmx else ";".join(real_mx) or "-"
+    sst, spf = spf_record(name)
+    if not (real_mx or spf or nullmx or name == apex):
+        return            # neither sends nor receives mail, and not a zone apex: nothing to judge
+    # SPF
+    if not spf:
+        if real_mx:
+            add(bracket, "spf-missing", "medium", name, "receives mail (MX) but publishes no SPF record: anyone can send as it")
+        else:
+            add(bracket, "spf-missing", "low", name, "no SPF record; a name that sends no mail should publish v=spf1 -all")
+        row["spf"] = "-"
+    elif len(spf) > 1:
+        add(bracket, "spf-multiple", "medium", name, "more than one SPF record: receivers treat that as a permanent error (RFC 7208 4.5)", records=len(spf))
+        row["spf"] = "multiple"
+    else:
+        row["spf"] = spf[0]
+        al = spf_all(name)
+        row["spf_all"] = al
+        if al == "+all":
+            add(bracket, "spf-permissive", "high", name, "the SPF record ends in +all: every server on the internet may send as this name", all=al)
+        elif al == "?all":
+            add(bracket, "spf-neutral", "medium", name, "the SPF record ends in ?all (neutral): it authorizes no one and protects nothing", all=al)
+        elif al == "none":
+            add(bracket, "spf-no-all", "medium", name, "the SPF record has no all mechanism, so mail from other servers is neutral")
+        w = spf_walk(name)
+        row["spf_lookups"] = str(w["lookups"])
+        if w["lookups"] > 10:
+            add(bracket, "spf-too-many-lookups", "medium", name, "more than 10 DNS-querying terms: receivers stop with a permanent error (RFC 7208 4.6.4)", lookups=w["lookups"])
+        for d in w["dangling"]:
+            add(bracket, "spf-include-dangling", "high" if parent_gone(d) else "medium", name,
+                "an include:/redirect= names a domain that does not exist: whoever registers it may send as this name", include=d)
+        for d in w["missing"]:
+            add(bracket, "spf-include-missing", "medium", name, "an include:/redirect= target publishes no single SPF record (permanent error)", include=d)
+        if w["ptr"]:
+            add(bracket, "spf-ptr", "low", name, "the ptr mechanism is deprecated (RFC 7208 5.5): slow and unreliable")
+    # DMARC: the name's own record, else the organizational domain's (sp= for subdomains)
+    src = name
+    _, dm = txt("_dmarc." + name)
+    dm = [r for r in dm if re.match(r"(?i)^v=DMARC1(\s|;|$)", r)]
+    if not dm and name != apex:
+        _, dm = txt("_dmarc." + apex)
+        dm = [r for r in dm if re.match(r"(?i)^v=DMARC1(\s|;|$)", r)]
+        src = apex
+    if not dm:
+        if real_mx or spf:
+            add(bracket, "dmarc-missing", "medium", name, "no DMARC record: receivers get no policy for mail that fails SPF/DKIM")
+        else:
+            add(bracket, "dmarc-missing", "low", name, "no DMARC record; a name that sends no mail should still publish v=DMARC1; p=reject")
+        row["dmarc"] = "-"
+    elif len(dm) > 1:
+        add(bracket, "dmarc-multiple", "medium", name, "more than one DMARC record: receivers ignore them all (RFC 7489 6.6.3)")
+        row["dmarc"] = "multiple"
+    else:
+        tg = tags(dm[0])
+        p = (tg.get("sp") if src != name and tg.get("sp") else tg.get("p", "")).lower()
+        row["dmarc"] = "p=%s%s" % (p or "?", "" if src == name else " (from %s)" % src)
+        if p not in ("none", "quarantine", "reject"):
+            add(bracket, "dmarc-invalid", "medium", name, "the DMARC record has no valid p= policy", record_at="_dmarc." + src)
+        elif p == "none":
+            add(bracket, "dmarc-none", "low", name, "DMARC p=none only monitors: spoofed mail is still delivered", record_at="_dmarc." + src)
+        try:
+            pct = int(tg.get("pct", "100"))
+        except ValueError:
+            pct = 100
+        if p in ("quarantine", "reject") and pct < 100:
+            add(bracket, "dmarc-partial", "low", name, "the DMARC policy applies to only part of the failing mail", pct=pct)
+        if not tg.get("rua"):
+            add(bracket, "dmarc-no-rua", "info", name, "no rua= address: nobody receives the aggregate reports", record_at="_dmarc." + src)
+    if not real_mx:
+        return
+    # MTA-STS and TLS-RPT: only for names that receive mail
+    _, sts = txt("_mta-sts." + name)
+    sts = [r for r in sts if re.match(r"(?i)^v=STSv1(\s|;|$)", r)]
+    if not sts:
+        add(bracket, "mta-sts-missing", "low", name, "no MTA-STS: mail to this name can be downgraded to plaintext or redirected by an attacker on the path")
+        row["mta_sts"] = "-"
+    elif passive == "1":
+        row["mta_sts"] = "record (policy not fetched: --passive-only)"
+    elif not in_scope("mta-sts." + name):
+        row["mta_sts"] = "record (policy not fetched: mta-sts.%s is outside --scope)" % name
+    else:
+        pol, why = mta_sts_policy(name)
+        if pol is None:
+            add(bracket, "mta-sts-policy-unreachable", "medium", name, "the _mta-sts record exists but the policy cannot be fetched, so senders cannot apply it", reason=why)
+            row["mta_sts"] = "unreachable"
+        else:
+            mode = pol.get("mode", "").lower()
+            row["mta_sts"] = mode or "?"
+            if mode == "testing":
+                add(bracket, "mta-sts-testing", "info", name, "MTA-STS in testing mode: failures are reported, not enforced")
+            elif mode == "none":
+                add(bracket, "mta-sts-none", "low", name, "MTA-STS mode none: the policy is withdrawn")
+            elif mode != "enforce":
+                add(bracket, "mta-sts-invalid", "medium", name, "the MTA-STS policy has no valid mode", mode=mode or "-")
+            bad = [h for h in real_mx if not any(mx_match(p, h) for p in pol["mx"])]
+            if bad:
+                add(bracket, "mta-sts-mx-mismatch", "medium", name, "MX hosts the policy does not list: under enforce, senders refuse to deliver to them", mx=",".join(bad))
+    _, rpt = txt("_smtp._tls." + name)
+    if not [r for r in rpt if re.match(r"(?i)^v=TLSRPTv1(\s|;|$)", r)]:
+        add(bracket, "tlsrpt-missing", "info", name, "no TLS-RPT record: you are not told when senders fail to reach you over TLS")
+        row["tls_rpt"] = "no"
+    else:
+        row["tls_rpt"] = "yes"
+    # dangling MX: a mail exchanger name that does not exist
+    for h in real_mx:
+        e = exists(h)
+        if e == "nx":
+            hi = parent_gone(h)
+            add(bracket, "mx-dangling", "high" if hi else "medium", name,
+                ("the MX host's domain does not exist: whoever registers it receives this name's mail" if hi
+                 else "the MX host does not exist: mail to it fails (and its domain's owner could create it)"), mx=h)
+        elif e == "noaddr":
+            add(bracket, "mx-no-address", "medium", name, "the MX host exists but has no address: mail to it fails", mx=h)
+def caa_check(apex, row):
+    st, ans, _ = dig(apex, "CAA")
+    iss = sorted(set(re.sub(r'"', "", r.split(None, 2)[2]) for o, t, r in ans if t == "CAA" and len(r.split(None, 2)) == 3 and r.split()[1].lower() in ("issue", "issuewild")))
+    row["caa"] = ";".join(iss) or "-"
+    if not any(t == "CAA" for o, t, r in ans):
+        add(apex, "caa-missing", "low", apex, "no CAA record: any certificate authority may issue certificates for this zone")
+def ns_check(apex, row):
+    st, ans, _ = dig(apex, "NS")
+    nss = sorted(set(r.split()[0].rstrip(".").lower() for o, t, r in ans if t == "NS" and r.split()))
+    row["ns"] = ";".join(nss) or "-"
+    tested, timeouts, lame = 0, 0, []
+    for n in nss:
+        e = exists(n)
+        if e == "nx":
+            hi = parent_gone(n)
+            add(apex, "ns-dangling", "high" if hi else "medium", apex,
+                ("a delegated name server's domain does not exist: whoever registers it can answer for the whole zone" if hi
+                 else "a delegated name server does not exist: resolvers that pick it fail"), ns=n)
+            continue
+        _, a4, _ = dig(n, "A")
+        for ip in [r for o, t, r in a4 if t == "A"][:2]:
+            tested += 1
+            s, ans2, aa = dig(apex, "SOA", server=ip, norec=True)
+            if s == "TIMEOUT":
+                timeouts += 1; lame.append((n, ip, "timeout"))
+            elif s != "NOERROR" or not aa or not any(t == "SOA" for o, t, r in ans2):
+                lame.append((n, ip, s.lower() if s != "NOERROR" else "not-authoritative"))
+    if tested and timeouts == tested:
+        add(apex, "ns-unreachable", "info", apex, "no name server answered from here (outbound DNS to them may be blocked): not judged", tested=tested)
+        return
+    for n, ip, why in lame:
+        add(apex, "ns-lame", "medium", apex, "a delegated name server does not answer authoritatively for the zone (lame delegation)", ns="%s(%s)" % (n, ip), reason=why)
+seeds = sorted(set(l.strip().lower().rstrip(".") for l in open(seeds_f) if l.strip()))
+def soa_of(seed):
+    st, ans, _ = dig(seed, "SOA")
+    for o, t, r in ans:
+        if t == "SOA":
+            return seed, o
+    # the SOA arrives in the authority section for names below the apex
+    try:
+        out = subprocess.run(["dig", "+time=3", "+tries=1", "+noall", "+authority"] + res + ["SOA", seed],
+                             capture_output=True, text=True, timeout=14).stdout
+    except Exception:
+        out = ""
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) >= 4 and f[2] == "IN" and f[3] == "SOA":
+            return seed, f[0].rstrip(".").lower()
+    return seed, ""
+with ThreadPoolExecutor(max_workers=8) as ex:
+    apex_of = dict(ex.map(soa_of, seeds))
+names = {}
+for s_, a in apex_of.items():
+    if a:
+        names.setdefault(a, ("apex", a))
+    names.setdefault(s_, ("seed", a or s_))
+def one(item):
+    name, (role, apex) = item
+    row = {"name": name, "role": role, "apex": apex}
+    bracket = name if role == "apex" else name
+    mail_checks(bracket, name, apex, row)
+    if role == "apex":
+        caa_check(apex, row); ns_check(apex, row)
+    return row
+with ThreadPoolExecutor(max_workers=8) as ex:
+    ROWS = list(ex.map(one, sorted(names.items(), key=lambda x: (x[1][1], x[1][0] != "apex", x[0]))))
+COLS = ["name", "role", "apex", "mx", "spf", "spf_all", "spf_lookups", "dmarc", "mta_sts", "tls_rpt", "caa", "ns"]
+with open(tsv_f, "w") as o:
+    o.write("\t".join(COLS) + "\n")
+    for r in ROWS:
+        o.write("\t".join(str(r.get(c, "")).replace("\t", " ") for c in COLS) + "\n")
+SEV = {"high": 0, "medium": 1, "low": 2, "info": 3}
+def order(l):
+    m = re.match(r"^\[([^\]]*)\] (\S+) \[(\w+)\] host=(\S+)", l)
+    return (m.group(1), SEV.get(m.group(3), 9), m.group(2), m.group(4), l) if m else ("", 9, "", "", l)
+with open(out_f, "a") as o:
+    o.write("".join(l + "\n" for l in sorted(FIND, key=order)))
+PYPOSTURE
+fi
+
+# --- TLD variants (main process): the seed's name under other TLDs, listed only -------
+if [ "$TLD_VARIANTS" = "1" ]; then
+  mkdir -p "$WORKDIR/parts"
+  log "TLD variants: tldfinder on the seeds' names (public DNS; listed, never scanned)"
+  python3 - "$DOMAINS_FILE" "$WORKDIR/parts/tld-variants.all.txt" "${RESOLVERS:-}" "$PROXY" "$SCAN_TIMEOUT" <<'PYTLD' 2>>"$WORKDIR/tld.err" || warn "TLD variant listing failed (see $WORKDIR/tld.err)"
+import subprocess, sys, re
+seeds_f, out_f, resolvers, proxy, tmo = sys.argv[1:6]
+res = []
+if resolvers:
+    try:
+        res = [l.strip() for l in open(resolvers) if l.strip() and not l.startswith("#")][:1]
+    except OSError:
+        res = []
+def dig(name, typ):
+    try:
+        out = subprocess.run(["dig", "+short", "+time=2", "+tries=1"] + ["@" + r.rsplit(":", 1)[0] for r in res] + [typ, name],
+                             capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        out = ""
+    return sorted(set(l.strip().rstrip(".").lower() for l in out.splitlines() if l.strip() and not l.startswith(";")))
+def apex_of(name):
+    try:
+        out = subprocess.run(["dig", "+time=2", "+tries=1", "+noall", "+answer", "+authority"] + ["@" + r.rsplit(":", 1)[0] for r in res] + ["SOA", name],
+                             capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        out = ""
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) >= 4 and f[2] == "IN" and f[3] == "SOA":
+            return f[0].rstrip(".").lower()
+    p = name.split(".")
+    return ".".join(p[-2:]) if len(p) >= 2 else name
+seeds = sorted(set(l.strip().lower().rstrip(".") for l in open(seeds_f) if l.strip()))
+apexes = {}
+for sd in seeds:
+    a = apex_of(sd)
+    if "." in a:
+        apexes.setdefault(a, []).append(sd)
+labels = {}
+for a in apexes:
+    labels.setdefault(a.split(".")[0], []).append(a)
+if not labels:
+    sys.exit(0)
+args = ["tldfinder", "-d", ",".join(sorted(labels)), "-dm", "tld", "-silent", "-duc", "-nc", "-max-time", str(max(1, int(tmo or 600) // 60))]
+if res:
+    args += ["-r", ",".join(res)]
+if proxy:
+    args += ["-proxy", proxy]
+try:
+    out = subprocess.run(args, capture_output=True, text=True, timeout=int(tmo or 600) + 30, stdin=subprocess.DEVNULL).stdout
+except Exception:
+    out = ""
+own = set(apexes)
+lines = []
+for d in sorted(set(l.strip().lower().rstrip(".") for l in out.splitlines())):
+    if not re.fullmatch(r"[a-z0-9][a-z0-9.-]*\.[a-z0-9-]{2,}", d) or d in own:
+        continue
+    lab = d.split(".")[0]
+    for a in labels.get(lab, []):
+        ns_a, ns_d = dig(a, "NS"), dig(d, "NS")
+        same = "yes" if ns_a and ns_d and set(ns_a) & set(ns_d) else "no"
+        lines.append("[%s] tld-variant [info] host=%s of=%s same_ns=%s ns=%s note=the name is registered under another "
+                     "TLD; same_ns=yes suggests it is yours, otherwise check who holds it (look-alike or parked); not scanned"
+                     % (apexes[a][0], d, a, same, ",".join(ns_d[:3]) or "-"))
+open(out_f, "a").write("".join(l + "\n" for l in lines))
+PYTLD
+fi
+
 export -f _ss_norm 2>/dev/null || true
-export -f process_one special_use_domain nuclei_oast_args takeover_check origin_check missing_keys late_pause prep_file scope_filter resolve_hosts brute_subs analyze_hosts cms_scan activescan osint_scan uro_filter \
+export -f process_one special_use_domain nuclei_oast_args takeover_check origin_check missing_keys late_pause prep_file scope_filter scope_addr_filter scope_ip_filter scope_url_regex resolve_hosts brute_subs analyze_hosts cms_scan activescan osint_scan uro_filter \
           _to _delay fmt_hms stage log ok warn err have _c \
           cache_or_run cb_fail cb_open _cbdir _cbkey _serialized seen_once url_junk_filter 2>/dev/null || true
 
@@ -3877,17 +5487,31 @@ if [ "${PROGRESS:-1}" = "1" ] && [ "${HEARTBEAT:-0}" -gt 0 ] 2>/dev/null; then
         "$(_c $'\033[1;35m')" "$(_c $'\033[0m')" "$(fmt_hms $_el)" \
         "$(_c $'\033[2m')" "$_done" "$NDOMAINS" "$(_c $'\033[0m')" >&2
     done
-  ) &
+  ) 9>&- &   # without the work-dir lock: its sleep may outlive the run by a few seconds
   HEARTBEAT_PID=$!
 fi
 # make sure the ticker never outlives the run (WORKDIR cleanup stays with the
 # keep-work-aware logic at the end of the script)
-trap '[ -n "${HEARTBEAT_PID:-}" ] && kill "$HEARTBEAT_PID" 2>/dev/null || true' EXIT INT TERM
+trap '[ -n "${HEARTBEAT_PID:-}" ] && kill "$HEARTBEAT_PID" 2>/dev/null; [ -n "${SCOPE_TMP:-}" ] && rm -rf "$SCOPE_TMP"; true' EXIT
 
 # xargs runs the per-domain worker N at a time. Invoke via 'bash' explicitly so
 # this does not depend on the script's execute bit (survives Windows round-trips).
+TODO_FILE="$DOMAINS_FILE"
+if [ "$RESUMED" = 1 ]; then
+  TODO_FILE="$WORKDIR/todo.txt"
+  while IFS= read -r _d; do
+    [ -n "$_d" ] || continue
+    [ -e "$WORKDIR/done/$(printf '%s' "$_d" | tr -c 'A-Za-z0-9.-' '_')" ] || printf '%s\n' "$_d"
+  done < "$DOMAINS_FILE" > "$TODO_FILE"
+  RESUME_DONE=$(( NDOMAINS - $(grep -c . "$TODO_FILE" || true) ))
+  ok "--resume (session $RUN_SESSIONS): $RESUME_DONE of $NDOMAINS seed(s) had finished in $WORKDIR; running the other $(grep -c . "$TODO_FILE" || true)"
+fi
+# in the background, then wait: bash runs a trap (Ctrl-C, SIGTERM) only after a foreground
+# command ends, but interrupts a wait at once, so an interrupt stops the workers right away
 # shellcheck disable=SC2016
-cat "$DOMAINS_FILE" | xargs -P "$THREADS" -I{} bash "$SELF" --__worker {} || true
+cat "$TODO_FILE" | xargs -P "$THREADS" -I{} bash "$SELF" --__worker {} &
+WORKERS_PID=$!
+wait "$WORKERS_PID" || true
 
 if [ -n "$HEARTBEAT_PID" ]; then kill "$HEARTBEAT_PID" 2>/dev/null || true; HEARTBEAT_PID=""; fi
 if [ "${PROGRESS:-1}" = "1" ]; then
@@ -3908,6 +5532,11 @@ if [ "$TLS_POSTURE" = "1" ] && [ "$TLS_CHAIN_CHECK" = "1" ] && [ -s "$WORKDIR/tl
   tls_chain_check "$WORKDIR/tlsx.jsonl"
 fi
 cat "$WORKDIR"/parts/aaaa.*.txt    2>/dev/null > "$WORKDIR/aaaa.tsv"    || : > "$WORKDIR/aaaa.tsv"
+# redirect hops (--extras) and the TLS version matrix (--tls-enum), joined by the aggregator
+HOPS_FILE="$WORKDIR/hops.jsonl"; TLSENUM_FILE="$WORKDIR/tlsenum.jsonl"
+cat "$WORKDIR"/parts/hops.*.jsonl    2>/dev/null > "$HOPS_FILE"    || : > "$HOPS_FILE"
+cat "$WORKDIR"/parts/tlsenum.*.jsonl 2>/dev/null > "$TLSENUM_FILE" || : > "$TLSENUM_FILE"
+export HOPS_FILE TLSENUM_FILE
 
 # fetch_cloud_ranges : emit "cidr<TAB>provider" for the public cloud IP-range feeds.
 fetch_cloud_ranges() {
@@ -4006,7 +5635,8 @@ ASN_CACHE_FILE="$WORKDIR/asn_cache.tsv"; : > "$ASN_CACHE_FILE"
 if [ "$USE_DB" = "1" ] && [ "$ASN" = "1" ]; then
   _psql -c "SELECT key || E'\t' || value FROM recon_cache WHERE source='asn'" > "$ASN_CACHE_FILE" 2>/dev/null || : > "$ASN_CACHE_FILE"
 fi
-export ASN_CACHE_FILE CPE_MAP_FILE
+RR_JSON="$JSON_OUT"   # --json: the CSV builder also writes <out>.urls.jsonl and <out>.services.jsonl
+export ASN_CACHE_FILE CPE_MAP_FILE RR_JSON
 python3 - "$WORKDIR/map.tsv" "$WORKDIR/httpx.jsonl" "$OUTPUT" "$ASN" "$ASN_MAX" "$WORKDIR/tlsx.jsonl" <<'PY'
 import sys, os, csv, json, subprocess, datetime, ipaddress, re
 from urllib.parse import urlparse
@@ -4264,6 +5894,24 @@ def _ms(t):
     v = float(m.group(1)); u = m.group(2) or "s"
     f = {"ns": 1e-6, "µs": 1e-3, "us": 1e-3, "ms": 1.0, "s": 1000.0, "m": 60000.0}[u]
     return str(int(round(v * f)))
+def _login_action(j):
+    # A password field on the page (httpx -er, _hx_enrich): the action of the <form> before it
+    # ("" = the page itself), or None when the page has none. httpx lists each distinct match
+    # once, in page order; a repeated identical <form> tag has the same action anyway.
+    ex = j.get("extracts")
+    items = [str(x) for v in (ex.values() if isinstance(ex, dict) else []) if isinstance(v, list) for x in v]
+    last_form = None
+    for it in items:
+        low = it.lower()
+        if low.startswith("<form"):
+            last_form = it
+        elif low.startswith("<input") and "password" in low:
+            if last_form is None:
+                return ""
+            m = re.search(r"""action\s*=\s*["']?([^"'\s>]+)""", last_form, re.I)
+            import html as _html
+            return _html.unescape(m.group(1)) if m else ""
+    return None
 def http_fields(j, url):
     h = _hdrs(j)
     scheme = url.split("://", 1)[0].lower() if "://" in url else ""
@@ -4312,6 +5960,7 @@ def http_fields(j, url):
         m = re.search(r"max-age\s*=\s*\"?(\d+)", h["strict_transport_security"], re.I)
         hsts = m.group(1) if m else "0"
     return {
+        "login_action": _login_action(j),
         "redirect_location": h.get("location", "") or str(j.get("location") or ""),
         "response_ms": _ms(j.get("time")),
         "body_sha256": sha,
@@ -4563,6 +6212,72 @@ for _in, _ur, rec in _hx_recs:          # tier 3: root record per host
             if hj:
                 host_root.setdefault(hj, rec)
 
+# --- redirect chains (B2.8): follow each row's same-host hops through the run's own records,
+# plus the hops --extras fetched (HOPS_FILE). WebInventory's rule: a hop to another host is
+# listed in the chain, not followed; final_url is the last URL that answered. Nothing here
+# sends a request.
+hop_meta, hop_norm = {}, {}
+try:
+    with open(os.environ.get("HOPS_FILE") or "/nonexistent", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            try:
+                j = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(j, dict):
+                continue
+            rec = {"status_code": first(j, "status_code", "status-code"), "title": first(j, "title")}
+            rec.update(http_fields(j, str(j.get("url") or j.get("input") or "")))
+            for v in (str(j.get("input") or ""), str(j.get("url") or "")):
+                if v:
+                    hop_meta.setdefault(v, rec)
+                    hop_norm.setdefault(urlkey(v), rec)
+except OSError:
+    pass
+from urllib.parse import urljoin as _urljoin
+REDIRECT_MAX = int(os.environ.get("REDIRECT_MAX") or 5)
+def _rec_for(u):
+    return meta.get(u) or meta_norm.get(urlkey(u)) or hop_meta.get(u) or hop_norm.get(urlkey(u))
+def follow(url, m):
+    """final_url, redirect_chain, and the record of the last URL that answered."""
+    cur_url, cur, chain, seen = url, m, [], {urlkey(url)}
+    for _ in range(REDIRECT_MAX):
+        try:
+            st = int(cur.get("status_code") or 0)
+        except (TypeError, ValueError):
+            break
+        loc = str(cur.get("redirect_location") or "").strip()
+        if st not in (301, 302, 303, 307, 308) or not loc:
+            break
+        nxt = _urljoin(cur_url, loc).split("#", 1)[0]
+        try:
+            pn, pc = urlparse(nxt), urlparse(cur_url)
+            if pn.scheme.lower() not in ("http", "https"):
+                break
+            same = (pn.hostname or "").lower() == (pc.hostname or "").lower()
+        except ValueError:
+            break
+        chain.append("%d->%s" % (st, nxt))
+        if not same or urlkey(nxt) in seen:
+            break                          # off-host (listed, not followed), or a loop
+        seen.add(urlkey(nxt))
+        n = _rec_for(nxt)
+        if not n:
+            break                          # not fetched (without --extras: not a URL the run probed)
+        cur_url, cur = nxt, n
+    return (cur_url if chain else ""), " | ".join(chain)[:1000], cur, cur_url
+def login_of(page_url, rec):
+    """(login_form, cleartext): the absolute target of the page's password form."""
+    la = rec.get("login_action") if isinstance(rec, dict) else None
+    if la is None:
+        return "", False
+    tgt = _urljoin(page_url, la) if la else page_url
+    try:
+        ts, ps = (urlparse(tgt).scheme or "").lower(), (urlparse(page_url).scheme or "").lower()
+    except ValueError:
+        ts, ps = "", ""
+    return tgt[:300], (ts == "http" or (ps == "http" and ts != "https"))
+
 # --- TLS posture (tlsx): index by host:port and host; compute hygiene flags ----
 def _truthy(v):
     if isinstance(v, bool): return v
@@ -4600,16 +6315,155 @@ def _days_until(s):
             continue
     return None
 
-def _posture(rec):
+
+# --- the leaf certificate (tlsx -cert, 1.20): key, signature algorithm, vendor defaults -----
+# A small DER reader (stdlib only): the subjectPublicKeyInfo and the signature algorithm are
+# all that is needed, and a run should not depend on python3-cryptography being installed.
+_KEY_OIDS = {"1.2.840.113549.1.1.1": "RSA", "1.2.840.113549.1.1.10": "RSA-PSS", "1.2.840.10045.2.1": "EC",
+             "1.2.840.10040.4.1": "DSA", "1.3.101.112": "Ed25519", "1.3.101.113": "Ed448"}
+_CURVES = {"1.2.840.10045.3.1.1": ("P-192", 192), "1.3.132.0.33": ("P-224", 224),
+           "1.2.840.10045.3.1.7": ("P-256", 256), "1.3.132.0.34": ("P-384", 384), "1.3.132.0.35": ("P-521", 521),
+           "1.3.36.3.3.2.8.1.1.7": ("brainpoolP256r1", 256), "1.3.36.3.3.2.8.1.1.11": ("brainpoolP384r1", 384),
+           "1.3.36.3.3.2.8.1.1.13": ("brainpoolP512r1", 512), "1.3.132.0.10": ("secp256k1", 256)}
+_SIG_OIDS = {"1.2.840.113549.1.1.2": "md2WithRSAEncryption", "1.2.840.113549.1.1.4": "md5WithRSAEncryption",
+             "1.2.840.113549.1.1.5": "sha1WithRSAEncryption", "1.2.840.113549.1.1.14": "sha224WithRSAEncryption",
+             "1.2.840.113549.1.1.11": "sha256WithRSAEncryption", "1.2.840.113549.1.1.12": "sha384WithRSAEncryption",
+             "1.2.840.113549.1.1.13": "sha512WithRSAEncryption", "1.2.840.113549.1.1.10": "rsassaPss",
+             "1.3.14.3.2.29": "sha1WithRSA", "1.2.840.10045.4.1": "ecdsa-with-SHA1",
+             "1.2.840.10045.4.3.1": "ecdsa-with-SHA224", "1.2.840.10045.4.3.2": "ecdsa-with-SHA256",
+             "1.2.840.10045.4.3.3": "ecdsa-with-SHA384", "1.2.840.10045.4.3.4": "ecdsa-with-SHA512",
+             "1.2.840.10040.4.3": "dsa-with-sha1", "2.16.840.1.101.3.4.3.1": "dsa-with-sha224",
+             "2.16.840.1.101.3.4.3.2": "dsa-with-sha256", "1.3.101.112": "Ed25519", "1.3.101.113": "Ed448"}
+def _tlv(d, i):
+    t = d[i]; ln = d[i + 1]; i += 2
+    if ln & 0x80:
+        n = ln & 0x7F
+        ln = int.from_bytes(d[i:i + n], "big"); i += n
+    if i + ln > len(d):
+        raise ValueError("truncated")
+    return t, i, i + ln
+def _kids(d, s, e):
+    out = []
+    while s < e:
+        t, vs, ve = _tlv(d, s); out.append((t, vs, ve)); s = ve
+    return out
+def _oid(b):
+    if not b:
+        return ""
+    parts = [min(b[0] // 40, 2), b[0] - 40 * min(b[0] // 40, 2)]
+    v = 0
+    for x in b[1:]:
+        v = (v << 7) | (x & 0x7F)
+        if not x & 0x80:
+            parts.append(v); v = 0
+    return ".".join(str(p) for p in parts)
+def _int_bits(d, vs, ve):
+    return int.from_bytes(d[vs:ve], "big").bit_length()
+def _cert_info(pem):
+    """(cert_key, key_type, key_bits, cert_sig_alg) of a PEM certificate; blanks on any error."""
+    try:
+        import base64
+        m = re.search(r"-----BEGIN CERTIFICATE-----(.+?)-----END CERTIFICATE-----", pem or "", re.S)
+        if not m:
+            return "", "", 0, ""
+        d = base64.b64decode("".join(m.group(1).split()))
+        _, cs, ce = _tlv(d, 0)
+        cert = _kids(d, cs, ce)                          # tbsCertificate, signatureAlgorithm, signature
+        tbs = _kids(d, cert[0][1], cert[0][2])
+        i = 1 if tbs[0][0] == 0xA0 else 0                # [0] version
+        spki = _kids(d, tbs[i + 5][1], tbs[i + 5][2])    # serial, sig, issuer, validity, subject, SPKI
+        alg = _kids(d, spki[0][1], spki[0][2])
+        ko = _oid(d[alg[0][1]:alg[0][2]])
+        ktype = _KEY_OIDS.get(ko, ko)
+        bits, label = 0, ""
+        if ktype in ("RSA", "RSA-PSS"):
+            _, ps, pe = spki[1]                          # BIT STRING: unused-bits byte, RSAPublicKey
+            rk = _kids(d, ps + 1, pe)
+            rk = _kids(d, rk[0][1], rk[0][2])
+            bits = _int_bits(d, rk[0][1], rk[0][2])
+        elif ktype == "EC" and len(alg) > 1 and alg[1][0] == 0x06:
+            label, bits = _CURVES.get(_oid(d[alg[1][1]:alg[1][2]]), (_oid(d[alg[1][1]:alg[1][2]]), 0))
+        elif ktype == "DSA" and len(alg) > 1 and alg[1][0] == 0x30:
+            pqg = _kids(d, alg[1][1], alg[1][2])
+            bits = _int_bits(d, pqg[0][1], pqg[0][2])
+        elif ktype == "Ed25519":
+            bits = 256
+        elif ktype == "Ed448":
+            bits = 456
+        sa = _kids(d, cert[1][1], cert[1][2])
+        so = _oid(d[sa[0][1]:sa[0][2]])
+        key = "%s %s" % (ktype, label or bits) if (label or bits) and not ktype.startswith("Ed") else ktype
+        return key, ktype, bits, _SIG_OIDS.get(so, so)
+    except Exception:
+        return "", "", 0, ""
+def _weak_key(ktype, bits):
+    if not bits:
+        return False
+    if ktype in ("RSA", "RSA-PSS", "DSA"):
+        return bits < 2048
+    return ktype == "EC" and bits < 224
+# WeakSig: MD2, MD5 or SHA-1 (WebInventory's rule: sha1|md5|md2)
+_WEAK_SIG = re.compile(r"sha1|md5|md2", re.I)
+# DefaultCert: a vendor's or OpenSSL's placeholder certificate, still in place. WebInventory's
+# rules (builtin-rules.json) plus the ingress-nginx and Traefik defaults.
+_DEFAULT_SUBJECT = re.compile(r"CN=SplunkServerDefaultCert|O=SplunkUser|O=Nessus Users United|"
+                              r"pfSense webConfigurator Self-Signed|O=Internet Widgits Pty Ltd|"
+                              r"O=SomeOrganization|OU=SomeOrganizationalUnit|"
+                              r"Kubernetes Ingress Controller Fake Certificate|TRAEFIK DEFAULT CERT", re.I)
+_DEFAULT_ISSUER = re.compile(r"OU=VMware Engineering|O=VMware Installer", re.I)
+def _dn(rec, kind):
+    dn = first(rec, kind + "_dn")
+    if dn:
+        return str(dn)
+    org = first(rec, kind + "_org")
+    if isinstance(org, list):
+        org = ", ".join("O=" + str(o) for o in org)
+    elif org:
+        org = "O=" + str(org)
+    cn = first(rec, kind + "_cn")
+    return ", ".join(x for x in (("CN=" + str(cn)) if cn else "", org or "") if x)
+def _not_yet_valid(nb):
+    if not nb:
+        return False
+    try:
+        dt = datetime.datetime.fromisoformat(str(nb).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt > datetime.datetime.now(datetime.timezone.utc)
+    except Exception:
+        return False
+
+# --- the TLS version matrix (--tls-enum, tls_enum_probe), by host:port and host -------------
+tlsenum_by_hp, tlsenum_by_host = {}, {}
+try:
+    with open(os.environ.get("TLSENUM_FILE") or "/nonexistent", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            try:
+                j = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(j, dict) and j.get("host"):
+                h = str(j["host"]).lower()
+                tlsenum_by_hp.setdefault(h + ":" + str(j.get("port") or 443), j)
+                tlsenum_by_host.setdefault(h, j)
+except OSError:
+    pass
+_PLAN_ORDER = ("TLS 1.3", "TLS 1.2", "TLS 1.1", "TLS 1.0", "SSL 3.0")
+
+def _posture(rec, en=None):
+    # en: the --tls-enum record for the same host:port (tls_enum_probe), or None
+    en = en if isinstance(en, dict) else {}
     neg_ver = first(rec, "tls_version", "version")
     cipher  = first(rec, "cipher", "cipher_suite")
     not_after = first(rec, "not_after", "notafter")
+    not_before = first(rec, "not_before", "notbefore")
     issuer = first(rec, "issuer_org", "issuer_cn", "issuer_dn")
     if isinstance(issuer, list): issuer = issuer[0] if issuer else ""
     flags = []
     venum = first(rec, "version_enum", "versions_enum", "tls_version_enum", default=[])
     if isinstance(venum, str): venum = [venum]
-    if any(_weak_version(v) for v in ([neg_ver] + list(venum))):
+    supported = [v for v in (en.get("tls_supported") or []) if v in _PLAN_ORDER]
+    if any(_weak_version(v) for v in ([neg_ver] + list(venum) + supported)):
         flags.append("WeakTLS")
     ciphers = []
     cenum = first(rec, "cipher_enum", "ciphers_enum", default=[])
@@ -4617,27 +6471,42 @@ def _posture(rec):
         for e in cenum:
             if isinstance(e, dict):
                 cs = e.get("ciphers") or e.get("cipher_list") or []
+                if isinstance(cs, dict):          # tlsx 1.4: {"weak": [...], "secure": [...]}
+                    cs = [c for v in cs.values() if isinstance(v, list) for c in v]
                 ciphers += cs if isinstance(cs, list) else [cs]
             elif isinstance(e, str):
                 ciphers.append(e)
     if cipher: ciphers.append(cipher)
-    weak_ciphers = sorted({c for c in ciphers if c and _weak_cipher(c)})
-    if weak_ciphers: flags.append("WeakCipher")
-    if _truthy(rec.get("expired")):
+    weak_ciphers = sorted({c for c in ciphers if isinstance(c, str) and c and _weak_cipher(c)})
+    weak_enum = str(en.get("tls_weak_cipher") or "")
+    if weak_ciphers or weak_enum: flags.append("WeakCipher")
+    key, ktype, kbits, sig = _cert_info(str(rec.get("certificate") or ""))
+    if _weak_key(ktype, kbits):            flags.append("WeakKey")
+    if sig and _WEAK_SIG.search(sig):      flags.append("WeakSig")
+    d = _days_until(not_after) if not_after else None
+    if _truthy(rec.get("expired")) or (d is not None and d < 0):
         flags.append("CertExpired")
-    elif not_after:
-        d = _days_until(not_after)
-        if d is not None and 0 <= d <= int(os.environ.get("CERT_WARN_DAYS") or 30): flags.append("CertExpiring")
+    elif _not_yet_valid(not_before):
+        flags.append("CertNotYetValid")
+    elif d is not None and 0 <= d <= int(os.environ.get("CERT_WARN_DAYS") or 30):
+        flags.append("CertExpiring")
     if _truthy(rec.get("self_signed")):   flags.append("SelfSigned")
+    if _DEFAULT_SUBJECT.search(_dn(rec, "subject")) or _DEFAULT_ISSUER.search(_dn(rec, "issuer")):
+        flags.append("DefaultCert")
     if _truthy(rec.get("mismatched")):    flags.append("CertNameMismatch")
     if _truthy(rec.get("untrusted")):     flags.append("CertUntrusted")
     if _truthy(rec.get("revoked")):       flags.append("CertRevoked")
     if _truthy(rec.get("wildcard_certificate")) or _truthy(rec.get("wildcard_cert")):
         flags.append("Wildcard")
+    bycv = en.get("tls_ciphers") if isinstance(en.get("tls_ciphers"), dict) else {}
     return {"tls_version": _tls_label(neg_ver),
             "tls_cipher": cipher or (";".join(weak_ciphers) if weak_ciphers else ""),
             "cert_not_after": not_after or "", "cert_issuer": issuer or "",
-            "tls_flags": ";".join(flags)}
+            "tls_flags": ";".join(flags),
+            "tls_supported": ";".join(supported),
+            "tls_ciphers": ";".join("%s=%s" % (v, bycv[v]) for v in _PLAN_ORDER if v in bycv),
+            "tls_weak_cipher": weak_enum,
+            "cert_key": key, "cert_sig_alg": sig, "cert_not_before": str(not_before or "")}
 
 tls_by_hp, tls_by_host = {}, {}
 if tlsx_path:
@@ -4653,7 +6522,7 @@ if tlsx_path:
                 if not isinstance(j, dict): continue
                 h = (j.get("host") or "").lower()
                 p = str(j.get("port") or "")
-                pv = _posture(j)
+                pv = _posture(j, tlsenum_by_hp.get(h + ":" + p) or (None if p else tlsenum_by_host.get(h)))
                 if h and p: tls_by_hp.setdefault(h + ":" + p, pv)
                 if h:       tls_by_host.setdefault(h, pv)
     except FileNotFoundError:
@@ -4708,6 +6577,15 @@ try:
                     tls = tls_by_hp.get(hh + ":" + str(pr.port or 443)) or tls_by_host.get(hh) or {}
             except Exception:
                 tls = {}
+            # redirect chain (B2.8) and the login form of the page it ends on
+            final_url, chain, fin, fin_url = follow(url, m) if m else ("", "", {}, url)
+            login_form, cleartext = login_of(fin_url, fin)
+            auth = m.get("auth", "")
+            hflags = [f for f in (m.get("http_flags", "") or "").split(";") if f]
+            if login_form and "Form" not in auth.split(";"):
+                auth = (auth + ";Form") if auth else "Form"
+            if cleartext and "CleartextAuth" not in hflags:
+                hflags.append("CleartextAuth")
             rows.append([
                 seed, url, host, sources,
                 m.get("status_code", ""),
@@ -4726,37 +6604,99 @@ try:
                 build_cpes(m.get("technologies", ""), m.get("webserver", "")),  # cpe (FPV-06)
                 # HTTP columns (1.19), appended so existing consumers keep their positions
                 m.get("redirect_location", ""), m.get("response_ms", ""), m.get("body_sha256", ""),
-                m.get("content_type", ""), m.get("powered_by", ""), m.get("auth", ""),
+                m.get("content_type", ""), m.get("powered_by", ""), auth,
                 m.get("cookies", ""), m.get("cookie_issues", ""), m.get("missing_sec_headers", ""),
-                m.get("hsts_max_age", ""), m.get("alt_svc", ""), m.get("http_flags", ""),
+                m.get("hsts_max_age", ""), m.get("alt_svc", ""), ";".join(hflags),
                 _favhash.get(host.lower(), ["", "", ""])[0], _favhash.get(host.lower(), ["", "", ""])[1],
                 lookup_ptr(ip),
                 _hostinfo.get(host.lower(), ["", ""])[0], _hostinfo.get(host.lower(), ["", ""])[1],
+                # 1.20 (appended): redirect chain and login form; TLS version matrix; leaf certificate
+                final_url, chain, login_form,
+                tls.get("tls_supported", ""), tls.get("tls_ciphers", ""), tls.get("tls_weak_cipher", ""),
+                tls.get("cert_key", ""), tls.get("cert_sig_alg", ""), tls.get("cert_not_before", ""),
             ])
 except FileNotFoundError:
     pass
 
 rows.sort(key=lambda r: (r[0], r[1]))
+CSV_HEADER = ["seed_domain", "url", "host", "sources",
+              "status_code", "content_length", "webserver", "title", "technologies",
+              "ip", "asn", "asn_org",
+              "tls_version", "tls_cipher", "cert_not_after", "cert_issuer", "tls_flags",
+              "ipv6", "cloud", "rdap_org", "geo", "cpe",
+              "redirect_location", "response_ms", "body_sha256", "content_type", "powered_by",
+              "auth", "cookies", "cookie_issues", "missing_sec_headers", "hsts_max_age",
+              "alt_svc", "http_flags", "favicon_mmh3", "favicon_md5", "ptr", "robots", "security_txt",
+              "final_url", "redirect_chain", "login_form",
+              "tls_supported", "tls_ciphers", "tls_weak_cipher", "cert_key", "cert_sig_alg", "cert_not_before"]
+# --json: the same rows as JSON lines (<out>.urls.jsonl), before the formula guard below,
+# plus one record per service (<out>.services.jsonl): scheme://host[:port] under a seed,
+# with its root URL's values (else its smallest URL's), the rule recon-db.sh diff uses.
+if os.environ.get("RR_JSON") == "1":
+    def _cell(v):
+        return "" if v is None else (v if isinstance(v, str) else str(v))
+    def _svc(u):
+        m = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*)://([^/?#]*)(.*)$", (u or "").strip())
+        if not m:
+            return None
+        sch, au, rest = m.group(1).lower(), m.group(2).rsplit("@", 1)[-1].lower(), m.group(3)
+        h, pt = au, ""
+        if au.startswith("["):
+            h, _, pp = au.partition("]")
+            h, pt = h + "]", pp.lstrip(":")
+        elif au.count(":") == 1:
+            h, pt = au.split(":")
+        dflt = {"https": 443, "http": 80}.get(sch)
+        if pt and not pt.isdigit():
+            return None
+        port = int(pt) if pt else dflt
+        if port is None or not 0 <= port <= 65535:
+            return None
+        name = "%s://%s%s" % (sch, h, "" if port == dflt else ":%d" % port)
+        return name, sch, h.strip("[]"), port, (re.split(r"[?#]", rest, maxsplit=1)[0] or "/")
+    _svcs = {}
+    def _jl(path, recs):
+        with open(path + ".tmp", "w", encoding="utf-8", errors="replace") as fj:
+            for o in recs:
+                fj.write(json.dumps(o, ensure_ascii=False, separators=(",", ":")) + "\n")
+        os.replace(path + ".tmp", path)
+    _urecs = []
+    for r in rows:
+        o = dict(zip(CSV_HEADER, (_cell(c) for c in r)))
+        _urecs.append(o)
+        sv = _svc(o["url"])
+        if sv:
+            key, rank = ((o["seed_domain"] or "").strip().lower(), sv[0]), (0 if sv[4] == "/" else 1, o["url"])
+            b = _svcs.get(key)
+            if b is None:
+                _svcs[key] = [rank, o, sv, 1]
+            else:
+                b[3] += 1
+                if rank < b[0]:
+                    b[0], b[1], b[2] = rank, o, sv
+    _jl(out_path + ".urls.jsonl", _urecs)
+    _srecs = []
+    for key in sorted(_svcs):
+        rank, o, sv, n = _svcs[key]
+        rec = {"seed_domain": o["seed_domain"], "service": sv[0], "scheme": sv[1], "host": o["host"],
+               "port": sv[3], "url_count": n}
+        rec.update((k, v) for k, v in o.items() if k not in rec)
+        _srecs.append(rec)
+    _jl(out_path + ".services.jsonl", _srecs)
 # FPV-01: titles, headers, org names and certificate issuers come from the scanned site
 # or third parties; a cell starting with = + - @ (or tab/CR) is a live formula in Excel.
 # Those text cells get a leading apostrophe; generate-report.sh and recon-db.sh import
 # strip it again. Numeric and fixed-format columns are left alone.
 _GUARD_COLS = {0, 1, 2, 3, 6, 7, 8, 11, 13, 15, 18, 19, 20, 21,
-               22, 25, 26, 27, 28, 29, 30, 32, 33, 36, 37, 38}   # 1.19 text columns (not the numbers/hashes)
+               22, 25, 26, 27, 28, 29, 30, 32, 33, 36, 37, 38,   # 1.19 text columns (not the numbers/hashes)
+               39, 40, 41}                                       # 1.20: final_url, redirect_chain, login_form
 def _csv_safe(v):
     v = "" if v is None else str(v)
     return ("'" + v) if v[:1] in ("=", "+", "-", "@", "\t", "\r") else v
 rows = [[(_csv_safe(c) if i in _GUARD_COLS else c) for i, c in enumerate(r)] for r in rows]
 with open(out_path, "w", newline="", encoding="utf-8") as fo:
     w = csv.writer(fo)
-    w.writerow(["seed_domain", "url", "host", "sources",
-                "status_code", "content_length", "webserver", "title", "technologies",
-                "ip", "asn", "asn_org",
-                "tls_version", "tls_cipher", "cert_not_after", "cert_issuer", "tls_flags",
-                "ipv6", "cloud", "rdap_org", "geo", "cpe",
-                "redirect_location", "response_ms", "body_sha256", "content_type", "powered_by",
-                "auth", "cookies", "cookie_issues", "missing_sec_headers", "hsts_max_age",
-                "alt_svc", "http_flags", "favicon_mmh3", "favicon_md5", "ptr", "robots", "security_txt"])
+    w.writerow(CSV_HEADER)
     w.writerows(rows)
 
 live = sum(1 for r in rows if str(r[4]).startswith(("2", "3", "401", "403")))
@@ -4842,6 +6782,39 @@ for kind in takeover origin extras favicon nuclei params secrets buckets cms act
     fi
   fi
 done
+# --scope: the seeds checked and everything held back (not contacted) -> <out>.scope.txt
+if [ "$SCOPE_ON" = 1 ] && [ -n "$SCOPE_DIR" ] && [ -d "$SCOPE_DIR" ]; then
+  python3 - "$SCOPE_DIR" "$WORKDIR" "$OUTPUT.scope.txt" <<'PYSCOUT' 2>/dev/null || warn " could not write $OUTPUT.scope.txt"
+import sys, os, json, glob
+sd, wd, out = sys.argv[1:4]
+s = json.load(open(os.path.join(sd, "summary.json")))
+lines = ["[scope] scope-file [info] file=%s sha256=%s entries=%d names=%d ranges=%d asns=%d exclusions=%d"
+         % (s["file"], s["sha256"], s["entries"], s["allow_names"], s["allow_ranges"], s["asns"],
+            s["deny_names"] + s["deny_ranges"] + s["deny_asns"])]
+for l in open(os.path.join(sd, "plan.tsv"), encoding="utf-8", errors="replace"):
+    f = l.rstrip("\n").split("\t")
+    if len(f) < 5:
+        continue
+    if f[3] == "in":
+        lines.append("[scope] seed-in-scope [info] seed=%s kind=%s line=%s entry=%s" % (f[1], f[2], f[0], f[4].replace(" ", "_")))
+    else:
+        lines.append("[scope] seed-skipped [info] seed=%s line=%s status=%s note=%s" % (f[1].replace(" ", "_"), f[0], f[3], f[4]))
+held = set()
+for p in sorted(glob.glob(os.path.join(wd, "parts", "scopeskip.*.tsv"))):
+    for l in open(p, encoding="utf-8", errors="replace"):
+        f = l.rstrip("\n").split("\t")
+        if len(f) >= 5:
+            held.add(tuple(f[:5]))
+for seed, kind, target, extra, why in sorted(held):
+    lines.append("[%s] scope-held-back [info] kind=%s target=%s%s note=not contacted: %s"
+                 % (seed, kind, target, (" " + extra) if extra else "", why))
+open(out, "w").write("".join(x + "\n" for x in lines))
+PYSCOUT
+  if [ -s "$OUTPUT.scope.txt" ]; then
+    _sh="$(grep -c ' scope-held-back ' "$OUTPUT.scope.txt" || true)"
+    ok " scope           : $OUTPUT.scope.txt (${_sh:-0} target(s) held back, not contacted)"
+  fi
+fi
 # edge / origin attributes from --origin (one row per live host)
 if ls "$WORKDIR"/parts/edge.*.tsv >/dev/null 2>&1; then
   { printf 'seed_domain\thost\tedge\torigin_software\tedge_evidence\tjarm\tcdn\tfavicon_mmh3\ttitle\tedge_ip\n'
@@ -4855,6 +6828,25 @@ if [ "$ZONE_EXPOSURE" = "1" ]; then
   if [ -s "$WORKDIR/zone_names.txt" ]; then
     { printf 'zone\tname\tsource\n'; cat "$WORKDIR/zone_names.txt"; } > "$OUTPUT.zone-names.txt"
     ok " zone names      : $OUTPUT.zone-names.txt ($(grep -c . "$WORKDIR/zone_names.txt") name(s))"
+  fi
+fi
+# email/DNS posture and TLD variants (main-process stages)
+if [ "$DNS_POSTURE" = "1" ]; then
+  if [ -s "$WORKDIR/parts/dnsposture.all.txt" ]; then
+    cp "$WORKDIR/parts/dnsposture.all.txt" "$OUTPUT.dnsposture.txt"
+    ok " email/DNS       : $OUTPUT.dnsposture.txt ($(grep -c . "$OUTPUT.dnsposture.txt") finding(s))"
+  fi
+  if [ -s "$WORKDIR/dnsposture.tsv" ]; then
+    cp "$WORKDIR/dnsposture.tsv" "$OUTPUT.dnsposture.tsv"
+    ok " email/DNS names : $OUTPUT.dnsposture.tsv ($(( $(wc -l < "$OUTPUT.dnsposture.tsv") - 1 )) name(s) checked)"
+  fi
+fi
+if [ "$TLD_VARIANTS" = "1" ]; then
+  if [ -s "$WORKDIR/parts/tld-variants.all.txt" ]; then
+    cp "$WORKDIR/parts/tld-variants.all.txt" "$OUTPUT.tld-variants.txt"
+    ok " TLD variants    : $OUTPUT.tld-variants.txt ($(grep -c . "$OUTPUT.tld-variants.txt") name(s), listed only)"
+  else
+    ok " TLD variants    : none found"
   fi
 fi
 # CNAME inventory from --takeover (every candidate with a CNAME, dangling or not)
@@ -4941,6 +6933,147 @@ PYSSM
   fi
 fi
 
+# --- cloud inventory diff (cloudlist): your accounts vs what the scan found ----------
+if [ "$CLOUDLIST" = "1" ]; then
+  log "cloudlist: listing the assets of the accounts in $CLOUDLIST_CONFIG"
+  _to "$SCAN_TIMEOUT" cloudlist -pc "$CLOUDLIST_CONFIG" -json -silent -duc < /dev/null > "$WORKDIR/cloudlist.jsonl" 2>>"$WORKDIR/cloudlist.err" || true
+  if [ ! -s "$WORKDIR/cloudlist.jsonl" ]; then
+    warn " cloudlist listed no assets (check the provider config and credentials; see $WORKDIR/cloudlist.err)."
+  else
+    python3 - "$WORKDIR/cloudlist.jsonl" "$OUTPUT" "$DOMAINS_FILE" "$OUTPUT.cloud.txt" "$OUTPUT.cloud-assets.tsv" <<'PYCLOUD' 2>>"$WORKDIR/cloudlist.err" || warn " cloud inventory diff failed (see $WORKDIR/cloudlist.err)"
+import sys, json, csv, ipaddress, re
+cl_f, csv_f, seeds_f, out_f, tsv_f = sys.argv[1:6]
+seeds = sorted(set(l.strip().lower().rstrip(".") for l in open(seeds_f) if l.strip()))
+def in_scope(n):
+    return any(n == s or n.endswith("." + s) for s in seeds)
+def addr(v):
+    try:
+        return ipaddress.ip_address(str(v).strip())
+    except ValueError:
+        return None
+INTERNAL = [ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10",
+                                              "169.254.0.0/16", "fc00::/7", "fe80::/10")]
+def internal(ip):
+    return any(ip in n for n in INTERNAL if ip.version == n.version)
+# the scan's inventory: hosts and their addresses (ip and ipv6 columns), the cloud column
+hosts, ips, cloud_of = set(), {}, {}
+with open(csv_f, newline="", encoding="utf-8", errors="replace") as fh:
+    for r in csv.DictReader(fh):
+        h = (r.get("host") or "").lower()
+        if not h:
+            continue
+        hosts.add(h)
+        for col in ("ip", "ipv6"):
+            for v in re.split(r"[;, ]+", r.get(col) or ""):
+                a = addr(v)
+                if a:
+                    ips.setdefault(a, set()).add(h)
+                    if r.get("cloud"):
+                        cloud_of[a] = r["cloud"]
+assets, cl_ips, cl_names = [], set(), set()
+for line in open(cl_f, encoding="utf-8", errors="replace"):
+    try:
+        j = json.loads(line)
+    except Exception:
+        continue
+    if not isinstance(j, dict):
+        continue
+    names = [str(j[k]).lower().rstrip(".") for k in ("dns_name", "hostname", "host") if j.get(k)]
+    addrs = [a for a in (addr(v) for k, v in j.items() if "ip" in k.lower() and isinstance(v, str)) if a]
+    for n in names:
+        cl_names.add(n)
+    for a in addrs:
+        cl_ips.add(a)
+    assets.append((str(j.get("provider", "")), str(j.get("id", "")), str(j.get("service", "")), names, addrs))
+lines, rows = [], []
+for prov, acct, svc, names, addrs in assets:
+    seen_n = [n for n in names if n in hosts]
+    seen_a = [a for a in addrs if a in ips]
+    seen = bool(seen_n or seen_a)
+    pub = [a for a in addrs if not internal(a)]
+    rows.append("\t".join([prov, acct, svc, ";".join(names), ";".join(map(str, addrs)), "yes" if seen else "no"]))
+    if seen or (not names and not pub):
+        continue            # found by the scan, or internal-only (not expected on the internet)
+    for n in names:
+        lines.append("[cloud] cloud-asset-unseen [info] host=%s provider=%s account=%s service=%s scope=%s note=an asset of "
+                     "your cloud account that the scan did not find: not reachable from the internet, or a gap in "
+                     "discovery (add it as a seed if it should be covered)" % (n, prov, acct or "-", svc or "-",
+                                                                               "in" if in_scope(n) else "outside-seeds"))
+    if not names:
+        for a in pub:
+            lines.append("[cloud] cloud-asset-unseen [info] host=%s provider=%s account=%s service=%s note=an address of your "
+                         "cloud account that the scan did not find" % (a, prov, acct or "-", svc or "-"))
+# the other way: addresses the scan found in a cloud provider's ranges that no listed account owns
+for a, c in sorted(cloud_of.items(), key=lambda x: str(x[0])):
+    if a not in cl_ips:
+        hs = sorted(ips.get(a, ()))
+        lines.append("[cloud] cloud-ip-unaccounted [low] host=%s ip=%s cloud=%s note=serves your names from %s, but no account "
+                     "in the cloudlist config owns it: a CDN or SaaS front, a third party, or an account missing from the "
+                     "inventory" % (hs[0] if hs else a, a, c.replace(" ", "_"), c))
+open(out_f, "w").write("".join(l + "\n" for l in lines))
+open(tsv_f, "w").write("provider\taccount\tservice\tnames\taddresses\tseen_in_scan\n" + "".join(r + "\n" for r in rows))
+PYCLOUD
+    [ -s "$OUTPUT.cloud.txt" ] || rm -f "$OUTPUT.cloud.txt"
+    ok " cloud inventory : $OUTPUT.cloud-assets.tsv ($(( $(wc -l < "$OUTPUT.cloud-assets.tsv") - 1 )) asset(s))$([ -s "$OUTPUT.cloud.txt" ] && echo "; $(grep -c . "$OUTPUT.cloud.txt") finding(s) in $OUTPUT.cloud.txt")"
+  fi
+fi
+
+# --- product advisories (vulnx): CVEs filed against each product seen --------------
+if [ "$VULNX" = "1" ]; then
+  log "vulnx: product advisories for the CPEs in the inventory"
+  python3 - "$OUTPUT" "$OUTPUT.vulnx.txt" "$OUTPUT.vulnx.tsv" "$VULNX_LIMIT" "$VULNX_MAX_PRODUCTS" "$PROXY" <<'PYVULNX' 2>>"$WORKDIR/vulnx.err" || warn " vulnx lookups failed (see $WORKDIR/vulnx.err)"
+import sys, csv, json, subprocess, re
+csv_f, out_f, tsv_f, limit, maxp, proxy = sys.argv[1:7]
+prods = {}
+with open(csv_f, newline="", encoding="utf-8", errors="replace") as fh:
+    for r in csv.DictReader(fh):
+        for c in (r.get("cpe") or "").split(";"):
+            f = c.strip().split(":")
+            if len(f) > 5 and f[0] == "cpe" and re.fullmatch(r"[A-Za-z0-9_.+-]+", f[3] + f[4]):
+                d = prods.setdefault((f[3].lower(), f[4].lower()), {"versions": set(), "hosts": set()})
+                if f[5] not in ("", "*", "-"):
+                    d["versions"].add(f[5])
+                if r.get("host"):
+                    d["hosts"].add(r["host"].lower())
+lines, rows = [], []
+for (vendor, product), d in sorted(prods.items(), key=lambda x: (-len(x[1]["hosts"]), x[0]))[:int(maxp)]:
+    q = "affected_products.vendor:%s && affected_products.product:%s" % (vendor, product)
+    args = ["vulnx", "search", "--json", "--silent", "--disable-update-check", "--no-color", "-n", str(limit),
+            "--sort-desc", "epss_score", "--fields", "cve_id,cvss_score,epss_score,is_kev,is_poc,is_template,severity", q]
+    if proxy:
+        args[2:2] = ["--proxy", proxy]
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=90, stdin=subprocess.DEVNULL)
+        j = json.loads(p.stdout or "{}")
+    except Exception as e:
+        sys.stderr.write("vulnx %s:%s: %s\n" % (vendor, product, e))
+        continue
+    res = j.get("results") or []
+    total = j.get("total") or j.get("count") or len(res)
+    kev = ((((j.get("facets") or {}).get("is_kev") or {}).get("buckets") or {}).get("true")) or sum(1 for x in res if x.get("is_kev"))
+    vers = ",".join(sorted(d["versions"])) or "unknown"
+    hs = sorted(d["hosts"])
+    for x in res:
+        rows.append("\t".join([vendor, product, vers, str(len(hs)), str(x.get("cve_id", "")), str(x.get("cvss_score", "")),
+                               str(x.get("epss_score", "")), "yes" if x.get("is_kev") else "no",
+                               "yes" if x.get("is_poc") else "no", "yes" if x.get("is_template") else "no"]))
+    if not total:
+        continue
+    top = ",".join("%s(%s)" % (x.get("cve_id"), ";".join(filter(None, ["kev" if x.get("is_kev") else "",
+                   "epss=%.2f" % x["epss_score"] if isinstance(x.get("epss_score"), (int, float)) else ""])))
+                   for x in res[:5])
+    lines.append("[vulnx] product-advisories [info] host=%s product=%s:%s versions=%s hosts=%d cves=%s kev=%s top=%s "
+                 "note=CVEs filed against the product, any version: check which apply to the version you run"
+                 % (hs[0] if hs else "-", vendor, product, vers, len(hs), total, kev, top or "-"))
+open(out_f, "w").write("".join(l + "\n" for l in lines))
+open(tsv_f, "w").write("vendor\tproduct\tversions_seen\thosts\tcve\tcvss\tepss\tkev\tpoc\tnuclei_template\n" + "".join(r + "\n" for r in rows))
+PYVULNX
+  [ -s "$OUTPUT.vulnx.txt" ] || rm -f "$OUTPUT.vulnx.txt"
+  [ "$(wc -l < "$OUTPUT.vulnx.tsv" 2>/dev/null || echo 0)" -gt 1 ] || rm -f "$OUTPUT.vulnx.tsv"
+  if [ -s "$OUTPUT.vulnx.txt" ]; then ok " vulnx           : $OUTPUT.vulnx.txt ($(grep -c . "$OUTPUT.vulnx.txt") product(s) with CVEs)"
+  else ok " vulnx           : no product with filed CVEs (or no CPEs: run with --enrich/--tls for versions)"; fi
+fi
+
 # --- monitoring: diff discovered URLs against a prior CSV -------------------
 if [ "$MONITOR" = "1" ]; then
   PREV="$MONITOR_PREV"
@@ -4958,9 +7091,30 @@ if [ "$MONITOR" = "1" ]; then
     comm -13 <(tail -n +2 "$PREV" 2>/dev/null | cut -d, -f2 | sort -u) \
              <(tail -n +2 "$OUTPUT" 2>/dev/null | cut -d, -f2 | sort -u) > "$NEWASSETS" 2>/dev/null || : > "$NEWASSETS"
     NN="$(wc -l < "$NEWASSETS" | tr -d ' ')"
+    # field by field, per service (recon-db.sh diff): <out>.delta.tsv
+    _dline=""
+    if [ "$RECON_DB_LIB_LOADED" = 1 ] && declare -F db_diff >/dev/null; then
+      if db_diff "$PREV" "$OUTPUT" -o "$OUTPUT.delta.tsv" --new-seeds "$DOMAINS_FILE" 2>"$WORKDIR/delta.err"; then
+        IFS=$'\t' read -r _dn _dr _dc _df _dso _dsn <<< "${DIFF_SUMMARY:-}"
+        _dline="$_dn new, $_dr removed, $_dc changed service(s) ($_df field change(s))"
+        ok " Changes         : $_dline vs $(basename "$PREV") -> $OUTPUT.delta.tsv"
+        [ "${_dso:--}" != - ] && warn " --monitor: seed(s) only in $(basename "$PREV") were not compared: $_dso"
+      else
+        warn " --monitor: the field-by-field comparison failed (see $WORKDIR/delta.err)"
+      fi
+    else
+      warn " --monitor: recon-db.sh not found next to run-recon; no field-by-field comparison (<out>.delta.tsv)"
+    fi
     if [ "$NN" -gt 0 ]; then
       ok " Monitoring      : $NN new asset(s) vs $(basename "$PREV") -> $NEWASSETS"
-      if [ "$NOTIFY" = "1" ] && have notify; then notify -silent < "$NEWASSETS" 2>/dev/null || true; fi
+      if [ "$NOTIFY" = "1" ] && have notify; then
+        # one message per run (-bulk), to the providers in NOTIFY_CONFIG when set
+        _nf=(-silent -bulk); [ -n "$NOTIFY_CONFIG" ] && _nf+=(-pc "$NOTIFY_CONFIG"); [ -n "$PROXY" ] && _nf+=(-proxy "$PROXY")
+        { printf 'run-recon: %s new asset(s) vs %s\n' "$NN" "$(basename "$PREV")"
+          [ -n "$_dline" ] && printf 'services: %s (see %s)\n' "$_dline" "$(basename "$OUTPUT").delta.tsv"
+          cat "$NEWASSETS"; } \
+          | _to 60 notify "${_nf[@]}" >/dev/null 2>>"$WORKDIR/notify.err" || warn " --notify: notify failed (see $WORKDIR/notify.err)"
+      fi
     else
       rm -f "$NEWASSETS"; ok " Monitoring      : no new assets vs $(basename "$PREV")."
     fi
@@ -4971,7 +7125,7 @@ fi
 
 # --- persist this run's host inventory into the DB (for later reference) ----
 if [ "$USE_DB" = "1" ]; then
-  if db_load_csv "$OUTPUT" "$TS"; then
+  if db_load_csv "$OUTPUT" "$TS" "$DOMAINS_FILE"; then
     ok " DB store        : loaded $RES_ROWS host row(s) into recon_hosts (run_ts=$TS)."
   else
     warn " DB store: could not load the CSV into recon_hosts (continuing)."
@@ -4986,10 +7140,12 @@ RUN_T1="$(date +%s 2>/dev/null || echo 0)"
 cat "$WORKDIR"/parts/seedstat.*.tsv 2>/dev/null > "$WORKDIR/seedstat.tsv" || : > "$WORKDIR/seedstat.tsv"
 RUN_RESOLVERS_N=0; [ -n "$RESOLVERS" ] && [ -s "$RESOLVERS" ] && RUN_RESOLVERS_N="$(grep -cvE '^\s*(#|$)' "$RESOLVERS" || true)"
 if [ "${#RUN_ARGS[@]}" -gt 0 ]; then printf '%s\0' "${RUN_ARGS[@]}" > "$WORKDIR/run_args.bin"; else : > "$WORKDIR/run_args.bin"; fi
-RR_VERSION="$VERSION" RR_STARTED="$RUN_STARTED" RR_DURATION="$(( RUN_T1 - RUN_T0 ))" RR_INPUT="$INPUT" \
+RR_SCOPE_DIR="$([ "$SCOPE_ON" = 1 ] && printf '%s' "$SCOPE_DIR")" RR_SESSIONS="$RUN_SESSIONS" RR_REUSED="$RESUME_DONE" \
+RR_VERSION="$VERSION" RR_STARTED="$RUN_STARTED" RR_DURATION="$(( RUN_T1 - RUN_T0 ))" RR_INPUT="$INPUT_ORIG" \
 RR_NDOM="${NDOM:-0}" RR_TOOLVERS="${_tvline:-}" RR_LABVER="${LAB_VERIFIED:-}" RR_RESOLVERS="$RESOLVERS" \
 RR_RESOLVERS_N="$RUN_RESOLVERS_N" RR_DNS_CHECK="$RUN_DNS_CHECK" RR_PROXY="$PROXY" RR_SS_CHROME="$SS_CHROME" \
 RR_SS_PROXY="$SS_PROXY_SERVER" RR_SS_BYPASS="$SS_PROXY_BYPASS" RR_ROWS="$RES_ROWS" RR_EXIT="$RUN_EXIT" \
+RR_RUN_ID="$RUN_ID" RR_ENGAGEMENT="$ENGAGEMENT" RR_JOB_ID="$JOB_ID" \
 python3 - "$OUTPUT" "$WORKDIR" <<'PYRUN' 2>/dev/null || warn " could not write $OUTPUT.run.json"
 import sys, json, os, re
 out, wd = sys.argv[1:3]
@@ -5006,13 +7162,15 @@ for line in open(os.path.join(wd, "seedstat.tsv"), encoding="utf-8", errors="rep
     if len(f) >= 4:
         seeds.append({"seed": f[0], "candidates": num(f[1]), "resolved": num(f[2]), "live_hosts": num(f[3])})
 arts = {}
-for k in ("takeover", "origin", "zone", "extras", "favicon", "nuclei", "params", "secrets", "buckets", "cms", "activescan",
-          "osint", "virustotal", "urlscan", "social"):
+for k in ("scope", "takeover", "origin", "zone", "dnsposture", "cloud", "tld-variants", "vulnx", "extras", "favicon", "nuclei",
+          "params", "secrets", "buckets", "cms", "activescan", "osint", "virustotal", "urlscan", "social"):
     p = "%s.%s.txt" % (out, k)
     if os.path.isfile(p):
         arts[k] = sum(1 for l in open(p, encoding="utf-8", errors="replace") if l.strip())
 for k, p in (("edge_hosts", out + ".edge.tsv"), ("cname_names", out + ".cname.tsv"),
-             ("zone_names", out + ".zone-names.txt"), ("screenshots", out + ".screenshots.tsv")):
+             ("zone_names", out + ".zone-names.txt"), ("screenshots", out + ".screenshots.tsv"),
+             ("dnsposture_names", out + ".dnsposture.tsv"), ("cloud_assets", out + ".cloud-assets.tsv"),
+             ("vulnx_cves", out + ".vulnx.tsv"), ("delta_changes", out + ".delta.tsv")):
     if os.path.isfile(p):
         arts[k] = max(0, sum(1 for l in open(p, encoding="utf-8", errors="replace") if l.strip()) - 1)
 warns = []
@@ -5029,6 +7187,7 @@ for part in (E("RR_TOOLVERS") or "").split(","):
         tv[f[0]] = f[1]
 rec = {
     "tool": "run-recon", "version": E("RR_VERSION", ""),
+    "run_id": E("RR_RUN_ID", ""), "engagement": E("RR_ENGAGEMENT") or None, "job_id": E("RR_JOB_ID") or None,
     "args": args,
     "started": E("RR_STARTED", ""), "duration_s": max(0, num(E("RR_DURATION")) or 0),
     "input": E("RR_INPUT", ""), "seeds": len(seeds) or (num(E("RR_NDOM")) or 0), "per_seed": seeds,
@@ -5040,7 +7199,20 @@ rec = {
     "url_rows": num(E("RR_ROWS")) or 0, "artifacts": arts,
     "warnings": warns[:200], "warnings_total": len(warns),
     "exit_status": num(E("RR_EXIT")) or 0,
+    "sessions": num(E("RR_SESSIONS")) or 1, "seeds_resumed": num(E("RR_REUSED")) or 0,
 }
+sd = E("RR_SCOPE_DIR") or ""
+if sd and os.path.isfile(os.path.join(sd, "summary.json")):
+    sc = json.load(open(os.path.join(sd, "summary.json")))
+    held = {}
+    p = out + ".scope.txt"
+    if os.path.isfile(p):
+        for l in open(p, encoding="utf-8", errors="replace"):
+            m = re.search(r" scope-held-back \[info\] kind=(\S+)", l)
+            if m:
+                held[m.group(1)] = held.get(m.group(1), 0) + 1
+    sc["held_back"] = held
+    rec["scope"] = sc
 with open(out + ".run.json", "w", encoding="utf-8") as f:
     json.dump(rec, f, indent=2)
     f.write("\n")
@@ -5063,9 +7235,184 @@ if [ "$REPORT" = "1" ]; then
   fi
 fi
 
+# --- --json: the side files as JSON lines (<out>.<kind>.jsonl) ---------------------
+# urls and services come from the CSV builder itself; these are read back from the files
+# this run just wrote, with the same field names: findings (every <out>.<kind>.txt line),
+# the TSV inventories, the warnings (all of them, in order) and the per-seed counts.
+# Written before the manifest, so each one has its SHA-256 there.
+if [ "$JSON_OUT" = "1" ]; then
+  cat "$WORKDIR"/parts/seedstat.*.tsv 2>/dev/null > "$WORKDIR/seedstat.tsv" || : > "$WORKDIR/seedstat.tsv"
+  if _jsum="$(python3 - "$OUTPUT" "$WORKDIR" <<'PYJSONL' 2>"$WORKDIR/jsonl.err"
+# JSONL-EXPORT
+import sys, os, re, json
+out, wd = sys.argv[1:3]
+FINDING_KINDS = ["scope", "takeover", "origin", "zone", "dnsposture", "cloud", "tld-variants", "vulnx", "extras",
+                 "favicon", "nuclei", "params", "secrets", "buckets", "cms", "activescan", "osint", "virustotal",
+                 "urlscan", "social"]
+# the report's default severity for a line without a [severity] tag (generate-report.sh KIND_SEV)
+KIND_SEV = {"takeover": "high", "secrets": "high", "buckets": "medium"}
+TSV_KINDS = [("dnsposture", ".dnsposture.tsv"), ("edges", ".edge.tsv"), ("cnames", ".cname.tsv"),
+             ("zone-names", ".zone-names.txt"), ("screenshots", ".screenshots.tsv"),
+             ("cloud-assets", ".cloud-assets.tsv"), ("vulnx", ".vulnx.tsv"), ("delta", ".delta.tsv")]
+SEV = re.compile(r"\[(critical|high|medium|low|info|unknown)\]", re.I)
+KV = re.compile(r'(?:^|\s)([A-Za-z_][A-Za-z0-9_.-]*)=("[^"]*"|\S*)')
+URLRE = re.compile(r"https?://\[?([A-Za-z0-9_.:-]+?)\]?(?::\d+)?(?:[/?#\s\"'<>]|$)")
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+summary = []
+def write(kind, recs):
+    p = "%s.%s.jsonl" % (out, kind)
+    with open(p + ".tmp", "w", encoding="utf-8", errors="replace") as f:
+        for o in recs:
+            f.write(json.dumps(o, ensure_ascii=False, separators=(",", ":")) + "\n")
+    os.replace(p + ".tmp", p)
+    summary.append("%s=%d" % (kind, len(recs)))
+def finding(src, line):
+    m = re.match(r"^\[([^\]]*)\]\s+(.*)$", line)
+    seed, detail = (m.group(1), m.group(2)) if m else ("", line)
+    toks = detail.split(maxsplit=2)
+    check = toks[0] if toks else ""
+    rest = detail[len(check):].lstrip()
+    sev, fields, note = "", {}, ""
+    t = SEV.match(rest)
+    if t:   # structured: "<check> [severity] key=value ... note=free text"
+        sev = t.group(1).lower()
+        body = rest[t.end():]
+        i = re.search(r"(?:^|\s)note=", body)
+        if i:
+            note, body = body[i.end():], body[:i.start()]
+        for k, v in KV.findall(body):
+            fields[k] = v[1:-1] if len(v) > 1 and v[0] == v[-1] == '"' else v
+    else:   # tool output: the first [severity] tag anywhere (nuclei), else the kind's default
+        t = SEV.search(line)
+        sev = t.group(1).lower() if t else KIND_SEV.get(src, "info")
+    host = fields.get("host", "")
+    if not host:
+        u = URLRE.search(line)
+        host = u.group(1).lower() if u else ""
+    return {"source": src, "seed": seed, "check": check, "severity": sev, "host": host, "fields": fields,
+            "note": note, "text": detail}
+recs = []
+for k in FINDING_KINDS:
+    p = "%s.%s.txt" % (out, k)
+    if os.path.isfile(p):
+        for l in open(p, encoding="utf-8", errors="replace"):
+            l = ANSI.sub("", l.rstrip("\r\n"))
+            if l.strip():
+                recs.append(finding(k, l))
+write("findings", recs)
+bad = 0
+for kind, suf in TSV_KINDS:
+    p = out + suf
+    if not os.path.isfile(p):
+        continue
+    with open(p, encoding="utf-8", errors="replace") as f:
+        hdr = f.readline().rstrip("\r\n").split("\t")
+        recs = []
+        for l in f:
+            l = l.rstrip("\r\n")
+            if not l:
+                continue
+            v = l.split("\t")
+            if len(v) != len(hdr):
+                bad += 1
+                v = (v + [""] * len(hdr))[:len(hdr)] if len(v) < len(hdr) else v[:len(hdr) - 1] + ["\t".join(v[len(hdr) - 1:])]
+            recs.append(dict(zip(hdr, v)))
+    write(kind, recs)
+warns = []
+wf = os.path.join(wd, "warnings.txt")
+if os.path.isfile(wf):
+    for l in open(wf, encoding="utf-8", errors="replace"):
+        l = ANSI.sub("", l).strip()
+        if l and l not in warns:
+            warns.append(l)
+write("warnings", [{"message": w} for w in warns])
+def num(v):
+    return int(v) if (v or "").isdigit() else None
+seeds = []
+sp = os.path.join(wd, "seedstat.tsv")
+for l in (open(sp, encoding="utf-8", errors="replace") if os.path.isfile(sp) else ()):
+    f = l.rstrip("\n").split("\t")
+    if len(f) >= 4:
+        seeds.append({"seed": f[0], "candidates": num(f[1]), "resolved": num(f[2]), "live_hosts": num(f[3])})
+write("seeds", seeds)
+if bad:
+    sys.stderr.write("%d TSV row(s) had the wrong number of fields\n" % bad)
+print(" ".join(summary))
+PYJSONL
+)"; then
+    ok " JSON lines      : $OUTPUT.<kind>.jsonl (urls=$(grep -c '' "$OUTPUT.urls.jsonl" 2>/dev/null || echo 0) services=$(grep -c '' "$OUTPUT.services.jsonl" 2>/dev/null || echo 0) $_jsum)"
+    [ -s "$WORKDIR/jsonl.err" ] && warn " --json: $(head -n 1 "$WORKDIR/jsonl.err")"
+  else
+    warn " --json: the side files could not be written as JSON lines (see $WORKDIR/jsonl.err)"
+  fi
+fi
+
+# --- manifest: SHA-256 of every file this run wrote ------------------------------
+# <out>.manifest.sha256, in sha256sum's own format with paths relative to the CSV's
+# directory, so `cd <dir> && sha256sum -c <out>.manifest.sha256` verifies the set later.
+# "Written by this run" = the CSV, <out>.* and screenshots-<ts>/ modified since the run
+# started; an older file with the same prefix (an earlier run with the same -o) is left
+# out and named, so the manifest never vouches for something this run did not produce.
+_man="$(RR_T0="$RUN_T0" python3 - "$OUTPUT" "${SHOTDIR:-}" <<'PYMAN' 2>"$WORKDIR/manifest.err"
+import sys, os, hashlib
+out, shots = sys.argv[1:3]
+t0 = int(os.environ.get("RR_T0") or 0) - 1
+d, base = os.path.dirname(out) or ".", os.path.basename(out)
+man = out + ".manifest.sha256"
+def h(p):
+    s = hashlib.sha256()
+    with open(p, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            s.update(b)
+    return s.hexdigest()
+files, stale = [], []
+for e in os.scandir(d):
+    if not e.is_file(follow_symlinks=False) or e.path == man:
+        continue
+    if e.name == base or e.name.startswith(base + "."):
+        (files if e.stat().st_mtime >= t0 else stale).append(e.path)
+if shots and os.path.isdir(shots):
+    for root, _, names in os.walk(shots):
+        files += [os.path.join(root, n) for n in names if os.path.isfile(os.path.join(root, n))]
+lines = sorted("%s  %s" % (h(p), os.path.relpath(p, d)) for p in files)
+with open(man + ".tmp", "w", encoding="utf-8") as f:
+    f.write("".join(l + "\n" for l in lines))
+os.replace(man + ".tmp", man)
+print("%d\t%s\t%d\t%s" % (len(lines), h(man), len(stale), ", ".join(os.path.basename(p) for p in sorted(stale)[:5])
+                                + (", ..." if len(stale) > 5 else "")))
+PYMAN
+)" || _man=""
+if [ -n "$_man" ] && [ -s "$OUTPUT.manifest.sha256" ]; then
+  IFS=$'	' read -r _mn _msha _mns _mstale <<< "$_man"
+  ok " manifest        : $OUTPUT.manifest.sha256 ($_mn file(s), sha256 ${_msha:0:16}...; verify: cd $(dirname "$OUTPUT") && sha256sum -c $(basename "$OUTPUT").manifest.sha256)"
+  [ "${_mns:-0}" -gt 0 ] && warn " manifest: $_mns older file(s) named like this run's outputs were left out (an earlier run with the same -o): $_mstale"
+else
+  warn " could not write $OUTPUT.manifest.sha256 (see $WORKDIR/manifest.err)"
+fi
+
+sed -i 's/^status=.*/status=complete/' "$WORKDIR/state" 2>/dev/null || true
 if [ "$KEEP_WORK" = "1" ]; then
   log "Intermediate artifacts kept in: $WORKDIR"
 else
   rm -rf "$WORKDIR" 2>/dev/null || true
+fi
+
+# --- --ship: send the finished run to Tideline -------------------------------------
+# An output stage only: it reads the files and the manifest written above and changes none
+# of them; its state goes to <out>.ship-state.json. A failure leaves the run complete
+# locally (exit 4); `ship-recon.sh ship <csv>` retries and sends only what is missing.
+if [ -n "$SHIP_URL" ]; then
+  _ship_int(){ trap - INT TERM; err "shipping interrupted: the run itself is complete. Send it later with: $SHIP_SH ship $OUTPUT"; exit "$1"; }
+  trap '_ship_int 130' INT
+  trap '_ship_int 143' TERM
+  log "Tideline: shipping run $RUN_ID to $SHIP_URL"
+  if bash "$SHIP_SH" ship "$OUTPUT" "${_shargs[@]}"; then
+    ok " Tideline        : run $RUN_ID shipped and verified ($OUTPUT.ship-state.json)"
+  else
+    _shrc=$?
+    err "Tideline: the run was not delivered (ship-recon.sh exit $_shrc; $OUTPUT.ship-state.json). The run is complete locally;"
+    err "  retry with: $SHIP_SH ship $OUTPUT   (sends only the parts Tideline does not have)"
+    [ "$RUN_EXIT" = 0 ] && RUN_EXIT=4
+  fi
 fi
 exit "$RUN_EXIT"

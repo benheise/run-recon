@@ -35,8 +35,29 @@
 #                          origin-exposed at LAB_ORIGIN_IP; spa.test origin-protected at
 #                          LAB_PROTECTED_IP; wp.test not reported)
 #   http                   HTTP detail (1.19): security headers, HSTS, cookies, cleartext auth,
-#                          robots.txt / security.txt / 404 probe (--extras), favicon, PTR (--enrich)
-#   checks                 takeover + zone + origin + http; non-zero if any fails
+#                          robots.txt / security.txt / 404 probe (--extras), favicon, PTR (--enrich);
+#                          1.20: redirect chains (same-host hops followed, off-host listed) and
+#                          login forms (CleartextAuth for a form posting to http://)
+#   tls                    --tls-enum against the TLS fixtures (legacy: TLS 1.0-1.2, a NULL suite,
+#                          RSA 1024/SHA-1; future: not yet valid; default: OpenSSL's default subject;
+#                          modern: the control), cross-checked with tlsx per version and openssl
+#   posture                --dns-posture against posture.test (permissive SPF, DMARC p=none,
+#                          MTA-STS testing, dangling MX and NS, a lame NS) and the clean
+#                          good.posture.test; --cloudlist against a lab Terraform state
+#   discovery              the discovery tools end to end: naabu (an alternate port), alterx
+#                          (--permute), shuffledns+massdns (--brute), cdncheck, uncover without
+#                          keys, and --monitor --notify to a local webhook
+#   scope                  --scope / --list-targets: the seed check, origin candidates held back, the
+#                          browser held to the names, an address exclusion proved at the origin's
+#                          access log (and a control run without --scope)
+#   resume                 SIGTERM after two seeds, then --resume: the CSV must equal an uninterrupted run
+#   history                --monitor's field-by-field delta and recon-db.sh history/changes across two runs
+#                          with the spa backend stopped in between (the store too, with RECON_DB_DSN)
+#   ship                   --ship to lab/mock-tideline.py (mutual TLS on loopback, a throwaway step-ca-shaped
+#                          PKI): the shipped records equal the local CSV row for row, screenshots travel
+#                          as artifacts, a second delivery sends nothing, a 503 then a retry resumes
+#   checks                 takeover + zone + origin + http + tls + posture + discovery + scope + resume + history
+#                          + ship; non-zero if any fails
 #   help
 #
 # Needs docker (+compose) and the run-recon toolchain for up/run/bench; compare
@@ -61,6 +82,12 @@ LAB_PROTECTED_IP="${LAB_PROTECTED_IP:-127.0.0.6}"
 # BIND, authoritative for the NSEC3-signed nsec3.test (CoreDNS's file plugin cannot serve
 # NSEC3): ns.nsec3.test answers on this address, CoreDNS forwards the zone to it
 LAB_NSEC3_IP="${LAB_NSEC3_IP:-127.0.0.7}"
+# TLS-posture fixtures (lab/tls-nginx.conf): one loopback address per fixture
+LAB_TLS_LEGACY_IP="${LAB_TLS_LEGACY_IP:-127.0.0.9}"
+LAB_TLS_FUTURE_IP="${LAB_TLS_FUTURE_IP:-127.0.0.10}"
+LAB_TLS_DEFAULT_IP="${LAB_TLS_DEFAULT_IP:-127.0.0.11}"
+LAB_TLS_MODERN_IP="${LAB_TLS_MODERN_IP:-127.0.0.12}"
+LAB_IP_VARS="LAB_DNS_IP LAB_ORIGIN_IP LAB_PROTECTED_IP LAB_NSEC3_IP LAB_TLS_LEGACY_IP LAB_TLS_FUTURE_IP LAB_TLS_DEFAULT_IP LAB_TLS_MODERN_IP"
 LAB_HOSTS="nginx.test wp.test spa.test ci.test"
 FARM_N_DEFAULT=50
 FARM_BACKENDS=(nginx wordpress spa jenkins)
@@ -96,9 +123,12 @@ gen_lab(){ # <farm_n>
     printf '</script></body></html>\n'
   } > "$LAB/spa/index.html"
   local _v
-  for _v in LAB_DNS_IP LAB_ORIGIN_IP LAB_PROTECTED_IP LAB_NSEC3_IP; do
+  for _v in $LAB_IP_VARS; do
     case "${!_v}" in 127.*) ;; *) die "$_v must be a loopback (127.0.0.0/8) address: ${!_v}";; esac
   done
+  # TLS-posture fixture certificates (lab/gen-tls-certs.py -> lab/tls/)
+  python3 -I "$LAB/gen-tls-certs.py" "$LAB/tls" >/dev/null || die "could not make the TLS fixture certificates (python3-cryptography and openssl are needed)"
+  printf 'legacy.tls.test\nfuture.tls.test\ndefault.tls.test\nmodern.tls.test\n' > "$LAB/targets-tls.txt"
   printf '%s\n' "$LAB_DNS_IP" > "$RESOLVERS_FILE"
   : > "$LAB/farm.caddy"; : > "$LAB/targets-farm.txt"
   printf 'host,status,technologies,cpe,tls_flags,ipv6,min_urls\n' > "$LAB/expected-farm.csv"
@@ -145,7 +175,16 @@ gen_lab(){ # <farm_n>
     printf 'direct.nginx.test. IN A %s\n' "$LAB_ORIGIN_IP"
     printf 'nginx.test. IN TXT "v=spf1 ip4:%s -all"\n' "$LAB_ORIGIN_IP"
     printf 'origin.spa.test. IN A %s\n' "$LAB_PROTECTED_IP"
+    # discovery fixtures: a name only alterx's permutations guess (--permute) and one only
+    # the lab wordlist holds (--brute)
+    printf 'grafana.nginx.test. IN A 127.0.0.1\nbackup-db.nginx.test. IN A 127.0.0.1\n'
+    # redirect / login-form fixtures (Caddyfile) and the TLS-posture fixtures (tls-nginx.conf)
+    printf 'redir.test. IN A 127.0.0.1\nplainlogin.redir.test. IN A 127.0.0.1\n'
+    printf 'legacy.tls.test. IN A %s\nfuture.tls.test. IN A %s\ndefault.tls.test. IN A %s\nmodern.tls.test. IN A %s\n' \
+      "$LAB_TLS_LEGACY_IP" "$LAB_TLS_FUTURE_IP" "$LAB_TLS_DEFAULT_IP" "$LAB_TLS_MODERN_IP"
   } > "$LAB/db.test"
+  printf 'www\nbackup-db\nnot-there-1\nnot-there-2\n' > "$LAB/brute-wordlist.txt"
+  printf 'nginx.test\n' > "$LAB/targets-discovery.txt"
   rm -f "$LAB/test.zone"
   # zone-exposure fixtures: names that no wordlist or passive source would find
   #   walk.test   DNSSEC-signed with NSEC  -> the chain can be walked
@@ -168,6 +207,38 @@ gen_lab(){ # <farm_n>
   done
   sign_zone walk.test 0
   sign_zone nsec3.test 1
+  # email/DNS posture fixtures (--dns-posture): posture.test gets everything wrong, its
+  # subdomain good.posture.test gets everything right
+  #   NS  ns.posture.test (CoreDNS, authoritative), ns-gone.nowhere.test (nowhere.test does
+  #       not exist: dangling), ns-lame.posture.test -> BIND, which refuses posture.test (lame)
+  #   MX  mx1.posture.test (exists), mx-old.gone-mail.test (gone-mail.test does not exist)
+  #   SPF include:_spf.posture.test +all; DMARC p=none without rua; MTA-STS testing whose
+  #   policy lists mx1 only; no TLS-RPT; CAA letsencrypt.org
+  {
+    printf '$ORIGIN posture.test.\n$TTL 60\n'
+    printf '@ IN SOA ns.posture.test. hostmaster.posture.test. %s 7200 3600 1209600 60\n' "$serial"
+    printf '@ IN NS ns.posture.test.\n@ IN NS ns-gone.nowhere.test.\n@ IN NS ns-lame.posture.test.\n'
+    printf 'ns IN A 127.0.0.1\nns-lame IN A %s\n@ IN A 127.0.0.1\nmx1 IN A 127.0.0.1\nmta-sts IN A 127.0.0.1\n' "$LAB_NSEC3_IP"
+    printf '@ IN MX 10 mx1.posture.test.\n@ IN MX 20 mx-old.gone-mail.test.\n'
+    printf '@ IN TXT "v=spf1 include:_spf.posture.test +all"\n_spf IN TXT "v=spf1 ip4:127.0.0.1 -all"\n'
+    printf '_dmarc IN TXT "v=DMARC1; p=none"\n_mta-sts IN TXT "v=STSv1; id=20261101"\n'
+    printf '@ IN CAA 0 issue "letsencrypt.org"\n'
+    printf 'good IN A 127.0.0.1\ngood IN MX 10 mx1.posture.test.\ngood IN TXT "v=spf1 mx -all"\n'
+    printf '_dmarc.good IN TXT "v=DMARC1; p=reject; rua=mailto:dmarc@posture.test"\n'
+    printf '_mta-sts.good IN TXT "v=STSv1; id=20261101"\nmta-sts.good IN A 127.0.0.1\n'
+    printf '_smtp._tls.good IN TXT "v=TLSRPTv1; rua=mailto:tlsrpt@posture.test"\n'
+  } > "$LAB/db.posture.test"
+  printf 'posture.test\ngood.posture.test\n' > "$LAB/targets-posture.txt"
+  # --cloudlist: a Terraform state (cloudlist's terraform provider reads it offline) with the
+  # ingress address the scan sees, and one the scan never finds
+  {
+    printf '{"version": 4, "terraform_version": "1.6.0", "serial": 1, "lineage": "run-recon-lab", "outputs": {},\n'
+    printf ' "resources": [\n'
+    printf '  {"mode": "managed", "type": "aws_instance", "name": "web", "instances": [{"attributes": {"id": "i-lab0001", "public_ip": "127.0.0.1"}}]},\n'
+    printf '  {"mode": "managed", "type": "aws_instance", "name": "forgotten", "instances": [{"attributes": {"id": "i-lab0002", "public_ip": "127.0.0.8"}}]}\n'
+    printf ' ]}\n'
+  } > "$LAB/cloud.tfstate"
+  printf -- '- provider: terraform\n  id: lab\n  tf_state_file: %s\n' "$LAB/cloud.tfstate" > "$LAB/cloudlist.yaml"
   printf 'walk.test\nxfr.test\nnsec3.test\nnginx.test\n' > "$LAB/targets-zone.txt"
   printf 'nginx.test\nalias.test\norphan.test\n' > "$LAB/targets-takeover.txt"
   printf 'nginx.test\nspa.test\nwp.test\n' > "$LAB/targets-origin.txt"
@@ -180,8 +251,8 @@ gen_lab(){ # <farm_n>
   } > "$LAB/db.127"
   # HTTP-detail check (bench-run-recon.sh http): the four sites, the cleartext-auth VPN and a
   # catch-all name from the walk.test zone
-  printf 'nginx.test\nspa.test\nwp.test\nci.test\nvpn-legacy.walk.test\nwww.walk.test\n' > "$LAB/targets-http.txt"
-  log "generated: SPA (120 KB), farm of $n vhosts, zones db.test db.walk.test db.xfr.test db.nsec3.test db.127, targets and ground truth"
+  printf 'nginx.test\nspa.test\nwp.test\nci.test\nvpn-legacy.walk.test\nwww.walk.test\nredir.test\nplainlogin.redir.test\n' > "$LAB/targets-http.txt"
+  log "generated: SPA (120 KB), farm of $n vhosts, zones db.test db.walk.test db.xfr.test db.nsec3.test db.posture.test db.127, targets and ground truth"
 }
 
 # sign_zone ZONE NSEC3(0|1): DNSSEC-sign lab/db.ZONE into lab/db.ZONE.signed with
@@ -245,9 +316,13 @@ cmd_up(){
   have docker || die "docker not found. Install Docker + compose, then re-run on your lab host."
   gen_lab "$farm"
   log "starting the range (lab DNS on $LAB_DNS_IP:53, exposed origin on $LAB_ORIGIN_IP:80, protected origin on $LAB_PROTECTED_IP:80, BIND on $LAB_NSEC3_IP:53)..."
-  export LAB_DNS_IP LAB_ORIGIN_IP LAB_PROTECTED_IP LAB_NSEC3_IP
+  # shellcheck disable=SC2086,SC2163  # the names in LAB_IP_VARS, one word each
+  export $LAB_IP_VARS
   compose -f "$COMPOSE_FILE" up -d \
     || die "compose up failed (if $LAB_DNS_IP:53 is in use, retry with LAB_DNS_IP=127.0.0.2)"
+  # nginx reads its certificates at start: serve the ones gen_lab just made (future.tls.test is
+  # "not yet valid" relative to them)
+  compose -f "$COMPOSE_FILE" restart tlslab >/dev/null 2>&1 || log "could not restart tlslab (the TLS fixtures may serve older certificates)"
   if ! grep -q 'nginx\.test' /etc/hosts 2>/dev/null; then
     log "add the lab names to /etc/hosts:   sudo sh -c '$0 hosts >> /etc/hosts'"
     log "(lab DNS on $LAB_DNS_IP serves them too; /etc/hosts covers tools that use the system resolver)"
@@ -256,9 +331,13 @@ cmd_up(){
   log "then:  $0 bench --runs 3            (lab accuracy)"
   log "       $0 bench --runs 3 --farm     (farm load)"
 }
-cmd_down(){ export LAB_DNS_IP LAB_ORIGIN_IP LAB_PROTECTED_IP LAB_NSEC3_IP; compose -f "$COMPOSE_FILE" down -v 2>/dev/null; log "range down."; }
+# shellcheck disable=SC2086,SC2163  # the names in LAB_IP_VARS, one word each
+cmd_down(){ export $LAB_IP_VARS; compose -f "$COMPOSE_FILE" down -v 2>/dev/null; log "range down."; }
 cmd_hosts(){
   printf '127.0.0.1 %s\n' "$LAB_HOSTS"
+  printf '127.0.0.1 redir.test plainlogin.redir.test\n'
+  printf '%s legacy.tls.test\n%s future.tls.test\n%s default.tls.test\n%s modern.tls.test\n' \
+    "$LAB_TLS_LEGACY_IP" "$LAB_TLS_FUTURE_IP" "$LAB_TLS_DEFAULT_IP" "$LAB_TLS_MODERN_IP"
   [ -f "$LAB/targets-farm.txt" ] && while IFS= read -r h; do [ -n "$h" ] && printf '127.0.0.1 %s\n' "$h"; done < "$LAB/targets-farm.txt"
 }
 
@@ -320,7 +399,7 @@ import sys, os, csv, re
 a_path, b_path = sys.argv[1], sys.argv[2]
 EXACT = os.environ.get("BENCH_EXACT", "0") == "1"
 # columns that legitimately differ run-to-run and are excluded from --exact
-VOLATILE = {"cert_not_after", "response_ms"}
+VOLATILE = {"cert_not_after", "cert_not_before", "response_ms"}
 
 def rows(path):
     with open(path, newline="", encoding="utf-8", errors="replace") as fh:
@@ -440,7 +519,7 @@ cmd_bench(){
       --baseline-script) base_script="${2:-}"; shift 2 || shift;;
       --ab)              ab="${2:-}"; shift 2 || shift;;
       --results)         results="${2:-}"; shift 2 || shift;;
-      -h|--help) sed -n '2,43p' "$0" | sed 's/^# \{0,1\}//'; return 0;;
+      -h|--help) awk 'NR > 1 && !/^#/ { exit } NR > 1 && !/^# ?=+$/' "$0" | sed 's/^# \{0,1\}//'; return 0;;
       -*) die "bench: unknown option: $1";;
       *) shift;;
     esac
@@ -587,6 +666,102 @@ cmd_origin(){
   return "$fail"
 }
 
+# posture: the email/DNS posture fixtures (lab/db.posture.test, the MTA-STS policies in the
+# Caddyfile) and the cloud inventory diff against lab/cloud.tfstate (run-recon 1.20)
+cmd_posture(){
+  lab_env
+  [ -f "$RUN_RECON" ] || die "run-recon not found at $RUN_RECON"
+  [ -s "$LAB/targets-posture.txt" ] || die "no lab/targets-posture.txt (run: $0 up)"
+  local t; t="$(mktemp -d /tmp/bench-posture.XXXXXX)"
+  # MTA-STS policies are fetched with certificate checks; the lab's are issued by Caddy's local CA
+  # shellcheck disable=SC2086,SC2163
+  export $LAB_IP_VARS
+  compose -f "$COMPOSE_FILE" exec -T ingress cat /data/caddy/pki/authorities/local/root.crt > "$t/caddy-root.crt" 2>/dev/null
+  [ -s "$t/caddy-root.crt" ] || die "could not read the ingress's local CA (is the lab up?)"
+  local cl=(); if have cloudlist; then cl=(--cloudlist "$LAB/cloudlist.yaml"); else log "  skip cloudlist not installed: no cloud inventory check"; fi
+  log "email/DNS posture check against lab/targets-posture.txt -> $t"
+  ( cd "$t" && bash "$RUN_RECON" -i "$LAB/targets-posture.txt" -o "$t/p.csv" --resolvers "$RESOLVERS_FILE" \
+      --dns-posture --mta-sts-ca "$t/caddy-root.crt" "${cl[@]}" --no-report >"$t/run.out" 2>"$t/run.err" ) || true
+  local f="$t/p.csv.dnsposture.txt" v="$t/p.csv.dnsposture.tsv" fail=0
+  _ck(){ if grep -qE "$2" "$1" 2>/dev/null; then log "  ok   $3"; else log "  FAIL $3 (see $1, $t/run.err)"; fail=1; fi; }
+  _ck "$f" '^\[posture\.test\] spf-permissive \[high\] host=posture\.test all=\+all '                  "posture.test: SPF +all -> spf-permissive [high]"
+  _ck "$f" '^\[posture\.test\] dmarc-none \[low\] host=posture\.test '                               "posture.test: DMARC p=none -> dmarc-none [low]"
+  _ck "$f" '^\[posture\.test\] dmarc-no-rua \[info\] host=posture\.test '                            "posture.test: no rua -> dmarc-no-rua [info]"
+  _ck "$f" '^\[posture\.test\] mta-sts-testing \[info\] host=posture\.test '                         "posture.test: policy fetched over verified TLS, mode testing"
+  _ck "$f" '^\[posture\.test\] mta-sts-mx-mismatch \[medium\] host=posture\.test mx=mx-old\.gone-mail\.test ' "posture.test: an MX host the policy does not list"
+  _ck "$f" '^\[posture\.test\] tlsrpt-missing \[info\] host=posture\.test '                         "posture.test: no TLS-RPT"
+  _ck "$f" '^\[posture\.test\] mx-dangling \[high\] host=posture\.test mx=mx-old\.gone-mail\.test '  "posture.test: MX host whose domain does not exist -> mx-dangling [high]"
+  _ck "$f" '^\[posture\.test\] ns-dangling \[high\] host=posture\.test ns=ns-gone\.nowhere\.test '   "posture.test: NS host whose domain does not exist -> ns-dangling [high]"
+  _ck "$f" "^\\[posture\\.test\\] ns-lame \\[medium\\] host=posture\\.test ns=ns-lame\\.posture\\.test\\($(printf '%s' "$LAB_NSEC3_IP" | sed 's/\./\\./g')\\) reason=refused " "posture.test: BIND refuses the zone -> ns-lame [medium]"
+  if grep -qE 'caa-missing.*host=posture\.test|ns-lame.*ns=ns\.posture\.test' "$f" 2>/dev/null; then log "  FAIL posture.test: CAA present / CoreDNS authoritative, yet reported"; fail=1
+  else log "  ok   posture.test: CAA present and ns.posture.test authoritative: not reported"; fi
+  if grep -q 'host=good\.posture\.test' "$f" 2>/dev/null; then log "  FAIL good.posture.test reported: $(grep 'host=good\.posture\.test' "$f" | head -n 2 | tr '\n' ' ')"; fail=1
+  else log "  ok   good.posture.test (SPF mx -all, DMARC reject+rua, MTA-STS enforce, TLS-RPT): no finding"; fi
+  _ck "$v" '^good\.posture\.test	seed	posture\.test	mx1\.posture\.test	v=spf1 mx -all	-all	1	p=reject	enforce	yes	' "dnsposture.tsv: the clean name's row"
+  if [ "${#cl[@]}" -gt 0 ]; then
+    _ck "$t/p.csv.cloud.txt" '^\[cloud\] cloud-asset-unseen \[info\] host=127\.0\.0\.8 provider=terraform account=lab ' "cloudlist: an account's address the scan never saw -> cloud-asset-unseen"
+    _ck "$t/p.csv.cloud-assets.tsv" '^terraform	lab	[^	]*		127\.0\.0\.1	yes$'             "cloudlist: the ingress address is matched to the scan's inventory"
+  fi
+  [ "$fail" = 0 ] && log "posture check: PASS" || log "posture check: FAIL"
+  return "$fail"
+}
+
+# discovery: the discovery tools against the lab (run-recon 1.20). Run A is the baseline
+# inventory; run B adds --ports/--permute/--brute and --monitor --notify against run A, so the
+# alternate-port URL is a new asset and reaches a local webhook.
+cmd_discovery(){
+  lab_env
+  [ -f "$RUN_RECON" ] || die "run-recon not found at $RUN_RECON"
+  [ -s "$LAB/targets-discovery.txt" ] || die "no lab/targets-discovery.txt (run: $0 up)"
+  local t fail=0 port; t="$(mktemp -d /tmp/bench-discovery.XXXXXX)"
+  _ck(){ if grep -qE "$2" "$1" 2>/dev/null; then log "  ok   $3"; else log "  FAIL $3 (see $1)"; fail=1; fi; }
+  log "discovery check against lab/targets-discovery.txt -> $t"
+  ( cd "$t" && bash "$RUN_RECON" -i "$LAB/targets-discovery.txt" -o "$t/a.csv" --resolvers "$RESOLVERS_FILE" \
+      --resolve --no-report >"$t/a.out" 2>"$t/a.err" ) || true
+  # a local webhook (loopback, random port) that records what notify posts
+  port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+  python3 -I -c '
+import http.server, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        b = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        open(sys.argv[2], "ab").write(b + b"\n"); self.send_response(200); self.end_headers()
+    def log_message(self, *a): pass
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()' "$port" "$t/webhook.txt" &
+  local hook=$!
+  printf 'custom:\n  - id: lab\n    custom_webhook_url: http://127.0.0.1:%s/hook\n    custom_method: POST\n    custom_format: "{{data}}"\n    custom_headers:\n      Content-Type: text/plain\n' "$port" > "$t/notify.yaml"
+  ( cd "$t" && NOTIFY_CONFIG="$t/notify.yaml" bash "$RUN_RECON" -i "$LAB/targets-discovery.txt" -o "$t/b.csv" \
+      --resolvers "$RESOLVERS_FILE" --resolve --permute --brute --brute-wordlist "$LAB/brute-wordlist.txt" \
+      --ports --port-spec 80,443,8443 --origin --monitor --monitor-prev "$t/a.csv" --notify --no-report >"$t/b.out" 2>"$t/b.err" ) || true
+  sleep 1; kill "$hook" 2>/dev/null; wait "$hook" 2>/dev/null
+  if have naabu; then _ck "$t/b.csv" ',https://nginx\.test:8443(/[^,]*)?,nginx\.test,'        "naabu: the alternate port 8443 found and probed"
+  else log "  skip naabu not installed"; fi
+  if have alterx; then _ck "$t/b.csv" ',https?://grafana\.nginx\.test[^,]*,grafana\.nginx\.test,[^,]*alterx' "alterx (--permute): grafana.nginx.test guessed and validated"
+  else log "  skip alterx not installed"; fi
+  if have shuffledns && have massdns; then _ck "$t/b.csv" ',https?://backup-db\.nginx\.test[^,]*,backup-db\.nginx\.test,[^,]*bruteforce' "shuffledns+massdns (--brute): backup-db.nginx.test from the wordlist"
+  else log "  skip shuffledns+massdns not installed (massdns: build from github.com/blechschmidt/massdns)"; fi
+  if grep -qE 'grafana|backup-db|not-there' "$t/a.csv" 2>/dev/null; then log "  FAIL the baseline run found names only permutations or the wordlist hold"; fail=1
+  else log "  ok   the baseline run (no --permute/--brute) does not have them"; fi
+  if have cdncheck; then
+    _ck "$t/b.csv.edge.tsv" '^nginx\.test	nginx\.test	Caddy	nginx/[^	]*	[^	]*	[^	]*		'   "cdncheck: no CDN tag for the loopback edge"
+    # the same call origin_check makes, on a Cloudflare address (cdncheck's ranges are built in)
+    if echo 104.16.0.1 | cdncheck -resp -silent -nc 2>/dev/null | sed -E 's/\x1B\[[0-9;]*[A-Za-z]//g' | grep -q '^104\.16\.0\.1 .*\[cloudflare\]'; then
+      log "  ok   cdncheck: 104.16.0.1 tagged cloudflare in the format origin_check parses"
+    else log "  FAIL cdncheck output format changed (origin_check expects 'IP [type] [provider]')"; fail=1; fi
+  fi
+  _ck "$t/b.csv.new-assets.txt" '^https://nginx\.test:8443'                                    "--monitor: the alternate-port URL is a new asset vs run A"
+  if have notify; then _ck "$t/webhook.txt" 'new asset\(s\) vs a\.csv'                         "--notify: one message (-bulk) posted to the lab webhook (NOTIFY_CONFIG)"
+    _ck "$t/webhook.txt" 'https://nginx\.test:8443'                                            "--notify: the message lists the new asset"
+  else log "  skip notify not installed"; fi
+  if have uncover; then
+    mkdir -p "$t/nokeys"
+    HOME="$t/nokeys" uncover -q 'ssl:"nginx.test"' -silent -duc >/dev/null 2>"$t/uncover.err" || true
+    _ck "$t/uncover.err" 'requires keys but no keys'                                            "uncover without keys: the message run-recon turns into a warning"
+  fi
+  [ "$fail" = 0 ] && log "discovery check: PASS" || log "discovery check: FAIL"
+  return "$fail"
+}
+
 # http: the HTTP-detail fixtures in lab/Caddyfile and lab/db.127 (run-recon 1.19)
 cmd_http(){
   lab_env
@@ -632,11 +807,328 @@ ck(re.search(r"catch-all-200 \[info\] host=www\.walk\.test", extras) is not None
 ck(row("https://ci.test").get("favicon_mmh3") == "81586312", "ci.test: Jenkins favicon mmh3 81586312")
 ck(any("wordpress_test_cookie" in r.get("cookie_issues", "") for r in rows), "wp.test: wordpress_test_cookie flag gaps")
 ck(n.get("ptr") == "ingress.lab.test", "PTR of 127.0.0.1 from the lab's reverse zone (--enrich, your resolver)")
+# 1.20: redirect chains and login forms (Caddyfile: redir.test, plainlogin.redir.test)
+rr, ro, rs, pl = row("https://redir.test"), row("https://redir.test/old"), row("http://redir.test/session"), row("http://plainlogin.redir.test")
+ck(rr.get("final_url") == "https://redir.test/login" and rr.get("redirect_chain") == "302->https://redir.test/login",
+   "redir.test: 302 to /login followed (a hop --extras fetched): final_url and redirect_chain")
+ck(rr.get("login_form") == "http://redir.test/session" and "CleartextAuth" in rr.get("http_flags", "") and "Form" in rr.get("auth", ""),
+   "redir.test: the login page's form posts to http:// -> login_form, Form, CleartextAuth on an HTTPS row")
+ck(ro.get("redirect_chain") == "301->https://elsewhere.test/" and ro.get("final_url") == "https://redir.test/old",
+   "redir.test/old: the off-host hop is listed, not followed")
+ck(rs.get("redirect_chain") == "301->https://redir.test/session" and rs.get("final_url") == "https://redir.test/session",
+   "http://redir.test/session (found in the form's action by the crawl): http:// -> https:// followed")
+ck(pl.get("login_form") == "http://plainlogin.redir.test/login" and pl.get("http_flags") == "PlainHttp;CleartextAuth",
+   "plainlogin.redir.test: a password form on a plain-HTTP page -> CleartextAuth")
 sys.exit(1 if fails else 0)
 PYHTTP
   local rc=$?
   [ "$rc" = 0 ] && log "http check: PASS" || log "http check: FAIL (see $t/run.err)"
   return "$rc"
+}
+
+# scope: --scope against the lab (run-recon 1.20). The seed check before anything is sent,
+# origin candidates outside the allowed ranges (not contacted), the browser held to the
+# scope, and an address exclusion proved at the origin's own access log: a request to
+# LAB_ORIGIN_IP reaches the nginx container from the docker bridge gateway.
+cmd_scope(){
+  lab_env
+  [ -f "$RUN_RECON" ] || die "run-recon not found at $RUN_RECON"
+  local t fail=0 rc ip pip cid gw n0 n1 n2
+  t="$(mktemp -d /tmp/bench-scope.XXXXXX)"
+  _ck(){ if grep -qE "$2" "$1" 2>/dev/null; then log "  ok   $3"; else log "  FAIL $3 (see $1)"; fail=1; fi; }
+  _nck(){ if grep -qE "$2" "$1" 2>/dev/null; then log "  FAIL $3 (see $1)"; fail=1; else log "  ok   $3"; fi; }
+  ip="$(printf '%s' "$LAB_ORIGIN_IP" | sed 's/\./\\./g')"; pip="$(printf '%s' "$LAB_PROTECTED_IP" | sed 's/\./\\./g')"
+  log "scope check -> $t"
+  printf 'nginx.test\nspa.test\nwp.test\n' > "$t/s1.txt"
+  printf 'nginx.test\nspa.test\nwp.test\nci.test\n' > "$t/in.txt"
+  # 1. the dry run: ci.test is outside the scope, so the run would refuse to start
+  rc=0; bash "$RUN_RECON" -i "$t/in.txt" --scope "$t/s1.txt" --list-targets > "$t/plan.txt" 2>&1 || rc=$?
+  if [ "$rc" = 2 ] && grep -qE '^4 +ci\.test +domain +OUT OF SCOPE +no entry covers it' "$t/plan.txt"; then
+    log "  ok   --list-targets: ci.test out of scope, exit 2 (the run would refuse)"
+  else log "  FAIL --list-targets (exit $rc, see $t/plan.txt)"; fail=1; fi
+  # 2. no address entries: the origin candidates are held back, the browser is held to the names
+  ( cd "$t" && bash "$RUN_RECON" -i "$t/in.txt" -o "$t/a.csv" --resolvers "$RESOLVERS_FILE" --scope "$t/s1.txt" \
+      --drop-out-of-scope --origin --screenshots --no-report >"$t/a.out" 2>"$t/a.err" ) || true
+  _nck "$t/a.csv" ',ci\.test,'                                          "--drop-out-of-scope: ci.test is not run"
+  _nck "$t/a.csv.origin.txt" 'origin-(exposed|protected)'             "no address entries: no origin candidate is contacted"
+  _ck  "$t/a.csv.scope.txt" "kind=origin-candidate target=$ip via=[^ ]*direct\.nginx\.test" "the origin candidate $LAB_ORIGIN_IP is listed as held back"
+  _ck  "$t/a.csv.screenshots.tsv" '^nginx\.test	[^	]*	ok'               "the browser, held to the scope's names (MAP * ~NOTFOUND), still renders nginx.test"
+  # 3. the origin addresses allowed: the same verdicts as without --scope
+  printf 'nginx.test\nspa.test\nwp.test\n%s/32\n%s/32\n' "$LAB_ORIGIN_IP" "$LAB_PROTECTED_IP" > "$t/s2.txt"
+  ( cd "$t" && bash "$RUN_RECON" -i "$LAB/targets-origin.txt" -o "$t/b.csv" --resolvers "$RESOLVERS_FILE" --scope "$t/s2.txt" \
+      --origin --no-report >"$t/b.out" 2>"$t/b.err" ) || true
+  _ck "$t/b.csv.origin.txt" "origin-exposed \[high\] host=nginx\.test origin=$ip port=80"  "allowed ranges: nginx.test's origin $LAB_ORIGIN_IP verified"
+  _ck "$t/b.csv.origin.txt" "origin-protected \[info\] host=spa\.test origin=$pip"          "allowed ranges: spa.test origin-protected"
+  # 4. an address exclusion, checked at the origin's access log
+  cid="$(compose -f "$COMPOSE_FILE" ps -q nginx 2>/dev/null | head -n 1)"
+  gw="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.Gateway}} {{end}}' "$cid" 2>/dev/null | awk '{print $1}')"
+  _direct(){ docker logs "$cid" 2>&1 | grep -c "^$gw " || true; }
+  printf 'direct\nbackup-db\nnot-there-1\n' > "$t/wl.txt"
+  printf 'nginx.test\n' > "$t/in-n.txt"
+  printf 'nginx.test\n!%s\n!backup-db.nginx.test\n' "$LAB_ORIGIN_IP" > "$t/s3.txt"
+  n0="$(_direct)"
+  ( cd "$t" && bash "$RUN_RECON" -i "$t/in-n.txt" -o "$t/c.csv" --resolvers "$RESOLVERS_FILE" --scope "$t/s3.txt" \
+      --resolve --brute --brute-wordlist "$t/wl.txt" --certs --no-report >"$t/c.out" 2>"$t/c.err" ) || true
+  sleep 1; n1="$(_direct)"
+  _nck "$t/c.csv" 'direct\.nginx\.test|backup-db\.nginx\.test'         "excluded: direct.nginx.test (its address) and backup-db.nginx.test (its name) are not in the CSV"
+  _ck  "$t/c.csv.scope.txt" "kind=name target=direct\.nginx\.test address=$ip "   "direct.nginx.test listed as held back (resolves into $LAB_ORIGIN_IP)"
+  if [ -n "$gw" ] && [ "$n1" = "$n0" ]; then log "  ok   no request reached $LAB_ORIGIN_IP (origin access log: $n0 -> $n1 direct requests)"
+  else log "  FAIL requests reached $LAB_ORIGIN_IP under --scope (origin access log: $n0 -> $n1; gateway ${gw:-?})"; fail=1; fi
+  ( cd "$t" && bash "$RUN_RECON" -i "$t/in-n.txt" -o "$t/d.csv" --resolvers "$RESOLVERS_FILE" \
+      --resolve --brute --brute-wordlist "$t/wl.txt" --certs --no-report >"$t/d.out" 2>"$t/d.err" ) || true
+  sleep 1; n2="$(_direct)"
+  if [ "$n2" -gt "$n1" ] && grep -q 'direct\.nginx\.test' "$t/d.csv"; then
+    log "  ok   control: without --scope the same run probes direct.nginx.test ($((n2 - n1)) direct request(s) logged)"
+  else log "  FAIL control: the run without --scope did not reach $LAB_ORIGIN_IP ($n1 -> $n2), so the check proves nothing"; fail=1; fi
+  # 5. MTA-STS: the policy host outside the scope is not fetched
+  printf 'posture.test\n!mta-sts.posture.test\n' > "$t/s4.txt"; printf 'posture.test\n' > "$t/in-p.txt"
+  ( cd "$t" && bash "$RUN_RECON" -i "$t/in-p.txt" -o "$t/e.csv" --resolvers "$RESOLVERS_FILE" --scope "$t/s4.txt" \
+      --dns-posture --no-report >"$t/e.out" 2>"$t/e.err" ) || true
+  _ck "$t/e.csv.dnsposture.tsv" 'policy not fetched: mta-sts\.posture\.test is outside --scope' "MTA-STS: the policy is not fetched from an excluded name"
+  [ "$fail" = 0 ] && log "scope check: PASS" || log "scope check: FAIL"
+  return "$fail"
+}
+
+# resume: a lab run stopped by SIGTERM after two seeds, then --resume; its CSV must equal an
+# uninterrupted run's (field by field; the second reference run is the noise floor)
+cmd_resume(){
+  lab_env
+  [ -f "$RUN_RECON" ] || die "run-recon not found at $RUN_RECON"
+  local t fail=0 rc pid i
+  t="$(mktemp -d /tmp/bench-resume.XXXXXX)"
+  log "resume check -> $t"
+  _rrun(){ local d="$1"; shift; mkdir -p "$t/$d"; ( cd "$t" && exec bash "$RUN_RECON" -i "$LAB/targets.txt" -D "$t/$d" -o "$t/$d/r.csv" \
+      --resolvers "$RESOLVERS_FILE" --tls -t 1 --no-report "$@" >"$t/$d.out" 2>>"$t/$d.err" ); }
+  _rrun ref1 || true; _rrun ref2 || true
+  # in the background with exec, so $! is run-recon itself (not a subshell around it)
+  mkdir -p "$t/cut"
+  ( cd "$t" && exec bash "$RUN_RECON" -i "$LAB/targets.txt" -D "$t/cut" -o "$t/cut/r.csv" \
+      --resolvers "$RESOLVERS_FILE" --tls -t 1 --no-report >"$t/cut.out" 2>>"$t/cut.err" ) & pid=$!
+  for i in $(seq 1 600); do
+    [ "$(find "$t/cut" -path '*/_work-*/done/*' -type f 2>/dev/null | wc -l)" -ge 2 ] && break; sleep 0.2
+  done
+  kill -TERM "$pid" 2>/dev/null; rc=0; wait "$pid" || rc=$?
+  if [ "$rc" = 143 ] && grep -qx 'status=interrupted' "$t"/cut/_work-*/state 2>/dev/null; then
+    log "  ok   SIGTERM after $(find "$t/cut" -path '*/_work-*/done/*' -type f | wc -l) of 4 seeds: exit 143, work dir kept"
+  else log "  FAIL SIGTERM: exit $rc (want 143), state $(grep -h '^status=' "$t"/cut/_work-*/state 2>/dev/null)"; fail=1; fi
+  sleep 1
+  rc=0; _rrun cut --resume || rc=$?
+  if [ "$rc" = 0 ] && grep -qE -- '--resume \(session 2\): [0-9]+ of 4 seed' "$t/cut.err"; then log "  ok   --resume finished the run ($(grep -oE '[0-9]+ of 4 seed\(s\) had finished' "$t/cut.err" | tail -n 1))"
+  else log "  FAIL --resume (exit $rc, see $t/cut.err)"; fail=1; fi
+  if [ -f "$t/ref1/r.csv" ] && [ -f "$t/ref2/r.csv" ] && [ -f "$t/cut/r.csv" ] \
+     && ( cmd_compare "$t/ref1/r.csv" "$t/cut/r.csv" --exact --noise "$t/ref2/r.csv" ) > "$t/cmp.txt" 2>&1 && grep -q 'RESULT: identical' "$t/cmp.txt"; then
+    log "  ok   the resumed run's CSV equals the uninterrupted run's (compare --exact, noise floor from a second run)"
+  else log "  FAIL the resumed CSV differs (see $t/cmp.txt)"; fail=1; fi
+  [ "$fail" = 0 ] && log "resume check: PASS" || log "resume check: FAIL"
+  return "$fail"
+}
+
+# history: two lab runs with the spa backend stopped in between. --monitor must report the
+# change field by field (<out>.delta.tsv), and recon-db.sh changes/history must find it, from
+# the run CSVs and, when RECON_DB_DSN points at a PostgreSQL database, from the store (--db).
+cmd_history(){
+  lab_env
+  [ -f "$RUN_RECON" ] || die "run-recon not found at $RUN_RECON"
+  local t fail=0 db=()
+  t="$(mktemp -d /tmp/bench-history.XXXXXX)"
+  [ -n "${RECON_DB_DSN:-}" ] && db=(--db)
+  _ck(){ if grep -qE "$2" "$1" 2>/dev/null; then log "  ok   $3"; else log "  FAIL $3 (see $1)"; fail=1; fi; }
+  log "history check -> $t${RECON_DB_DSN:+ (store: \$RECON_DB_DSN)}"
+  mkdir -p "$t/runs"
+  # the baseline run measures the lab as it is now: with --db it would otherwise read target results
+  # cached by an earlier run (up to CACHE_TTL old, e.g. the previous history check's stopped spa)
+  ( cd "$t" && CACHE_FRESH_ACTIVE=1 bash "$RUN_RECON" -i "$LAB/targets.txt" -D "$t/runs" --resolvers "$RESOLVERS_FILE" --tls "${db[@]}" --no-report >"$t/a.out" 2>"$t/a.err" ) || true
+  sleep 1
+  compose -f "$COMPOSE_FILE" stop spa >/dev/null 2>&1
+  ( cd "$t" && bash "$RUN_RECON" -i "$LAB/targets.txt" -D "$t/runs" --resolvers "$RESOLVERS_FILE" --tls "${db[@]}" --monitor >"$t/b.out" 2>"$t/b.err" ) || true
+  compose -f "$COMPOSE_FILE" start spa >/dev/null 2>&1
+  local b; b="$(ls -t "$t"/runs/recon-*.csv | head -n 1)"
+  _ck "$b.delta.tsv" '^changed	spa\.test	https://spa\.test	status_code	200	502$'  "--monitor: spa.test's status 200 -> 502, field by field"
+  if awk -F'\t' 'NR > 1 && $2 != "spa.test"' "$b.delta.tsv" | grep -q .; then log "  FAIL changes reported for the services that did not change (see $b.delta.tsv)"; fail=1
+  else log "  ok   nothing else changed (nginx, wp, ci: no delta lines)"; fi
+  _ck "$b.report.html" 'Changes since the previous run'                              "report: the Changes section"
+  bash "$HERE/recon-db.sh" changes spa.test --csv "$t/runs" > "$t/changes.tsv" 2>&1
+  _ck "$t/changes.tsv" '	spa\.test	https://spa\.test	changed	status_code	200	502$'       "recon-db.sh changes --csv: the same event, with its run"
+  if [ -n "${RECON_DB_DSN:-}" ]; then
+    bash "$HERE/recon-db.sh" changes spa.test > "$t/db-changes.tsv" 2>&1
+    _ck "$t/db-changes.tsv" '	spa\.test	https://spa\.test	changed	status_code	200	502$'  "recon-db.sh changes (PostgreSQL store, --db): the same event"
+    bash "$HERE/recon-db.sh" history nginx.test > "$t/db-history.tsv" 2>&1
+    _ck "$t/db-history.tsv" '^nginx\.test	https://nginx\.test	[0-9-]+	[0-9-]+	[0-9]+	[0-9]+	present	200 ' "recon-db.sh history (store): nginx.test present, first/last seen"
+  else
+    log "  skip the store (set RECON_DB_DSN to a PostgreSQL database to check --db history)"
+  fi
+  [ "$fail" = 0 ] && log "history check: PASS" || log "history check: FAIL"
+  return "$fail"
+}
+
+# tls: --tls-enum against the TLS fixtures (run-recon 1.20, lab/tls-nginx.conf). Each fixture's
+# flags and columns, the version matrix cross-checked against tlsx's own per-version handshakes
+# (-min-version/-max-version), and the NULL-suite acceptance against the container's openssl.
+cmd_tls(){
+  lab_env
+  [ -f "$RUN_RECON" ] || die "run-recon not found at $RUN_RECON"
+  [ -s "$LAB/targets-tls.txt" ] || die "no lab/targets-tls.txt (run: $0 up)"
+  local t v fail=0; t="$(mktemp -d /tmp/bench-tls.XXXXXX)"
+  log "TLS posture check (--tls-enum) against lab/targets-tls.txt -> $t"
+  ( cd "$t" && bash "$RUN_RECON" -i "$LAB/targets-tls.txt" -o "$t/t.csv" \
+      --resolvers "$RESOLVERS_FILE" --tls-enum --no-report >"$t/run.out" 2>"$t/run.err" ) || true
+  # an independent reading of the matrix: one tlsx run per version with Go's TLS stack (-sm ctls:
+  # tlsx 1.4.0's default "auto" mode hung for minutes on the fixtures that refuse the version)
+  if command -v tlsx >/dev/null 2>&1; then
+    for v in tls10 tls11 tls12 tls13; do
+      timeout 120 tlsx -l "$LAB/targets-tls.txt" -json -silent -tls-version -sm ctls -min-version "$v" -max-version "$v" -timeout 10 \
+        2>/dev/null | python3 -I -c 'import sys, json; [print(json.loads(l)["host"] + "\t" + sys.argv[1]) for l in sys.stdin if l.strip()]' "$v" >> "$t/tlsx-versions.tsv"
+    done
+  fi
+  # the container's own OpenSSL: does legacy.tls.test accept NULL-SHA when it is all that is offered?
+  docker exec lab-tlslab-1 sh -c 'echo | openssl s_client -connect 127.0.0.1:4431 -servername legacy.tls.test -tls1_2 -cipher "NULL-SHA:@SECLEVEL=0" 2>/dev/null' \
+    > "$t/openssl-null.txt" 2>&1 || true
+  python3 -I - "$t/t.csv" "$t/tlsx-versions.tsv" "$t/openssl-null.txt" <<'PYTLS' || fail=1
+import sys, csv
+csv_f, tv_f, null_f = sys.argv[1:4]
+try:
+    rows = {r["host"]: r for r in csv.DictReader(open(csv_f, newline="", encoding="utf-8")) if r.get("tls_version")}
+except OSError:
+    rows = {}
+fails = 0
+def ck(ok, msg):
+    global fails
+    print("[bench]   %s %s" % ("ok  " if ok else "FAIL", msg))
+    fails += 0 if ok else 1
+def fl(h):
+    return set((rows.get(h, {}).get("tls_flags") or "").split(";")) - {""}
+L, F, D, M = (rows.get(h + ".tls.test", {}) for h in ("legacy", "future", "default", "modern"))
+ck(L.get("tls_supported") == "TLS 1.2;TLS 1.1;TLS 1.0" and M.get("tls_supported") == "TLS 1.3;TLS 1.2",
+   "version matrix: legacy TLS 1.2/1.1/1.0, modern TLS 1.3/1.2")
+ck(L.get("tls_weak_cipher") == "TLS 1.2:TLS_RSA_WITH_NULL_SHA" and not M.get("tls_weak_cipher"),
+   "weak-only hello: legacy accepts TLS_RSA_WITH_NULL_SHA, modern accepts none")
+ck({"WeakTLS", "WeakCipher", "WeakKey", "WeakSig", "SelfSigned", "CertUntrusted"} <= fl("legacy.tls.test"),
+   "legacy: WeakTLS, WeakCipher, WeakKey, WeakSig, SelfSigned, CertUntrusted (the chain check's level-0 retry)")
+ck(L.get("cert_key") == "RSA 1024" and L.get("cert_sig_alg") == "sha1WithRSAEncryption", "legacy: cert_key RSA 1024, cert_sig_alg sha1WithRSAEncryption")
+ck("CertNotYetValid" in fl("future.tls.test") and "CertExpired" not in fl("future.tls.test"), "future: CertNotYetValid (not CertExpired)")
+ck("DefaultCert" in fl("default.tls.test") and D.get("cert_key") == "RSA 2048", "default: DefaultCert (O=Internet Widgits Pty Ltd), RSA 2048")
+ck(not (fl("modern.tls.test") & {"WeakTLS", "WeakCipher", "WeakKey", "WeakSig", "DefaultCert", "CertNotYetValid", "CertExpired"})
+   and M.get("cert_key") == "EC P-256", "modern (the control): none of those flags, EC P-256")
+# tlsx's per-version handshakes agree with the matrix
+tv = {}
+try:
+    for line in open(tv_f, encoding="utf-8"):
+        h, v = line.rstrip("\n").split("\t")
+        tv.setdefault(h, set()).add({"tls10": "TLS 1.0", "tls11": "TLS 1.1", "tls12": "TLS 1.2", "tls13": "TLS 1.3"}[v])
+except (OSError, ValueError, KeyError):
+    tv = {}
+if tv:
+    same = all(tv.get(h, set()) == set((r.get("tls_supported") or "").split(";")) - {""} for h, r in rows.items())
+    ck(same, "tlsx -min-version/-max-version per version agrees with tls_supported on every fixture")
+else:
+    print("[bench]   skip tlsx cross-check (tlsx not found)")
+try:
+    null = open(null_f, encoding="utf-8", errors="replace").read()
+except OSError:
+    null = ""
+ck("Cipher is NULL-SHA" in null, "the container's openssl: legacy.tls.test negotiates NULL-SHA when only it is offered")
+sys.exit(1 if fails else 0)
+PYTLS
+  [ "$fail" = 0 ] && log "tls check: PASS" || log "tls check: FAIL (see $t/run.err)"
+  return "$fail"
+}
+
+cmd_ship(){
+  lab_env
+  [ -f "$RUN_RECON" ] || die "run-recon not found at $RUN_RECON"
+  local t rc mp port i fail=0 ship
+  ship="$(dirname "$RUN_RECON")/ship-recon.sh"
+  t="$(mktemp -d /tmp/bench-ship.XXXXXX)"
+  log "Tideline shipping check (--ship to lab/mock-tideline.py on loopback) -> $t"
+  bash "$LAB/gen-ship-certs.sh" "$t/pki" >/dev/null 2>&1 || die "could not make the test PKI (openssl)"
+  mkdir -p "$t/store"
+  python3 -I "$LAB/mock-tideline.py" --cert "$t/pki/server.pem" --key "$t/pki/server.key" --client-ca "$t/pki/root.pem" \
+    --store "$t/store" --schemas "$(dirname "$RUN_RECON")/schemas" --port 0 > "$t/mock.log" 2>&1 &
+  mp=$!
+  for i in $(seq 1 100); do [ -s "$t/store/port" ] && break; sleep 0.1; done
+  port="$(cat "$t/store/port" 2>/dev/null || true)"
+  [ -n "$port" ] || { kill "$mp" 2>/dev/null; die "the mock ingest did not start (see $t/mock.log)"; }
+  local sargs=(--ship "https://127.0.0.1:$port" --ship-cert "$t/pki/rr-test01.pem" --ship-key "$t/pki/rr-test01.key" --ship-ca "$t/pki/root.pem")
+  rc=0; ( cd "$t" && bash "$RUN_RECON" -i "$LAB/targets.txt" -o "$t/s.csv" --resolvers "$RESOLVERS_FILE" --tls --ipv6 \
+      --takeover --dns-posture --screenshots --engagement lab-ship "${sargs[@]}" >"$t/run.out" 2>"$t/run.err" ) || rc=$?
+  echo "$rc" > "$t/run.rc"
+  # a second delivery of the same run: Tideline already has it
+  : > "$t/store/requests.ship1"; cp "$t/store/requests.jsonl" "$t/store/requests.ship1"; : > "$t/store/requests.jsonl"
+  rc=0; bash "$ship" ship "$t/s.csv" > "$t/reship.out" 2> "$t/reship.err" || rc=$?; echo "$rc" > "$t/reship.rc"
+  cp "$t/store/requests.jsonl" "$t/store/requests.ship2"; : > "$t/store/requests.jsonl"
+  # the same files as another run (new run_id), Tideline busy on part 2, then a retry
+  mkdir -p "$t/copy"; cp "$t"/s.csv "$t"/s.csv.* "$t/copy/" 2>/dev/null; rm -f "$t/copy/s.csv.ship-state.json"
+  cp -r "$t"/screenshots-* "$t/copy/" 2>/dev/null || true
+  python3 -I - "$t/copy" <<'PYNEW'
+import json, hashlib, uuid, sys, os
+d = sys.argv[1]; p = os.path.join(d, "s.csv.run.json")
+j = json.load(open(p)); j["run_id"] = str(uuid.uuid4()); json.dump(j, open(p, "w"), indent=2)
+h = hashlib.sha256(open(p, "rb").read()).hexdigest(); m = os.path.join(d, "s.csv.manifest.sha256")
+lines = open(m).readlines()
+open(m, "w").write("".join((h + "  s.csv.run.json\n") if l.endswith("  s.csv.run.json\n") else l for l in lines))
+PYNEW
+  printf '[{"method":"PUT","part":2,"status":503,"times":20}]' > "$t/store/faults.json"
+  rc=0; SHIP_RETRIES=0 bash "$ship" ship "$t/copy/s.csv" --url "https://127.0.0.1:$port" --cert "$t/pki/rr-test01.pem" \
+    --key "$t/pki/rr-test01.key" --ca "$t/pki/root.pem" > /dev/null 2> "$t/busy.err" || rc=$?; echo "$rc" > "$t/busy.rc"
+  printf '[]' > "$t/store/faults.json"; : > "$t/store/requests.jsonl"
+  rc=0; bash "$ship" ship "$t/copy/s.csv" > /dev/null 2> "$t/retry.err" || rc=$?; echo "$rc" > "$t/retry.rc"
+  cp "$t/store/requests.jsonl" "$t/store/requests.retry"
+  kill "$mp" 2>/dev/null; wait "$mp" 2>/dev/null || true
+  python3 -I - "$t" <<'PYSHIP' || fail=1
+import csv, json, os, sys
+t = sys.argv[1]
+fails = 0
+def ck(ok, msg):
+    global fails
+    print("[bench]   %s %s" % ("ok  " if ok else "FAIL", msg))
+    fails += 0 if ok else 1
+def rd(p):
+    try:
+        return open(os.path.join(t, p), encoding="utf-8").read().strip()
+    except OSError:
+        return ""
+def reqs(p):
+    try:
+        return [(j["method"], j["path"].rsplit("/", 1)[-1], j["status"]) for j in map(json.loads, open(os.path.join(t, "store", p)))]
+    except OSError:
+        return []
+ck(rd("run.rc") == "0", "the lab run with --ship exits 0")
+st = json.loads(rd("s.csv.ship-state.json") or "{}")
+ck(st.get("state") == "complete" and st.get("server_state") == "verified", "ship-state.json: complete, Tideline verified the run")
+rid = st.get("run_id", "")
+rdir = os.path.join(t, "store", "runs", rid)
+try:
+    man = json.load(open(os.path.join(rdir, "manifest.json")))
+except (OSError, ValueError):
+    man = {"parts": []}
+same = bool(man["parts"]) and all(
+    open(os.path.join(rdir, "parts", str(p["n"])), "rb").read() == open(os.path.join(t, p["name"]), "rb").read()
+    for p in man["parts"])
+ck(same, "every part Tideline stored equals the local file (%d parts)" % len(man["parts"]))
+def ung(v):
+    return v[1:] if v[:1] == "'" and v[1:2] in ("=", "+", "-", "@", "\t", "\r") else v
+rows = list(csv.reader(open(os.path.join(t, "s.csv"), newline="", encoding="utf-8")))
+up = next((p for p in man["parts"] if p["kind"] == "urls"), None)
+js = [json.loads(l) for l in open(os.path.join(rdir, "parts", str(up["n"])), encoding="utf-8")] if up else []
+ck(len(js) == len(rows) - 1 and all([ung(c) for c in r] == [j[k] for k in rows[0]] for r, j in zip(rows[1:], js)),
+   "the shipped URL records equal the local CSV, row for row and field for field (%d rows)" % len(js))
+shots = [p for p in man["parts"] if p.get("media") == "image/png"]
+nshots = sum(1 for l in open(os.path.join(t, "s.csv.manifest.sha256")) if "  screenshots-" in l and l.rstrip().endswith(".png"))
+ck(nshots > 0 and len(shots) == nshots, "the screenshots travel as image/png artifacts (%d of %d)" % (len(shots), nshots))
+ck(man.get("engagement") == "lab-ship" and man.get("sensor") == "rr-test01", "the manifest carries the engagement and the certificate's sensor")
+r1 = reqs("requests.ship1")
+ck(r1[:1] == [("POST", "runs", 201)] and r1[-1:] == [("POST", "complete", 202)]
+   and sum(1 for r in r1 if r[0] == "PUT" and r[2] == 204) == len(man["parts"]) and len(r1) == len(man["parts"]) + 2,
+   "one open (201), one PUT per part (204: hash and schema checks passed), one complete (202)")
+ck(rd("reship.rc") == "0" and reqs("requests.ship2") == [("POST", "runs", 200)], "shipping it again: Tideline answers 200 and nothing is re-sent")
+ck(rd("busy.rc") == "4" and "HTTP 503" in rd("busy.err"), "Tideline busy on part 2: exit 4, the run kept for a retry")
+rr = reqs("requests.retry")
+ck(rd("retry.rc") == "0" and rr[:1] == [("POST", "runs", 200)] and not any(r[0] == "PUT" and r[1] == "1" for r in rr)
+   and rr[-1:] == [("POST", "complete", 202)], "the retry re-opens the run and sends only what Tideline lacks")
+sys.exit(1 if fails else 0)
+PYSHIP
+  [ "$fail" = 0 ] && log "ship check: PASS" || log "ship check: FAIL (see $t)"
+  return "$fail"
 }
 
 cmd_checks(){
@@ -645,22 +1137,36 @@ cmd_checks(){
   cmd_zone || rc=1
   cmd_origin || rc=1
   cmd_http || rc=1
-  [ "$rc" = 0 ] && log "lab checks: PASS (takeover, zone, origin, http)" || log "lab checks: FAIL"
+  cmd_tls || rc=1
+  cmd_posture || rc=1
+  cmd_discovery || rc=1
+  cmd_scope || rc=1
+  cmd_resume || rc=1
+  cmd_history || rc=1
+  cmd_ship || rc=1
+  [ "$rc" = 0 ] && log "lab checks: PASS (takeover, zone, origin, http, tls, posture, discovery, scope, resume, history, ship)" || log "lab checks: FAIL"
   return "$rc"
 }
 
 case "${1:-help}" in
   up)       shift; cmd_up "$@";;
   takeover) cmd_takeover;;
+  posture)  cmd_posture;;
+  discovery) cmd_discovery;;
+  scope)    cmd_scope;;
+  resume)   cmd_resume;;
+  history)  cmd_history;;
   zone)     cmd_zone;;
   origin)   cmd_origin;;
   http)     cmd_http;;
+  tls)      cmd_tls;;
+  ship)     cmd_ship;;
   checks)   cmd_checks;;
   down)     cmd_down;;
   hosts)    cmd_hosts;;
   run)      shift; cmd_run "$@";;
   compare)  shift; cmd_compare "$@";;
   bench)    shift; cmd_bench "$@";;
-  help|-h|--help) sed -n '2,43p' "$0" | sed 's/^# \{0,1\}//';;
-  *) die "unknown command: ${1:-} (try: up|down|hosts|run|compare|bench|takeover|zone|origin|http|checks)";;
+  help|-h|--help) awk 'NR > 1 && !/^#/ { exit } NR > 1 && !/^# ?=+$/' "$0" | sed 's/^# \{0,1\}//';;
+  *) die "unknown command: ${1:-} (try: up|down|hosts|run|compare|bench|takeover|zone|origin|http|tls|posture|discovery|scope|resume|history|ship|checks)";;
 esac

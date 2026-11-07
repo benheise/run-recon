@@ -26,18 +26,18 @@ container lab in this release and its output was checked.
 | subzy (not PD) | — | `--takeover` fingerprints | 1.2.1 | yes | |
 | subfinder | 2.17.0 | `--subs` | 2.17.0 | binary only | its sources are internet APIs; `.test` seeds skip them |
 | urlfinder | 0.0.3 | passive URLs | 0.0.3 | no | internet archives |
-| naabu | 2.7.0 | `--ports` | 2.7.0 | no | next: a non-standard-port service in the lab |
-| alterx | 0.1.0 | `--permute` | 0.1.0 | no | next: guessable names in the lab zone |
-| shuffledns | 1.2.1 | `--brute` (needs massdns) | 1.2.1 | no | next: same |
-| cdncheck | 1.4.0 | `--origin` | 1.4.0 | no | |
-| uncover | 1.2.1 | `--favicon` | 1.2.1 | no | `--favicon` actually queries `ssl:"<domain>"`; a real favicon-hash pivot is planned (§3) |
-| notify | 1.0.7 | `--monitor --notify` | 1.0.7 | no | |
+| naabu | 2.7.0 | `--ports` | 2.7.0 | yes (v1.20) | lab: `https://nginx.test:8443` found and probed (`bench-run-recon.sh discovery`) |
+| alterx | 0.1.0 | `--permute` | 0.1.0 | yes (v1.20) | lab: `grafana.nginx.test`, which only a permutation guesses |
+| shuffledns | 1.2.1 | `--brute` (needs massdns, built from source) | 1.2.1 | yes (v1.20) | lab: `backup-db.nginx.test` from the lab wordlist |
+| cdncheck | 1.4.0 | `--origin` | 1.4.0 | yes (v1.20) | lab edge untagged; `104.16.0.1 [waf] [cloudflare]` in the format `--origin` parses |
+| uncover | 1.2.1 | `--favicon` (cert-name search and, since v1.19, the favicon-hash pivot) | 1.2.1 | yes, without keys (v1.20) | no keys: one warning instead of silence; searches with keys stay V7 (Kali) |
+| notify | 1.0.7 | `--monitor --notify` (`-bulk`, `NOTIFY_CONFIG` → `-pc`) | 1.0.7 | yes (v1.20) | lab: one message to a loopback webhook naming the new asset |
 | chaos-client | 0.5.2 | via subfinder's `chaos` source (key in its provider config) | — | — | |
 | nuclei-templates | 10.5.1 | `nuclei -update-templates` (setup `--include-heavy`) | not pinned | — | templates update on their own schedule |
 | interactsh-client / -server | 1.4.1 | not called directly; `--interactsh-server URL` points nuclei at your own server | — | — | |
-| **cloudlist** | 1.5.1 | **not wired** | — | — | planned: owned-asset list from cloud APIs (§3) |
-| **tldfinder** | 0.0.2 | **not wired** | — | — | planned: the same brand under other TLDs |
-| **vulnx** | 2.0.2 | **not wired** | — | — | optional online complement to the offline NVD/KEV/EPSS join (adds PoC / template availability); successor of cvemap, whose API was retired on 2025-08-01 |
+| cloudlist | 1.5.1 | `--cloudlist [CFG]` (v1.20) | 1.5.1 | yes (v1.20) | lab: the Terraform provider reads `lab/cloud.tfstate` offline; real cloud accounts stay a Kali check |
+| tldfinder | 0.0.2 | `--tld-variants` (v1.20), `-dm tld` | 0.0.2 | suite only | it queries public DNS whatever `-r` says, so it cannot run inside the lab |
+| vulnx | 2.0.2 | `--vulnx` (v1.20) | 2.0.2 | yes (v1.20) | real API (no key) on the lab's CPEs; no version matching, so product-level leads; the module is `github.com/projectdiscovery/vulnx/v2` |
 | depx | 0.1.1 | not wired | — | — | supply-chain intelligence for lockfiles, SBOMs and GitHub orgs. Useful for DevSecOps pipelines, not for an external attack-surface scan |
 | pdtm | 0.1.5 | not used | — | — | it installs the latest release and offers no version selection, while run-recon parses tool output and needs pinned versions |
 | proxify, simplehttpserver, aix | — | not needed | — | — | `--proxy` covers proxying |
@@ -70,25 +70,25 @@ arrive behind a switch, as WebInventory's opt-in probes do.
 
 | WebInventory capability (product sheet §) | run-recon v1.17 (v1.18 and v1.19 changes in bold) | Status |
 |---|---|---|
-| Fail-closed scope, `-Scope`, `-ListTargets` (A1) | per-seed scope filter on discovered names; no authorisation file, no dry run | **gap** (batch 4: `--scope FILE`, `--list-targets`) |
+| Fail-closed scope, `-Scope`, `-ListTargets` (A1) | per-seed scope filter on discovered names; **v1.20: `--scope FILE` (names, `*.names`, IPv4/IPv6 ranges, ASNs, `!` exclusions): seeds and the file checked before anything is sent (exit 2), `--drop-out-of-scope`, `--list-targets` dry run; discovered names, names resolving into excluded ranges, addresses run-recon picks itself (origin candidates, scan hits, range sweeps), the crawl (katana `-cs`/`-cos`), the screenshot browser (`MAP * ~NOTFOUND`), nuclei/whatweb/cmseek redirects all held to it; `<out>.scope.txt` lists what was held back** | parity (redirects are not followed rather than followed and checked; gospider/hakrawler skipped under `--scope`) |
 | Connect scan, any-port HTTP/TLS detection (A2, A3) | naabu `--ports`, then httpx | parity in approach; naabu not yet lab-run |
-| HTTP fields (A4): FinalUrl, RedirectChain, Auth, Cookies, CookieFlagIssues, MissingSecHeaders, HstsMaxAge, AltSvc, BodySha256, ResponseMs | status, length, title, server, technologies; **v1.19: `redirect_location`, `response_ms`, `body_sha256`, `content_type`, `powered_by`, `auth`, `cookies`, `cookie_issues`, `missing_sec_headers`, `hsts_max_age`, `alt_svc`, `http_flags` (`CleartextAuth`, `PlainHttp`), from the enrichment request itself (no extra traffic)** | parity except the followed redirect chain (per-URL `Location` only; each hop that was crawled has its own row) and password-form detection |
+| HTTP fields (A4): FinalUrl, RedirectChain, Auth, Cookies, CookieFlagIssues, MissingSecHeaders, HstsMaxAge, AltSvc, BodySha256, ResponseMs | status, length, title, server, technologies; **v1.19: `redirect_location`, `response_ms`, `body_sha256`, `content_type`, `powered_by`, `auth`, `cookies`, `cookie_issues`, `missing_sec_headers`, `hsts_max_age`, `alt_svc`, `http_flags` (`CleartextAuth`, `PlainHttp`), from the enrichment request itself (no extra traffic)**; **v1.20: `final_url` and `redirect_chain` (`code->URL | …`, same-host hops followed through the run's own records, and with `--extras` through the ones it did not probe; off-host hops listed, not followed, as in WebInventory), `login_form` (httpx `-er` on the same request) with `Form` in `auth` and `CleartextAuth` for a form on plain HTTP or posting to `http://`** | parity |
 | Favicon mmh3 / MD5 (A5) | **v1.19: `favicon_mmh3`, `favicon_md5` with `--extras`, `--favicon` or `--origin`; `--favicon` searches the hash on Shodan/Fofa (mmh3) and Censys (MD5) through uncover** | parity (opt-in here; on by default in WebInventory) |
 | robots.txt, security.txt, 404 probe (A6) | **v1.19: `--extras`: `robots` and `security_txt` columns, robots paths as URL rows, `security-txt-expired/invalid [low]`, `catch-all-200`, error-page versions** | parity (opt-in) |
 | OPTIONS / risky methods (A7), identification paths (A8) | nuclei tech templates under `--active` | partial |
-| TLS posture (A9): version matrix, ciphers, weak ciphers, key/sig strength, chain validation | negotiated version/cipher, expiry, self-signed, name mismatch; **v1.18: chain validation against the system trust store (`CertUntrusted`), `CertExpiring` at 30 days like `-CertWarnDays`** | partial: chain validation now at parity; version matrix and key/sig strength still to map |
+| TLS posture (A9): version matrix, ciphers, weak ciphers, key/sig strength, chain validation | negotiated version/cipher, expiry, self-signed, name mismatch; **v1.18: chain validation against the system trust store (`CertUntrusted`), `CertExpiring` at 30 days like `-CertWarnDays`**; **v1.20: `--tls-enum` runs WebInventory's plan (one ClientHello per version, TLS 1.3 to SSL 3.0, and one offering only weak suites, each stopped at the ServerHello) → `tls_supported`, `tls_ciphers`, `tls_weak_cipher`, `WeakTLS`, `WeakCipher`; tlsx `-cert` → `cert_key`, `cert_sig_alg`, `cert_not_before`, `WeakKey`, `WeakSig`, `CertNotYetValid`, `DefaultCert` (WebInventory's rules + ingress-nginx and Traefik); the chain check retries at OpenSSL security level 0 when the local default refuses the handshake** | parity (detail in columns, flags without the `:detail` suffix) |
 | SAN vhosts (A10) | SANs feed discovery (tlsx), vhost brute (`--vhost`) | different approach |
 | Reverse DNS (A11) | **v1.19: `ptr` column under `--enrich`; non-public addresses asked only of your `--resolvers`** | parity (opt-in, as in WebInventory) |
 | Fingerprinting engine, CPEs (A12) | httpx tech detection (Wappalyzer data) + rule-based CPE emission (FPV-06) | parity for web; no Recog banners |
-| Version advisories (A13) | offline NVD/KEV/EPSS join (`recon-db.sh vulns`) | covered by the join |
+| Version advisories (A13) | offline NVD/KEV/EPSS join (`recon-db.sh vulns`); **v1.20: WebInventory's 184 CPE alias groups (`cpe-aliases.json`: Jira Server/Data Center, Varnish's vendor strings, …)** | covered by the join |
 | JARM (B1) | tlsx `-jarm` under `--origin`, **v1.18: a host attribute in `<out>.edge.tsv`, no longer reported as an "exposed origin"** | parity; JA4S not planned (FoxIO licence) |
 | SMB / RDP / SNMP identity (B2–B4) | none | not planned: internal-network probes. For EASM, port-level exposure of 445/3389/161 from naabu is the finding |
 | Screenshots (B5) | httpx `-ss` / gowitness; **v1.18: the browser gets `--proxy-server` / a `NO_PROXY` bypass list, and each capture is validated (`<out>.screenshots.tsv`)**; **v1.20: `--host-resolver-rules` from `--resolvers`; gowitness 3 validated from its JSON lines (go-rod driver, explicit URLs)** | parity in routing and evidence; no per-page scope proxy |
 | Jump-host proxy (B6) | `--proxy` | parity |
-| Pace, retries, resilience (C1) | rate, threads, retries, late retry; no resume | partial |
-| Outputs (C2): JSONL with evidence, delta, run.json, SHA-256 manifest | CSV, HTML report, side artifacts, `--monitor` new-asset diff; **v1.18: `<out>.run.json` (version, command line, tool versions, resolvers, per-seed counts, warnings, exit status); exit 3 for a run with no results** | partial (batch 4: SHA-256 manifest, field-level delta) |
+| Pace, retries, resilience (C1) | rate, threads, retries, late retry; **v1.20: SIGINT/SIGTERM stop every stage and keep the work dir (exit 130/143); `--resume` continues with the seeds that finished (state file with command-line/input/scope hashes, a lock while running)** | parity (resume per seed, not per check) |
+| Outputs (C2): JSONL with evidence, delta, run.json, SHA-256 manifest | CSV, HTML report, side artifacts, `--monitor` new-asset diff; **v1.18: `<out>.run.json` (version, command line, tool versions, resolvers, per-seed counts, warnings, exit status); exit 3 for a run with no results**; **v1.20: `<out>.manifest.sha256` (every file the run wrote, `sha256sum -c` format) and `<out>.delta.tsv` (per service: new, removed, 17 fields compared)** | parity except JSONL with per-detection evidence |
 | Hostile-content handling (C3) | report escapes data; CSV formula guard added in v1.17 | parity for CSV |
-| Inventory store (D): first/last seen, change log, hash-chained ledger | PostgreSQL cache + per-run host rows | **gap** (batch 4: first/last seen and change events in recon-db) |
+| Inventory store (D): first/last seen, change log, hash-chained ledger | PostgreSQL cache + per-run host rows; **v1.20: the compared fields stored per run, `recon_runs` (seeds covered, columns present), `recon-db.sh history` (first/last seen, gone since) and `changes` (events), also offline over run CSVs (`--csv`)** | parity except the hash-chained ledger (the manifest hashes each run's files) |
 | Offline vulnerability correlation (E) | `recon-db.sh vulns` (NVD 2.0, KEV, EPSS, match confidence) | parity |
 | Lab, A/B, "faster and identical" | `bench-run-recon.sh` + `lab/`; **v1.18: zone and origin fixtures, `bench-run-recon.sh checks`** | parity |
 | (no WebInventory equivalent) DNS zone exposure | **v1.18: `--zone-exposure` (AXFR per name server, NSEC walk, NSEC3 parameters)** | new |
@@ -100,6 +100,8 @@ arrive behind a switch, as WebInventory's opt-in probes do.
 |---|---|---|
 | 1 | nuclei callbacks off by default; asnmap key check and visible errors; CNAME/dangling takeover check; katana honours `--resolvers`/`--proxy`; stdin closed for all tools; late HTTPS retry in the live probe; CSV formula guard; pinned tool versions with a lab-verified warning | **done in v1.17.0** |
 | 2 | httpx fields (final URL, redirect target, security headers, cookie flags, HSTS, Alt-Svc, body hash, response time, favicon mmh3) as appended CSV columns; real favicon pivot; reverse DNS; opt-in robots/security.txt | **done in v1.19.0** (see `PLAN.md`) |
-| 3 | Email and DNS posture (SPF, DMARC, MTA-STS, DNSSEC, CAA, dangling MX/NS); cloudlist inventory diff; tldfinder seed expansion; lab fixtures for naabu, alterx, shuffledns, cdncheck, uncover, notify | |
-| 4 | Evidence and history: scope file + dry run, run manifest and run.json, field-level delta, first/last seen in recon-db | run.json done in v1.18.0 |
+| 3 | Email and DNS posture (SPF, DMARC, MTA-STS, DNSSEC, CAA, dangling MX/NS); cloudlist inventory diff; tldfinder seed expansion; lab fixtures for naabu, alterx, shuffledns, cdncheck, uncover, notify | **done in v1.20.0**: `--dns-posture`, `--cloudlist`, `--tld-variants` (listed only), `--vulnx`; `bench-run-recon.sh posture` and `discovery` |
+| 4 | Evidence and history: scope file + dry run, run manifest and run.json, field-level delta, first/last seen in recon-db | run.json done in v1.18.0; **the rest done in v1.20.0**: `--scope`, `--list-targets`, `.manifest.sha256`, `.delta.tsv`, `recon-db.sh history/changes/diff`, `--resume` |
+| 5 | Redirect chains and login forms (B2.8); TLS version matrix and certificate strength (T1, T2); CPE aliases (X1) | **done in v1.20.0**: `final_url`, `redirect_chain`, `login_form`; `--tls-enum`; `cert_key`, `cert_sig_alg`, `cert_not_before` and four TLS flags; `cpe-aliases.json`; `bench-run-recon.sh tls` |
+| 6 | JSON output and result shipping to Tideline (PLAN P1–P3, recon-platform-plan §11) | **done in v1.20.0**: `--json` (13 record kinds, `schemas/`), `run_id`, `--engagement`, `--job-id`, `--ship` with `ship-recon.sh`; `lab/mock-tideline.py`; `bench-run-recon.sh ship` |
 | report review | `REPORT-REVIEW.md`: `--zone-exposure`, verified `--origin`, screenshot routing and validation, run integrity (seed-resolving preflight, per-seed warnings, exit 3, run.json), report rebuild (names, cards, graded TLS), TLS chain validation, crawl-junk filter | **done in v1.18.0** |

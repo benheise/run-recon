@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tideline:schema:run-recon.delta/1",
+  "title": "run-recon delta",
+  "description": "One service change against the previous run, from --monitor (a row of <out>.delta.tsv). Values are strings, as in the TSV.",
+  "x-tideline-schema": "run-recon.delta/1",
+  "x-minor": 0,
+  "type": "object",
+  "properties": {
+    "change": {
+      "type": "string"
+    },
+    "seed": {
+      "type": "string"
+    },
+    "service": {
+      "type": "string"
+    },
+    "field": {
+      "type": "string"
+    },
+    "old": {
+      "type": "string"
+    },
+    "new": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "change",
+    "seed",
+    "service",
+    "field",
+    "old",
+    "new"
+  ],
+  "additionalProperties": {
+    "type": "string"
+  }
+}

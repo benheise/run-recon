@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tideline:schema:run-recon.dnsposture/1",
+  "title": "run-recon dnsposture",
+  "description": "One name checked by --dns-posture (a row of <out>.dnsposture.tsv). Values are strings, as in the TSV.",
+  "x-tideline-schema": "run-recon.dnsposture/1",
+  "x-minor": 0,
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string"
+    },
+    "role": {
+      "type": "string"
+    },
+    "apex": {
+      "type": "string"
+    },
+    "mx": {
+      "type": "string"
+    },
+    "spf": {
+      "type": "string"
+    },
+    "spf_all": {
+      "type": "string"
+    },
+    "spf_lookups": {
+      "type": "string"
+    },
+    "dmarc": {
+      "type": "string"
+    },
+    "mta_sts": {
+      "type": "string"
+    },
+    "tls_rpt": {
+      "type": "string"
+    },
+    "caa": {
+      "type": "string"
+    },
+    "ns": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "name",
+    "role",
+    "apex",
+    "mx",
+    "spf",
+    "spf_all",
+    "spf_lookups",
+    "dmarc",
+    "mta_sts",
+    "tls_rpt",
+    "caa",
+    "ns"
+  ],
+  "additionalProperties": {
+    "type": "string"
+  }
+}

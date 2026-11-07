@@ -407,7 +407,7 @@ hashed locally is listed in `PLAN.md` (F10).
   like the lab "breaking" between sessions. Started as a tracked background process it stays up. The new
   run-integrity checks reported it correctly: "no resolver answered", per-seed "none resolved", exit 3.
 
-## v1.20.0 (unreleased): the v1.18 follow-ups (F1–F10)
+## v1.20.0: the v1.18 follow-ups (F1–F10)
 
 Same lab and method; baseline v1.19.0 frozen from its tag (`938f58e`). The lab gained three fixtures for
 this work (`origin.spa.test` → a 403-only address, `nsec3.test` on BIND 9.18, nothing else changed), and
@@ -459,3 +459,299 @@ were recorded).
 - **An awk `NR == FNR` idiom misfires when the first file is empty**: every line of the second file is taken as
   part of the first. It suppressed every `origin-protected` line until the test with no exposed origin caught it.
 - **dnsx `-a -aaaa`** answers both families in one record; the mock answered only the last flag it saw.
+
+## v1.20.0: Batch 3, email and DNS posture and discovery coverage
+
+Same lab and method. The baseline is the follow-ups branch (`followups-v1.18`, frozen with `git archive`), so
+the A/B isolates Batch 3. The lab gained the `posture.test` zone, two MTA-STS policies, a Terraform state, port
+8443 on the ingress and two discovery names in `db.test`; both versions ran against the same lab.
+
+### A/B and cost
+
+| Scenario | baseline wall s | Batch 3 wall s | baseline CPU s | Batch 3 CPU s | accuracy | `--exact` |
+|---|---:|---:|---:|---:|---|---|
+| lab, `--tls --ipv6` (vs follow-ups) | 24.08 | 23.55 | 12.39 | 12.44 | 3/3 / 3/3 | identical (87 rows) |
+| farm, `--tls --ipv6 -t 10`, without → with `--dns-posture` (same version) | 92.73 | 93.52 | 81.12 | 83.57 | 3/3 / 3/3 | identical (50 rows) |
+
+The default path did not change. `--dns-posture` costs under a second of wall time and 2.5 s of CPU on 50
+seeds: it runs once in the main process, mostly dig calls, and only names with MX or SPF records (and each
+zone apex) get the mail checks.
+
+### Lab fixture checks (real tools)
+
+`bench-run-recon.sh checks` → **PASS** on all six (takeover, zone, origin, http, posture, discovery).
+
+| Check | Fixture | Result |
+|---|---|---|
+| posture | posture.test | `spf-permissive [high]`, `mx-dangling [high]`, `ns-dangling [high]`, `ns-lame [medium] reason=refused` (BIND), `mta-sts-mx-mismatch [medium]`, `dmarc-none [low]`, `dmarc-no-rua`, `mta-sts-testing`, `tlsrpt-missing` (info); no CAA or lame finding for what is correct |
+| posture | good.posture.test | no finding; the MTA-STS `enforce` policy fetched with Caddy's CA passed through `--mta-sts-ca` |
+| posture | without `--mta-sts-ca` | `mta-sts-policy-unreachable [medium] reason=untrusted-certificate`: verification is on |
+| posture | cloudlist, Terraform state | `127.0.0.1` matched to the inventory; `127.0.0.8` → `cloud-asset-unseen [info]` |
+| discovery | naabu, ports 80,443,8443 | `https://nginx.test:8443` probed and inventoried |
+| discovery | alterx | `grafana.nginx.test` (source `alterx`); absent from the baseline run |
+| discovery | shuffledns + massdns (built from source) | `backup-db.nginx.test` (source `bruteforce`) |
+| discovery | cdncheck | loopback edge untagged; `104.16.0.1 [waf] [cloudflare]` |
+| discovery | `--monitor --notify` | the `:8443` URL is a new asset; one message reached the loopback webhook |
+| discovery | uncover, no keys | "requires keys but no keys were found", now one run-recon warning |
+
+vulnx 2.0.2 against its real API (no key) on the lab's CPEs listed 8 products, e.g. `f5:nginx` 41 CVEs (3 in
+KEV), `apache:http_server` 352 (23 in KEV), `jenkins:jenkins` 294 (9 in KEV). These counts cover every version
+of the product, which is why `--vulnx` reports leads, not findings. tldfinder could not be run inside the lab:
+in `-dm tld` mode it resolves through public DNS whatever `-r` says.
+
+### Found while building this
+
+- **`--origin` with `--ports` compared against the wrong service.** The reference response of a host was its
+  first https record, which on the discovery fixture was the `:8443` service (another page, another Server
+  header): `edge.tsv` then said "no edge" for nginx.test. The reference is now the default port's response.
+- **The suite's dig mock answered the resolver preflight's header before any fixture**, so every posture
+  answer read as NOERROR and NXDOMAIN-based checks could not fire. The posture fixtures now answer first.
+- **`cloudlist` writes a default provider config on first run**, so "no config" could not be tested against
+  `$HOME`; the test runs with an empty `HOME`.
+
+## v1.20.0: Batch 4, evidence and history
+
+Same lab and method. The baseline is the Batch 3 branch (`batch-3-email-dns`, frozen with `git archive`), so the
+A/B isolates Batch 4. No lab fixture changed; the three new checks use the existing names.
+
+### A/B: the default path
+
+| Scenario | runs per side | Batch 3 wall s | Batch 4 wall s | Batch 3 CPU s | Batch 4 CPU s | `--exact` |
+|---|---:|---:|---:|---:|---:|---|
+| lab, `--tls --ipv6` (3 sessions, one with the order swapped) | 9 | 24.42 | 25.09 | 15.23 | 15.68 | identical (87 rows), all sessions |
+| farm, `--tls --ipv6 -t 10` (2 sessions, one swapped) | 6 | 97.6 | 99.4 | 93.4 | 95.6 | identical (50 rows), both sessions |
+| lab, interleaved run by run (old / new, 4 rounds) | 4 | 24.67 | 24.07 | 14.81 | 14.43 | — |
+| 6 farm seeds without WordPress, 2 interleaved blocks of 5 | 10 | 18.00 | 17.95 | 10.95 | 10.85 | — |
+| farm, `--passive-only` (framework cost only), 2 blocks of 5 | 10 | 2.39 | 2.55 | 4.34 | 4.55 | — |
+
+The output of the default path is identical. The session medians differ by 2–3 %, which is inside the lab's spread
+(one run of either version reached 29–31 s), and the difference disappears when the versions are interleaved run
+by run. The 6-seed control shows Batch 4 0.1 s lower in CPU. The only cost that shows up consistently is a fixed
+one, measured on `--passive-only` runs. It comes from what a run now does once, at the start and the end: two
+short hashes for the state file, and the manifest. On a 50-seed run that is about 0.2 s of CPU. The check for
+ignored input lines was then changed to start Python only when a line does not count as a seed.
+
+One farm run of Batch 4 (1 of 12) lost WordPress's version on f06: httpx's technology detection saw a page
+without the version marker under load. The enrichment code did not change in this batch.
+
+### Lab fixture checks (real tools)
+
+`bench-run-recon.sh checks` → **PASS** on all nine (takeover, zone, origin, http, posture, discovery, scope,
+resume, history), with `RECON_DB_DSN` pointing at a PostgreSQL 16 database for the history check.
+
+| Check | What was run | Result |
+|---|---|---|
+| scope | `--list-targets`, ci.test outside the scope | exit 2; `ci.test` OUT OF SCOPE, no work dir |
+| scope | `--origin --screenshots`, names only | no origin contacted; `127.0.0.5` in `.scope.txt` as held back; the browser (Chrome rules with `MAP * ~NOTFOUND`) still renders nginx.test |
+| scope | the two origin addresses allowed | `origin-exposed` nginx.test → 127.0.0.5 and `origin-protected` spa.test, as without `--scope` |
+| scope | `!127.0.0.5`, `!backup-db.nginx.test`, brute wordlist finding both | neither name in the CSV; `direct.nginx.test` held back with its address. **The origin's own access log: unchanged during the run (31 → 31, and 39 → 39 in the full `checks` run)**; the same run without `--scope`: +5 |
+| scope | `!mta-sts.posture.test` | the MTA-STS policy was not fetched ("outside --scope" in the posture table) |
+| resume | 4 lab seeds, `-t 1 --tls`, SIGTERM after 2 | exit 143, state `interrupted`; `--resume` ran the other 2; **CSV `--exact` equal to an uninterrupted run** (87 rows; body hashes of wp.test as the noise floor) |
+| history | spa backend stopped between two runs | `.delta.tsv`: spa.test status 200 → 502, title, server, technologies, CPE; nothing for the three other hosts; the report's Changes section |
+| history | `recon-db.sh changes` / `history` | the same events from the run CSVs (`--csv`) and from the PostgreSQL store (`--db`); nginx.test present with first/last seen |
+
+The store was also checked by hand against PostgreSQL 16: a 1.19-shaped `recon_hosts` table with one row was
+migrated in place by the first import, three runs imported, and `changes` did not compare `cpe` against the old
+run (its CSV never had the column).
+
+katana's crawl-scope flags were checked on a loopback server before relying on them: with `-fs rdn`, a page
+linking to two siblings and an outside name; `-cos` kept a sibling out, `-cs` restricted the crawl further (it
+applies on top of `-fs`), and `-cos` wins over `-cs`.
+
+### Found while building this
+
+- **`--monitor --db` could not see a change.** The cache served the live probe and enrichment records from the
+  previous run (7-day TTL), so the history check's stopped backend still read 200. Under `--monitor`, every
+  target-facing result is now measured afresh and only stored (`CACHE_FRESH_ACTIVE`); passive lookups still
+  come from the cache.
+- **A pipeline in the new screenshot code aborted the worker.** `{ ...; [ scope ] && cat; } | sort` ends with a
+  false test when there is no scope, and under `pipefail` + `set -e` that killed the seed's worker before the
+  CMS and active scans. The suite's `--all` case caught it.
+- **The heartbeat's `sleep` kept the work-dir lock.** Killing the heartbeat subshell orphaned its `sleep`, which
+  still held the inherited lock descriptor, so an immediate `--resume` saw the run as still running. The
+  heartbeat now starts without the descriptor and is killed after the process tree.
+- **Children forked during the kill.** Killing a worker's children first let the worker start its next stage
+  before it was killed itself. The tree is now frozen (SIGSTOP), listed again, terminated and continued.
+- **A resume racing the live run** (found by the first version of the suite test, which signalled a subshell
+  instead of run-recon) deleted the live run's seed directory. The work-dir lock makes `--resume` refuse a run
+  that is still going.
+- **The suite's AAAA test extracts code by a marker** (`-aaaa -json -silent`); the new dnsx call used the same
+  argument order and was picked up first. The new calls use another order.
+
+## v1.20.0: Batch 5, redirect chains, login forms and TLS parity
+
+Same lab and method. The baseline is the Batch 4 branch (`batch-4-evidence`, frozen with `git archive`), so the
+A/B isolates Batch 5. New fixtures: the redirect and login-form names in the Caddyfile, and the `tlslab` nginx
+with four TLS fixtures (`lab/tls-nginx.conf`, certificates from `lab/gen-tls-certs.py`).
+
+### A/B: the default path
+
+| Scenario | runs per side | Batch 4 wall s | Batch 5 wall s | Batch 4 CPU s | Batch 5 CPU s | `--exact` |
+|---|---:|---:|---:|---:|---:|---|
+| lab, `--tls --ipv6` (2 sessions, one with the order swapped) | 6 | 22.79 | 22.31 | 10.00 | 10.04 | 2 fields differ, both justified (below) |
+| farm, `--tls --ipv6 -t 10` (2 sessions, one swapped) | 6 | 85.40 | 86.61 | 64.88 | 65.37 | identical (50 rows), both sessions |
+| farm, interleaved run by run (old / new, 4 rounds) | 4 | 85.78 | 86.09 | 65.11 | 65.07 | — |
+
+The timings match within the run-to-run spread. In the farm sessions, the side that ran first was slower in both
+(Batch 5 +1.3 s CPU when it went first, −0.2 s when it went second); run by run, the two are equal. Two fields differ, both on one row:
+`http://wp.test/wp-login.php`, WordPress's login page, served on plain HTTP. It now carries `auth=Form` and
+`http_flags=PlainHttp;CleartextAuth`. That is the new login-form detection reporting a real finding, the one
+WebInventory reports as `Auth=Form` and `CleartextAuth`. The first session's comparison also listed four rows
+"only in" one side. They were crawl variance in the baseline itself: Batch 4's own three runs had 87, 87 and 85
+rows, and against an 87-row Batch 4 run the only differences were the two fields.
+
+The new columns cost no request on the default path. `-er` adds one regex pass over each body inside httpx,
+`-cert` adds the PEM to each tlsx record, and the CSV builder reads it with a stdlib DER parser. None of these
+shows up beyond the noise.
+
+### The opt-in paths
+
+| Scenario | runs per side | without wall s | with wall s | without CPU s | with CPU s | what differs |
+|---|---:|---:|---:|---:|---:|---|
+| lab `--tls --ipv6 --extras`: Batch 4 → Batch 5, interleaved (6 rounds) | 6 | 23.68 | 26.22 | 13.39 | 14.04 | wp.test's two login rows (`Form`, `CleartextAuth`) |
+| lab: `--tls --ipv6` → `--tls-enum --ipv6` (Batch 5) | 3 | 22.48 | 23.09 | 10.22 | 10.57 | `tls_supported`, `tls_ciphers` on every https row (35 rows) |
+| farm: `--tls --ipv6 -t 10` → `--tls-enum --ipv6 -t 10` | 3 | 87.30 | 86.20 | 66.03 | 68.04 | the same two columns, 50 rows |
+
+- **`--extras`** now follows redirects past the hops the run did not probe. That costs one httpx start (about
+  1 s wall and 0.7 s CPU, all of it startup) per seed with such a hop. On the lab only wp.test has one
+  (`/wp-admin/` → `wp-login.php?redirect_to=…`), and wp.test is the slowest seed, so the whole run waits
+  for it. A seed with no redirect in its records starts nothing (a `grep` first), and after the first round
+  a further round runs only when a hop itself redirected. The swapped sessions showed the same order effect
+  as the farm; the interleaved rounds above are the measurement.
+- **`--tls-enum`** costs one Python process per seed and six short handshakes per https host: about 0.35 s
+  of CPU on the lab and 2 s on the 50-seed farm, with no change in wall time on the farm.
+
+### Lab fixture checks (real tools)
+
+| Check | What was run | Result |
+|---|---|---|
+| tls | `--tls-enum` on legacy/future/default/modern`.tls.test` | legacy: `tls_supported=TLS 1.2;TLS 1.1;TLS 1.0`, `tls_weak_cipher=TLS 1.2:TLS_RSA_WITH_NULL_SHA`, `RSA 1024` / `sha1WithRSAEncryption`, `WeakTLS;WeakCipher;WeakKey;WeakSig;SelfSigned`; future: `CertNotYetValid`; default: `DefaultCert`; modern: none, `EC P-256` |
+| tls | the same matrix from tlsx (`-sm ctls -min-version V -max-version V`, one run per version) | agrees on every fixture |
+| tls | the container's openssl, `-cipher NULL-SHA` | `Cipher is NULL-SHA`: legacy really accepts it |
+| tls | legacy's chain | `CertUntrusted` (`self-signed certificate`) from the level-0 retry; Batch 4 gave no verdict |
+| http | `https://redir.test/` (302 → `/login`) | `final_url=https://redir.test/login` through a hop `--extras` fetched; `login_form=http://redir.test/session`, `Form`, `CleartextAuth` on the HTTPS row |
+| http | `https://redir.test/old` (301 → `https://elsewhere.test/`) | listed in `redirect_chain`, not followed |
+| http | `http://redir.test/session` (from the form's action, via the crawl) | `301->https://redir.test/session` followed |
+| http | `http://plainlogin.redir.test/` | `login_form=http://plainlogin.redir.test/login`, `PlainHttp;CleartextAuth` |
+| http | (not a fixture) WordPress | `http://wp.test/wp-admin/` → `wp-login.php` on plain HTTP: `Form`, `CleartextAuth` |
+
+`bench-run-recon.sh checks` → **PASS** on all ten (takeover, zone, origin, http, tls, posture, discovery, scope,
+resume, history), the history check with `RECON_DB_DSN` pointing at a PostgreSQL 16 database. The daemon of
+the lab's containers stopped during the full run, after the first seven had passed; scope, resume and history
+were run again once it was back, and passed.
+
+### Found while building this
+
+- **`--tls-full` produced no CSV with tlsx 1.4.0, in every release since 1.17.** tlsx 1.4's
+  `cipher_enum` holds a dictionary per version (`{"weak": [...], "secure": [...]}`), and the CSV builder
+  passed that dictionary to the cipher-name check, which raised `AttributeError`. Reproduced with the CSV
+  builders of v1.17.0, v1.19.0 and Batch 4 on a real `-ce` record. `--tls-full` is now an alias of
+  `--tls-enum` and no longer calls `-ce`, and the parser flattens the dictionary anyway.
+- **tlsx `-ce` misses suites.** On `legacy.tls.test` it listed the four CBC-SHA suites but not `NULL-SHA`,
+  which the server accepts (the container's openssl negotiates it).
+- **tlsx cannot offer weak suites.** With `-ci`, ctls refuses the names (`TLS_RSA_WITH_RC4_128_MD5 not
+  supported`). ztls accepts them but sends a ClientHello with no cipher suites at all: the lab nginx logged `no
+  ciphers specified`. The openssl mode ignored the list. So the weak-cipher probe, like the version matrix, is
+  run-recon's own ClientHello, stopped at the ServerHello as WebInventory's is. It is independent of the local
+  OpenSSL, which can no longer offer SSL 3.0 or RC4.
+- **tlsx's `expired` is false for a certificate that is not valid yet.** `CertNotYetValid` comes from
+  `not_before`; `CertExpired` now also from `not_after`.
+- **The chain check gave no verdict on the weakest hosts.** The local OpenSSL (security level 2) refused the
+  legacy fixture's handshake before verifying anything, so a self-signed RSA 1024 host went without
+  `CertUntrusted`. One retry at level 0 fixes it; it only runs after such a refusal.
+- **tlsx 1.4.0's default scan mode can hang on an open stdin.** When a handshake fails in `auto` mode, tlsx
+  falls back to `openssl s_client`, which reads stdin: 40 s and more with stdin left open, under a second with
+  `/dev/null`. run-recon already closes stdin at start-up (TOOL-COVERAGE finding 6), so only the bench's own
+  tlsx cross-check was exposed; it now uses `-sm ctls` and a timeout.
+- **Caddy's `redir /login 302` is a matcher.** In the first version of the fixture, `/login` was read as a path
+  matcher and `302` as the target, so `/` answered an empty 200; it is `redir * /login 302`.
+- **The lab image's OpenSSL has no 3DES or RC4.** Debian's OpenSSL 1.1.1n is built without them, so
+  `legacy.tls.test` accepts `NULL-SHA` as its weak suite, which gives the same `WeakCipher`.
+- **A suite file named `enum.py` shadowed Python's `enum` module** for the scripts next to it. The extracted
+  probe is `tlsenum_probe.py` and runs with `-I`.
+
+## v1.20.0: Batch 6, JSON output and shipping to Tideline
+
+Same lab and method. The baseline is the Batch 5 branch (`batch-5-redirects-tls`, frozen with `git archive`), so
+the A/B isolates Batch 6. Each comparison ran interleaved: the two sides alternated run by run, and the order
+switched each round. Batch 5 showed this to be the reliable measurement; back-to-back sessions carry an order
+effect.
+
+### A/B
+
+| Scenario | runs per side | A wall s | B wall s | A CPU s | B CPU s | `--exact` (noise floor from A's next run) |
+|---|---:|---:|---:|---:|---:|---|
+| lab `--tls --ipv6`: Batch 5 (A) → Batch 6 (B) | 6 | 23.26 | 22.75 | 10.21 | 10.13 | identical, 87 rows, every round compared |
+| lab: Batch 6 `--tls --ipv6` (A) → the same with `--json` (B) | 6 | 22.25 | 22.79 | 10.07 | 10.18 | identical CSV |
+
+- **Default path.** It is unchanged. The only addition is `run_id` in run.json, one read of
+  `/proc/sys/kernel/random/uuid`, which is within the noise.
+- **The noise floor.** It is needed on the lab. WordPress's oEmbed responses carry a random per-request
+  `secret`, so their `body_sha256` differs between any two runs of the same version: eight fields, set
+  aside by `compare --noise`. One round (the fourth) also had crawl variance in the baseline (85 rows
+  instead of 87) and is not counted; Batch 5 saw the same.
+- **`--json`.** It costs about 0.1 s of CPU on the lab: one `json.dumps` per row in the CSV builder, and
+  one short Python pass over the side files before the manifest. The CSV is byte-identical.
+- **The farm.** The farm A/B was cut short when the lab's Docker daemon reached its time limit after one
+  run (Batch 5 default, 87.40 s wall / 65.24 s CPU, in line with the Batch 5 figures above). `--json`'s
+  per-row cost scales with rows, not seeds.
+
+### Shipping cost
+
+`ship-recon.sh ship` of the lab run (12 parts: 6 JSONL files, the manifest, 4 screenshots; 1.7 MB raw,
+1.34 MB gzip, mostly the PNGs) to the mock ingest on loopback, three times under new `run_id`s:
+**0.87–0.90 s wall, 0.24–0.26 s CPU** (ship-recon, curl, openssl), all three delivered and verified. The cost is
+one curl process and one TLS handshake per part, about 70 ms each. A seed-heavy run with hundreds of
+screenshots pays that per image, sequentially. Reusing connections (curl `--next`, or one HTTP/2
+connection) is the obvious improvement once a real Tideline exists to measure against. It does not
+touch the scan: shipping starts after the run's manifest is written.
+
+### Lab checks (real tools)
+
+| Check | Result |
+|---|---|
+| ship (new) | PASS. A lab run with `--tls --ipv6 --takeover --dns-posture --screenshots` was shipped to `lab/mock-tideline.py`: 12 parts, all stored byte for byte; 87 URL records equal to the CSV row for row; 4 screenshots as `image/png`; one open (201), 12 PUTs (204), one complete (202). A second delivery: 200 and nothing re-sent. A 503 on part 2: exit 4, then a retry that sends only parts 2–12 |
+| takeover, zone, origin, posture, resume | PASS on the final code |
+| http, tls, discovery, scope | PASS on the final code, after the lab came back in a new session (the first session's Docker daemon reached its time limit) |
+| history, with the PostgreSQL 16 store | PASS after a fix to the check itself (below); then PASS again at once, with the stale cache that had made it fail |
+
+### Found while building this
+
+- **curl's `--cacert` does not pin.** curl still loads the system CA directory: `curl -v` shows
+  `CAfile: <yours>` and `CApath: /etc/ssl/certs`. A request with a CA that has nothing to do with the
+  server succeeded through the agent proxy, whose CA is in the system store. With an empty `--capath` it
+  failed with `self-signed certificate in certificate chain`. ship-recon passes an empty `--capath` and
+  `-q`. The suite proves the pin with `SSL_CERT_DIR` and `CURL_CA_BUNDLE` pointing at a store that would
+  accept the server. This bears on WebInventory's shipper too: plan §5 says the sensor validates
+  against the pinned root, not the machine store.
+- **curl does not retry a connection reset mid-upload** (exit 56) without `--retry-all-errors`. That
+  flag would also retry refusals, so ship-recon exits 4 instead and the next run resumes from
+  `ship-state.json`.
+- **The history check's baseline run read a stale cache.** With `--db`, its first run read target results
+  cached by an earlier run, up to `CACHE_TTL` (7 days) old. The previous history check had stopped the spa
+  backend for its second run, so the cache held spa.test at 502. The check then saw no 200 → 502 change, and
+  certificates cached before a lab restart showed up as `cert_not_after` changes. The baseline run now sets
+  `CACHE_FRESH_ACTIVE=1`, the same re-measuring `--monitor --db` does. run-recon itself was right: this was
+  the check's own isolation.
+- **The suite pulls the CSV builder out by a pattern anchored at `^python3 -`.** Exporting the `--json`
+  switch kept that line as it was. A prefix assignment (`RR_JSON=… python3 - …`) would have silently
+  hidden the builder from four test sections.
+
+## v1.20.0 release: A/B against v1.19.0
+
+The release against the previous one: v1.19.0 (`git archive v1.19.0`) against the release branch, on the
+default path (`--tls --ipv6`), interleaved run by run with the order switched each round.
+
+| Scenario | runs per side | v1.19.0 wall s | v1.20.0 wall s | v1.19.0 CPU s | v1.20.0 CPU s | `--exact` on the columns both write |
+|---|---:|---:|---:|---:|---:|---|
+| lab | 6 | 22.84 | 22.50 | 9.81 | 10.04 | 2 fields differ, every round: `wp-login.php`'s `auth=Form` and `CleartextAuth` (87 rows) |
+| farm, `-t 10` | 3 | 86.12 | 85.02 | 64.39 | 64.28 | identical, 50 rows, every round |
+
+- **Output.** Every existing column is identical, on the lab and on the farm. The only exception is
+  WordPress's login page, served on plain HTTP, where Batch 5's login-form detection reports a real
+  finding. The nine new columns are appended after `security_txt`. The noise floor (WordPress oEmbed's
+  random secret, eight `body_sha256` values) comes from a second run of v1.19.0.
+- **Timing.** Wall and CPU are equal within the spread. On the lab, v1.20.0 spends about 0.2 s more CPU on
+  the leaf-certificate parsing and the password-form regex that Batch 5 added to requests the run
+  already makes. On the farm, the CPU is the same.
+- **Lab checks.** All eleven pass on the release code (Batch 6's lab checks above).

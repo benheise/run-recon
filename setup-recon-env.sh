@@ -11,7 +11,8 @@
 #
 # Installs system-wide under /opt/recon, with binaries/shims on PATH via
 # /usr/local/bin:
-#   - apt/dnf/pacman base packages (git, python3-venv, build tools, jq, ldnsutils for the lab's signed zones, libpcap, postgresql-client...)
+#   - apt/dnf/pacman base packages (git, python3-venv, build tools, jq, ldnsutils for the lab's signed zones,
+#     python3-cryptography for the lab's TLS fixture certificates, libpcap, postgresql-client...)
 #   - Go toolchain (pinned) -> /usr/local/go
 #   - Go tools -> /usr/local/bin: gau, waybackurls, httpx, katana, subfinder,
 #     dnsx, tlsx, alterx, nuclei, hakrawler, gospider, ffuf, subjs, getJS,
@@ -93,6 +94,10 @@ GO_TOOLS=(
   "github.com/projectdiscovery/cdncheck/cmd/cdncheck@v1.4.0|cdncheck"   # CDN/WAF provider tagging
   "github.com/projectdiscovery/uncover/cmd/uncover@v1.2.1|uncover"      # Shodan/Censys/Fofa pivot
   "github.com/projectdiscovery/notify/cmd/notify@v1.0.7|notify"         # monitoring notifications
+  # --- v1.20 additions (Batch 3) ---
+  "github.com/projectdiscovery/cloudlist/cmd/cloudlist@v1.5.1|cloudlist" # cloud inventory diff (--cloudlist)
+  "github.com/projectdiscovery/tldfinder/cmd/tldfinder@v0.0.2|tldfinder" # TLD variants (--tld-variants)
+  "github.com/projectdiscovery/vulnx/v2/cmd/vulnx@v2.0.2|vulnx"         # product advisories (--vulnx)
   "github.com/owasp-amass/amass/v4/...@v4.2.0|amass"                    # passive subdomains
   "github.com/tomnomnom/assetfinder@v0.1.1|assetfinder"                 # passive subdomains
   "github.com/PentestPad/subzy@v1.2.1|subzy"                            # subdomain takeover (lab)
@@ -275,7 +280,7 @@ install_base_packages(){
       as_root apt-get update -y || warn "apt-get update reported errors"
       as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         git curl wget unzip zip ca-certificates build-essential pkg-config \
-        python3 python3-venv python3-pip pipx \
+        python3 python3-venv python3-pip pipx python3-cryptography \
         jq dnsutils ldnsutils whois libpcap-dev gcc make \
         ruby ruby-dev whatweb \
         postgresql-client \
@@ -286,7 +291,7 @@ install_base_packages(){
       log "dnf: installing base packages..."
       as_root dnf install -y \
         git curl wget unzip zip ca-certificates pkgconf-pkg-config \
-        python3 python3-pip pipx jq bind-utils ldns-utils whois libpcap-devel gcc make postgresql \
+        python3 python3-pip pipx python3-cryptography jq bind-utils ldns-utils whois libpcap-devel gcc make postgresql \
         ruby ruby-devel \
         || warn "some dnf packages failed to install"
       as_root dnf groupinstall -y "Development Tools" 2>/dev/null || true
@@ -295,7 +300,7 @@ install_base_packages(){
       log "pacman: installing base packages..."
       as_root pacman -Sy --noconfirm --needed \
         git curl wget unzip zip ca-certificates base-devel pkgconf \
-        python python-pip python-pipx jq bind ldns whois libpcap gcc make \
+        python python-pip python-pipx python-cryptography jq bind ldns whois libpcap gcc make \
         ruby whatweb \
         || warn "some pacman packages failed to install"
       ;;
@@ -622,8 +627,8 @@ date | as_root tee "$INSTALL_ROOT/.provisioned" >/dev/null
 
 # ===========================================================================
 # 8) install the companion operational scripts
-#    run-recon.sh needs generate-report.sh and recon-db.sh to live NEXT TO IT
-#    (it resolves them relative to its own path), so install all three together.
+#    run-recon.sh needs generate-report.sh, recon-db.sh and ship-recon.sh to live NEXT
+#    TO IT (it resolves them relative to its own path), so install them together.
 # ===========================================================================
 if [ "$RUNNER_FOUND" = "yes" ]; then
   log "Installing toolkit scripts from $SCRIPT_DIR ..."
@@ -634,7 +639,7 @@ if [ "$RUNNER_FOUND" = "yes" ]; then
   else
     warn "Could not install run-recon.sh automatically."
   fi
-  for _companion in generate-report.sh recon-db.sh; do
+  for _companion in generate-report.sh recon-db.sh ship-recon.sh; do
     _cmd="${_companion%.sh}"
     if [ -f "$SCRIPT_DIR/$_companion" ]; then
       if as_root install -m 0755 "$SCRIPT_DIR/$_companion" "$INSTALL_ROOT/bin/$_companion" \
@@ -647,6 +652,23 @@ if [ "$RUNNER_FOUND" = "yes" ]; then
       warn "$_companion not found next to this installer; the ${_cmd} feature will be unavailable from the installed command."
     fi
   done
+  # data the vulns join reads next to recon-db.sh: the CPE alias groups (1.20)
+  if [ -f "$SCRIPT_DIR/cpe-aliases.json" ]; then
+    if as_root install -m 0644 "$SCRIPT_DIR/cpe-aliases.json" "$INSTALL_ROOT/bin/cpe-aliases.json"; then
+      ok "Installed: $INSTALL_ROOT/bin/cpe-aliases.json  (CPE alias groups for recon-db vulns)"
+    else
+      warn "Could not install cpe-aliases.json; recon-db vulns will join exact CPE names only."
+    fi
+  fi
+  # the JSON Schemas of --json's records and of the Tideline envelope (1.20), for consumers
+  if [ -d "$SCRIPT_DIR/schemas" ]; then
+    if as_root install -d -m 0755 "$INSTALL_ROOT/bin/schemas" \
+       && as_root install -m 0644 "$SCRIPT_DIR"/schemas/*.json "$SCRIPT_DIR"/schemas/SHA256SUMS "$INSTALL_ROOT/bin/schemas/"; then
+      ok "Installed: $INSTALL_ROOT/bin/schemas/  (JSON Schemas of the --json records and the Tideline envelope)"
+    else
+      warn "Could not install schemas/."
+    fi
+  fi
 else
   warn "run-recon.sh not found next to this script ($SCRIPT_DIR)."
   warn "Place run-recon.sh (with generate-report.sh + recon-db.sh) alongside this installer and re-run."
@@ -752,7 +774,7 @@ PRESENT=""; MISSING=""
 for tool in gau waybackurls anew unfurl qsreplace gf httpx-toolkit katana subfinder dnsx \
             tlsx alterx nuclei hakrawler gospider ffuf subjs getJS urlfinder waymore \
             arjun uro dirsearch xnLinkFinder linkfinder secretfinder \
-            naabu shuffledns puredns massdns asnmap mapcidr cdncheck uncover notify \
+            naabu shuffledns puredns massdns asnmap mapcidr cdncheck uncover notify cloudlist tldfinder vulnx \
             amass assetfinder findomain subzy gowitness jsluice trufflehog \
             github-subdomains github-endpoints cloud_enum dnsvalidator \
             wpscan droopescan joomscan cmseek whatweb tookie-osint \
