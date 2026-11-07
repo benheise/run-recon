@@ -14,7 +14,7 @@ GitHub redirects the old URLs). Follow-ups F1–F10 (PR #3), Batch 3 (#4), Batch
 `VERSION` 1.20.0) are all merged. Only #3 reached `main`: each stacked PR merged into the branch below it, because
 GitHub retargets a stacked PR only when its base branch is deleted. PR #9 lands `release-v1.20.0`, which holds all of
 it, on `main`; then create the v1.20.0 release and tag in the GitHub UI. The V-list (section 2) still needs Ben's
-Kali VM.
+Kali VM. Section 10 adds the items from the AutoAR review (2026-11-07).
 
 ## 0. Source of truth
 
@@ -112,7 +112,7 @@ release, brought forward at Ben's request. Details: SHIPPING.md.
 | P1 | `--json`: JSON lines per record kind with the CSV's and TSVs' field names: urls and services (from the CSV builder itself, unguarded), findings, DNS posture, edges, CNAMEs, zone names, screenshot classes, cloud assets, vulnx, delta, warnings, seeds; JSON Schemas (2020-12) in `schemas/` | Done (`batch-6-json-ship`) | suite: parity with the CSV, the findings parser, the schema contract (field lists read from the source); lab A/B |
 | P2 | `run_id` (UUID v4, kept across `--resume`), `--engagement`, `--job-id` in run.json and the manifest | Done | suite (incl. `--resume`) |
 | P3 | `--ship URL` with `--ship-cert`/`--ship-key`/`--ship-ca`/`--ship-proxy`: mTLS pinned to the Tideline CA (an empty `--capath`: `--cacert` alone still trusts the system store), signed `tideline-envelope/1` (ES256), gzip parts hashed as in the run's manifest, `ship-state.json`, exit 4; preflight before the scan; `ship-recon.sh` ship/status/export/envelope/check | Done | suite against `lab/mock-tideline.py` (delivery, re-ship, resume, refusals, pinning, export); `bench-run-recon.sh ship` (the shipped records equal the local CSV row for row) |
-| P4 | WebInventory's side (`-ShipTo`, `Send-WebInventoryRun.ps1`, `Register-WebInventorySensor.ps1`) against the same envelope; run-recon vendoring `schemas/` and `SHA256SUMS` from a tagged `tideline-schemas` release (the repository is drafted: `claude/tideline-schemas-v1.md`) | Planned (WebInventory, Tideline) | contract test of both tools' lab output; `sha256sum -c` of the vendored copy |
+| P4 | WebInventory's side (`-ShipTo`, `Send-WebInventoryRun.ps1`, `Register-WebInventorySensor.ps1`) against the same envelope; Outcrop vendoring `schemas/schemas/` and `schemas/SHA256SUMS` from benheise/Tideline at tag `schemas-v1.0.0` (released 2026-11-07; project doc `claude/tideline-schemas-v1.md`) | WebInventory's side is in Hinterland 2.6.0, but its envelopes do not validate against `schemas-v1.0.0` yet (Tideline plan TA15); Outcrop's vendoring Planned | contract test of both tools' lab output; `sha256sum -c` of the vendored copy |
 
 ## 9. v1.21: the Outcrop name
 
@@ -123,6 +123,64 @@ The repository was renamed `benheise/Outcrop` on 2026-11-07, and Ben chose to ca
 |---|---|---|---|
 | O1 | `outcrop.sh` is the command (installed as `outcrop`); `run-recon.sh` stays as a wrapper that execs it (same arguments, environment, exit status and PID), installed as `run-recon`, so existing scripts and cron jobs keep working. The name changes in help, messages, the report header (for runs from 1.21 on), the setup scripts and the current docs | Done (`outcrop-v1.21`, PR #10) | suite: the wrapper's version, a symlinked install, exit status, the same CSV, a missing outcrop.sh |
 | O2 | Unchanged on purpose: the frozen machine ids (`tool` = `run-recon` in run.json and the Tideline envelope; the `run-recon.*/1` schemas); output names (`recon-<ts>.csv`); the companion scripts (`generate-report.sh`, `recon-db.sh`, `ship-recon.sh`); the dev scripts (`bench-run-recon.sh`, `test-run-recon.sh`); the cloud-feed cache path; history sections of the docs | Decided | suite pins the tool id |
+
+## 10. From the AutoAR review
+
+AutoAR (h0tak88r/AutoAR) is a Go bug-bounty pipeline. Its web and HTTP side was reviewed for ideas (project
+doc `claude/autoar-web-research.md`). Three takeaways apply here:
+
+- a few cheap detectors AutoAR has and Outcrop lacks;
+- lessons from AutoAR's own defects;
+- engine patterns.
+
+The platform's share is in the Tideline plan, section 15 (TA1–TA15). AutoAR's intrusive defaults are not adopted:
+
+- S3 write and delete probes;
+- 403 bypasses;
+- default credentials;
+- exploit checks.
+
+A change to a default path still follows the method above.
+
+**Blind spots (do these first)**
+
+| ID | Item | Status | Check |
+|---|---|---|---|
+| OA1 | User-Agent A/B. httpx, katana and nuclei send their default User-Agents (only wpscan sets one). AutoAR found WAFs answering 404 or 406 to nuclei's User-Agent and 200 to a browser's, on a host with a confirmed exposure | Planned | lab: a WAF-fronted target (ModSecurity with the OWASP CRS); live hosts and findings per User-Agent, 3 runs |
+| OA2 | `waf_blocked` warnings. A block page (403, 406, 429 or 503 carrying a known WAF vendor's page) becomes a warning naming the host and vendor, not a result. Needs the warning `kind` field (Tideline TA9) | Planned | lab: one block-page fixture per vendor |
+| OA3 | ffuf fallback calibration. When feroxbuster is missing, `--fuzz` and `--activescan` fall back to ffuf, and neither ffuf call passes `-ac`, so a host that answers 200 for every path fills the results. feroxbuster filters wildcards by default, and `--vhost` already passes `-ac` | Planned | lab: the catch-all host with feroxbuster off the PATH; the result matches feroxbuster's |
+| OA4 | Throttle accounting. Count connection resets, timeouts, TLS name errors and 429s per host from the tools' output, write them to `warnings.jsonl`, and mark a host over a threshold `throttled` in the report. AutoAR filtered exactly these errors out of its logs | Planned | lab: a rate-limiting fixture (nginx `limit_req`) |
+| OA5 | One request policy. The User-Agent, extra headers, rate and timeouts are set once and applied to every tool invocation (httpx, katana, nuclei, ffuf, feroxbuster, gospider, hakrawler and the rest). AutoAR fixed its User-Agent in one code path and missed the one its main workflow uses | Planned | lab access log: every request of a run carries the policy User-Agent; the suite checks each invocation's argv |
+| OA6 | SIGTERM stops the traffic. An interrupted or timed-out run signals its tools' process group, so no child keeps sending after Outcrop exits. B4.5 keeps the work dir; this makes sure the scan itself stops. Tideline's job deadline (TA1) relies on it | Planned | lab: a packet capture after SIGTERM shows no traffic to the targets once the grace period ends |
+
+**New detectors**
+
+| ID | Item | Status | Check |
+|---|---|---|---|
+| OA7 | Cloudflare 1016 in `--takeover`. A name that resolves into Cloudflare's ranges and answers 530 with "error code: 1016" has a proxied record whose origin is gone, a takeover class that CNAME checks miss. Read from the httpx response the run already has: no extra request | Planned | lab fixture answering 530 / 1016; suite |
+| OA8 | `--mcp` (opt-in). POST a JSON-RPC `initialize` to the six common MCP paths, then list tools, resources and prompts, and never call `tools/call`. Report a server with no auth and tools named like exec or shell. Use a current protocol version (AutoAR sends `2024-11-05`) and carry the session header between requests | Planned | lab: an MCP server with and without auth; suite |
+| OA9 | API docs, GraphQL consoles and Docker files in `--extras`: Swagger and OpenAPI documents, GraphQL UI pages, `docker-compose.yml` and `Dockerfile`, each confirmed by keywords in the body, not by the status code. GET only; GraphQL introspection (a POST) only under `--active` | Planned | lab: exposed and soft-404 fixtures; no false positive on the catch-all host |
+| OA10 | Backup names derived from the domain in `--fuzz` (`example.com.zip`, `www_example.tar.gz` and the like). Send HEAD, and count a hit only on 200, a Content-Length over 100 and an archive MIME type; fall back to a 1-byte ranged GET when HEAD is refused | Planned | lab: a real archive, a soft-404 host and a host that refuses HEAD |
+| OA11 | URL tags. gf-style tags (sqli, ssrf, redirect, lfi and so on) as a new column on URL rows, never as findings. Offline: no traffic | Planned | suite; the schema field (Tideline TA9) |
+| OA12 | JS endpoint diff in `--monitor` with `--js`. Endpoints that appeared in bundles since the previous run become `new_js_endpoint` delta rows, for Tideline's drift view (TA11) | Planned | lab: a bundle that changes between two runs; `bench-run-recon.sh history` |
+| OA13 | Lame delegation below the seeds. `--dns-posture` checks the seeds and their zones today. Also check delegated child zones found among the candidates: a name that returns SERVFAIL or REFUSED is asked again at its own name servers | Planned | lab: a delegated child zone whose name server refuses |
+| OA14 | Dependency confusion in `--js`. Package names from exposed `package.json` files and bundles are looked up in the npm registry only, with no traffic to the target; an unclaimed scoped name is a finding | Planned | suite with a registry mock |
+| OA15 | WordPress slug availability in `--active`. Detected plugin and theme slugs are looked up on wordpress.org; one that is not there can be claimed by someone else | Planned | suite with an API mock |
+| OA16 | SaaS tenants. Check in DNS whether company-named tenants exist (Atlassian, Zendesk and the like) and list them, never scan them, the way `--tld-variants` works | Planned | suite; live check on Kali |
+
+**Speed**
+
+| ID | Item | Status | Check |
+|---|---|---|---|
+| OA17 | Tech-scoped nuclei, as an option. Pass httpx's technologies as nuclei tags instead of running the whole template set at `NUCLEI_SEV`. Outcrop already runs one pass; AutoAR runs `http/` and then three of its subtrees again | Planned | lab A/B: findings per minute, and every finding of the full run still found |
+| OA18 | Stage events. Each stage writes its start, end and counts to run.json or a JSON-lines file, for Tideline's run timeline (TA3) | Planned | suite; lab run |
+| OA19 | Post-probe analyses at once. `--takeover`, `--dns-posture`, `--extras`, `--origin`, `--screenshots` and `--tls` read the same httpx output; run them at once behind one shared connection budget | Planned | farm A/B: faster wall time, identical output, the `--rate` budget held |
+
+**Housekeeping**
+
+| ID | Item | Status | Check |
+|---|---|---|---|
+| OA20 | Lab names. The lab writers behind Tideline's `schemas/fixtures/run-recon/` use `ex.com` and `nex.com`, which are registered to third parties, and `2.2.2.2`, an allocated address. Use reserved names (`example.com`, `.test`) and the documentation ranges (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) | Planned | suite; Tideline's `regen.sh` rebuilds the fixtures |
 
 ## Done (for reference)
 
