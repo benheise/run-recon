@@ -53,6 +53,14 @@ RECON_DIR="$(dirname "$RECON_SELF")"
 : "${FUZZ:=0}"             # 1 = content-discovery brute force on live hosts (feroxbuster, else ffuf)
 : "${FUZZ_THREADS:=40}"    # fuzzer concurrency
 
+# --- request policy: one User-Agent, extra headers and a per-request timeout for every tool
+# that sends HTTP or TLS to a target. Set once here (or by --user-agent, --header,
+# --req-timeout); _policy_init turns them into each tool's own flags, and the test suite
+# checks every invocation. RATE above is the per-tool requests/sec of the same policy. ---
+: "${USER_AGENT:=browser}"  # browser (a current Chrome) | outcrop | tool (each tool's own default) | the exact string
+: "${REQ_HEADERS:=}"        # extra request headers, one "Name: value" per line (--header, repeatable)
+: "${REQ_TIMEOUT:=10}"      # seconds per request (HTTP and TLS) (--req-timeout)
+
 # --- wall-clock caps per stage (seconds; 0 = unlimited). These bound TOTAL tool
 # runtime so a slow source / huge wordlist can't hang the run for hours. Tune via
 # env if you genuinely need longer. ---
@@ -63,6 +71,10 @@ RECON_DIR="$(dirname "$RECON_SELF")"
 : "${FUZZ_TIMEOUT:=1800}"  # content discovery (feroxbuster/ffuf) per invocation (30m)
 : "${SCAN_TIMEOUT:=2400}"  # nuclei / active-scan template runs (40m)
 : "${HEARTBEAT:=20}"       # seconds between overall-progress heartbeats (0 disables)
+: "${MAX_RUNTIME:=0}"     # whole-run deadline in seconds (--max-runtime; 0 = none): stopped as by SIGTERM, exit 124
+: "${STOP_GRACE:=10}"      # seconds a stopped run's tools get between SIGTERM and SIGKILL
+: "${THROTTLE_MIN:=5}"     # run health: a host is "throttled" with this many 429s, resets, timeouts, TLS name errors...
+: "${THROTTLE_PCT:=10}"    # ...that are at least this % of its requests
 : "${FUZZ_EXT:=}"          # optional comma list of extensions to probe (e.g. php,bak,json)
 : "${RESOLVE:=0}"          # 1 = dnsx validation gate (drop non-resolving candidate hosts)
 : "${CERTS:=0}"            # 1 = tlsx active cert SAN/CN harvesting (discovers sibling hosts)
@@ -240,8 +252,111 @@ _to() {
     "$@"
   fi
 }
+# _fg CMD... : run CMD (a command or a function) in the background and wait for it. bash runs a
+# trap only after a foreground command ends, but interrupts a wait at once: a SIGTERM or Ctrl-C
+# during a long stage of the main process stops the run then, not when the stage is done. CMD
+# keeps this stdin (<&0: a heredoc given to _fg) and its exit status; variables it sets are lost.
+_fg() { "$@" <&0 & wait "$!"; }
 # _delay <seconds> : sleep between same-source requests (rate spacing); 0 = none.
 _delay() { case "${1:-0}" in 0|0.0|"") : ;; *) sleep "$1" 2>/dev/null || true;; esac; }
+
+# --- request policy (USER_AGENT, REQ_HEADERS, REQ_TIMEOUT, RATE) -> each tool's own flags ---
+# Every tool that sends HTTP to a target takes its arguments from these arrays, so the policy
+# is set in one place. The parent validates the values (_policy_check); the workers rebuild the
+# arrays from the exported strings. Tools that cannot carry it fully are listed in the README
+# (httpx's screenshot browser keeps its own User-Agent, gospider lowercases it and fetches
+# JavaScript without the extra headers, subzy has neither option).
+UA_OUTCROP='Mozilla/5.0 (X11; Linux x86_64) Outcrop (authorized asset inventory)'
+# the default: a current Chrome on Windows (Chrome 157, stable since 2026-11-03; raise it with each release,
+# since a long-stale version looks like a bot to a bot manager). Lab A/B behind ModSecurity + the OWASP
+# CRS: the tools' own User-Agents lost every --fuzz result (CRS blocks feroxbuster's and ffuf's), this one
+# and Outcrop's own lost none.
+UA_BROWSER='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36'
+_policy_init() {
+  local h ck="" oth=() xn=""
+  case "$USER_AGENT" in
+    outcrop) POLICY_UA="$UA_OUTCROP";;
+    browser) POLICY_UA="$UA_BROWSER";;
+    tool|"") POLICY_UA="";;
+    *)       POLICY_UA="$USER_AGENT";;
+  esac
+  POL_HDRS=()
+  while IFS= read -r h; do [ -n "$h" ] && POL_HDRS+=("$h"); done <<< "$REQ_HEADERS"
+  for h in "${POL_HDRS[@]}"; do
+    case "${h%%:*}" in [Cc][Oo][Oo][Kk][Ii][Ee]) ck="${h#*:}"; ck="${ck# }";; *) oth+=("$h");; esac
+  done
+  # ProjectDiscovery tools (httpx, katana, nuclei), ffuf: -H per header
+  PA_H=(); [ -n "$POLICY_UA" ] && PA_H+=(-H "User-Agent: $POLICY_UA")
+  for h in "${POL_HDRS[@]}"; do PA_H+=(-H "$h"); done
+  # feroxbuster, curl, gospider: their User-Agent flag + -H
+  PA_FEROX=(); [ -n "$POLICY_UA" ] && PA_FEROX+=(-a "$POLICY_UA")
+  PA_CURL=();  [ -n "$POLICY_UA" ] && PA_CURL+=(-A "$POLICY_UA")
+  PA_GOSPIDER=(); [ -n "$POLICY_UA" ] && PA_GOSPIDER+=(-u "$POLICY_UA" --robots=false)
+  for h in "${POL_HDRS[@]}"; do PA_FEROX+=(-H "$h"); PA_CURL+=(-H "$h"); PA_GOSPIDER+=(-H "$h"); done
+  # hakrawler: one -h, headers joined by ";;"
+  PA_HAKRAWLER=(); h=""
+  [ -n "$POLICY_UA" ] && h="User-Agent: $POLICY_UA"
+  local x; for x in "${POL_HDRS[@]}"; do h="${h:+$h;;}$x"; done
+  [ -n "$h" ] && PA_HAKRAWLER=(-h "$h")
+  # whatweb: -U and --header
+  PA_WHATWEB=(); [ -n "$POLICY_UA" ] && PA_WHATWEB+=(-U "$POLICY_UA")
+  for h in "${POL_HDRS[@]}"; do PA_WHATWEB+=(--header "$h"); done
+  # wpscan: --ua (else its own random one, as before), --headers "A: x; B: y", --cookie-string
+  if [ -n "$POLICY_UA" ]; then PA_WPSCAN=(--ua "$POLICY_UA"); else PA_WPSCAN=(--random-user-agent); fi
+  if [ "${#oth[@]}" -gt 0 ]; then h=""; for x in "${oth[@]}"; do h="${h:+$h; }$x"; done; PA_WPSCAN+=(--headers "$h"); fi
+  [ -n "$ck" ] && PA_WPSCAN+=(--cookie-string "$ck")
+  # gowitness 3 (the screenshot browser): --chrome-user-agent, --chrome-header
+  PA_GOWITNESS=(); [ -n "$POLICY_UA" ] && PA_GOWITNESS+=(--chrome-user-agent "$POLICY_UA")
+  for h in "${POL_HDRS[@]}"; do PA_GOWITNESS+=(--chrome-header "$h"); done
+  # xnLinkFinder: -uc, -c (cookies), -H "A: x; B: y"
+  PA_XN=(); [ -n "$POLICY_UA" ] && PA_XN+=(-uc "$POLICY_UA"); [ -n "$ck" ] && PA_XN+=(-c "$ck")
+  for x in "${oth[@]}"; do xn="${xn:+$xn; }$x"; done; [ -n "$xn" ] && PA_XN+=(-H "$xn")
+  # User-Agent only (no header option): subjs, droopescan, joomscan, cmseek; getJS: -header
+  PA_SUBJS=(); PA_DROOPESCAN=(); PA_JOOMSCAN=(); PA_CMSEEK=(); PA_GETJS=()
+  if [ -n "$POLICY_UA" ]; then
+    PA_SUBJS=(-ua "$POLICY_UA"); PA_DROOPESCAN=(--user-agent "$POLICY_UA")
+    PA_JOOMSCAN=(-a "$POLICY_UA"); PA_CMSEEK=(--user-agent "$POLICY_UA"); PA_GETJS=(-header "User-Agent: $POLICY_UA")
+  fi
+  for h in "${POL_HDRS[@]}"; do PA_GETJS+=(-header "$h"); done
+  # arjun and secretfinder: one argument, headers separated by newlines
+  h=""; [ -n "$POLICY_UA" ] && h="User-Agent: $POLICY_UA"
+  for x in "${POL_HDRS[@]}"; do h="${h:+$h$'\n'}$x"; done
+  PA_ARJUN=(); PA_SECRETFINDER=(); [ -n "$h" ] && { PA_ARJUN=(--headers "$h"); PA_SECRETFINDER=(-H "$h"); }
+  # the cache keeps target-facing results per policy: a result measured with one User-Agent
+  # or header set is not served to a run that sends another (tool defaults keep the old keys)
+  POLICY_TAG=""
+  if [ -n "$POLICY_UA" ] || [ "${#POL_HDRS[@]}" -gt 0 ]; then
+    POLICY_TAG="@ua$(printf '%s\n%s' "$POLICY_UA" "$REQ_HEADERS" | sha256sum 2>/dev/null | cut -c1-8)"
+  fi
+}
+# _policy_check: the parent's validation of --user-agent / --header / --req-timeout (exit 2)
+_policy_check() {
+  local h n v
+  if [ -n "$POLICY_UA" ]; then
+    if [ "${#POLICY_UA}" -gt 512 ] || ! printf '%s' "$POLICY_UA" | LC_ALL=C grep -qE '^[ -~]+$' \
+       || [[ "$POLICY_UA" == *';;'* ]]; then
+      err "--user-agent: printable ASCII, at most 512 characters and no ';;' (got: ${POLICY_UA:0:80})"; exit 2
+    fi
+  fi
+  [ "${#POL_HDRS[@]}" -le 16 ] || { err "--header: at most 16 extra headers"; exit 2; }
+  for h in "${POL_HDRS[@]}"; do
+    n="${h%%:*}"; v="${h#*:}"; v="${v# }"
+    if [ "$n" = "$h" ] || ! printf '%s' "$n" | LC_ALL=C grep -qE '^[A-Za-z0-9-]{1,64}$' \
+       || ! printf '%s' "$v" | LC_ALL=C grep -qE '^[ -~]{1,1024}$'; then
+      err "--header '$h': want 'Name: value' (letters, digits and '-' in the name; printable ASCII in the value)"; exit 2
+    fi
+    case "$(printf '%s' "$n" | tr 'A-Z' 'a-z')" in
+      user-agent) err "--header: set the User-Agent with --user-agent"; exit 2;;
+      host|content-length|transfer-encoding|connection)
+        err "--header: '$n' is set by each tool for each request and cannot be overridden"; exit 2;;
+      cookie) [[ "$v" == *';;'* ]] && { err "--header: no ';;' in a Cookie value"; exit 2; };;
+      *) [[ "$v" == *';'* ]] && { err "--header '$n': no ';' in the value (wpscan and xnLinkFinder split headers on it); only a Cookie may hold one"; exit 2; };;
+    esac
+  done
+  case "$REQ_TIMEOUT" in ''|*[!0-9]*|0) err "--req-timeout: a whole number of seconds, 1 or more"; exit 2;; esac
+  return 0
+}
+_policy_init
 
 # --- per-source circuit breaker + concurrency ceiling (run-shared via $WORKDIR) ---
 # State lives under $WORKDIR/.cb (shared across the parallel per-domain workers),
@@ -302,6 +417,11 @@ cache_or_run() {
   printf '%s' "$out"
 }
 
+# _policy_src SRC: the cache source an HTTP result is kept under. A response depends on the
+# request policy (a WAF answers one User-Agent and blocks another), so HTTP results are kept
+# per policy; TLS, port and DNS results are not (the policy does not change them).
+_policy_src() { case "$1" in httpx_json_*|katana|live_probe) printf '%s%s' "$1" "${POLICY_TAG:-}";; *) printf '%s' "$1";; esac; }
+
 # cache_split SRC KEYFILE HITVAL MISSKEYS
 #   Partition KEYFILE (one key per line) against the DB cache for SRC (values are
 #   base64-encoded blobs):
@@ -310,6 +430,7 @@ cache_or_run() {
 #   With USE_DB!=1: HITVAL empty, MISSKEYS = KEYFILE (run everything).
 cache_split() {
   local src="$1" keyf="$2" hitval="$3" misskeys="$4"
+  src="$(_policy_src "$src")"
   : > "$hitval"; : > "$misskeys"
   [ -s "$keyf" ] || return 0
   # every cache_split source is a target-facing result (probe, enrichment, crawl, ports,
@@ -364,6 +485,7 @@ PY
 #   No-op when USE_DB!=1.
 cache_store() {
   local src="$1" misskeys="$2" resultf="$3" mode="$4" noneg="${5:-}"
+  src="$(_policy_src "$src")"
   [ "$USE_DB" = "1" ] || return 0
   local tc="$resultf.tc" ng="$resultf.ng"
   CACHE_MODE="$mode" python3 - "$resultf" "$misskeys" "$tc" "$ng" <<'PY' || return 0
@@ -798,9 +920,16 @@ PYENUM
 # same fields. -er: the <form> tags and password inputs of the page, in page order (httpx
 # lists each distinct match once), for login_form / CleartextAuth; no extra request.
 LOGIN_FORM_RE='(?is)<form[^>]*>|<input[^>]+type\s*=\s*["'"'"']?password'
+# The block-page markers of the WAF vendors (run health, waf_blocked), matched in the same
+# response (headers and body); no extra request.
+WAF_MARK_RE='(?i)incapsula incident id|_incapsula_resource|the requested url was rejected|mod_?security|generated by wordfence|limited by the site owner|cf-error-details|error code: 10[0-9]{2}|reference&#32;&#35;[0-9]|errors\.edgesuite\.net|request blocked\.|generated by cloudfront|sucuri website firewall|fortiweb|web page blocked|barra_counter_session|the request is blocked\.|ddos-guard'
+# -probe: a request httpx could not complete (reset, timeout, TLS name error, refused) is
+# written too, as a "failed" record; those go to <raw>/hx_failed.jsonl for the run-health
+# count, the rest on as before.
 _hx_enrich() {
-  _to "$STAGE_TIMEOUT" "$HTTPX_BIN" -silent -json -status-code -content-length -title -tech-detect -web-server \
-    -irh -hash sha256 -nfs -er "$LOGIN_FORM_RE" -timeout 10 -retries "$HTTP_RETRIES" -rl "$RATE" "$@"
+  _to "$STAGE_TIMEOUT" "$HTTPX_BIN" -silent -json -probe -status-code -content-length -title -tech-detect -web-server \
+    -irh -hash sha256 -nfs -er "$LOGIN_FORM_RE" -er "$WAF_MARK_RE" -timeout "$REQ_TIMEOUT" -retries "$HTTP_RETRIES" -rl "$RATE" "${PA_H[@]}" "$@" \
+    | awk -v f="${raw:-$WORKDIR}/hx_failed.jsonl" '/"failed":true[,}]/ { print >> f; next } { print }'
 }
 
 # redirect_hops DOMAIN RAW ENRICHED HOPS [HTTPX-ARGS...] : --extras. The same-host redirect
@@ -877,12 +1006,12 @@ PYHOPS
     [ -s "$next" ] || break
     cat "$next" >> "$asked"
     local _hh="$raw/hops_hit.jsonl" _hm="$raw/hops_miss.txt" _hf="$raw/hops_fresh.jsonl" _hrc=0
-    cache_split httpx_json_v3 "$next" "$_hh" "$_hm"
+    cache_split httpx_json_v4 "$next" "$_hh" "$_hm"
     cat "$_hh" >> "$hops" 2>/dev/null || true
     if [ -s "$_hm" ]; then
       _hx_enrich "$@" < "$_hm" 2>>"$raw/httpx.err" > "$_hf" || _hrc=$?
       cat "$_hf" >> "$hops" 2>/dev/null || true
-      [ "$_hrc" -eq 0 ] && cache_store httpx_json_v3 "$_hm" "$_hf" httpxjson noneg
+      [ "$_hrc" -eq 0 ] && cache_store httpx_json_v4 "$_hm" "$_hf" httpxjson noneg
     fi
   done
   [ -s "$hops" ] && log "[$domain] redirect hops: $(grep -c . "$hops") same-host target(s) fetched"
@@ -1348,7 +1477,7 @@ PYTK
     # Keep only subzy's result lines ("[ VULNERABLE ]  -  <name>  [ <service> ]"). The old
     # 'vulnerable|takeover' grep also matched subzy's settings banner ("Show only
     # potentially vulnerable subdomains"), a false finding for every seed.
-    _to "$STAGE_TIMEOUT" subzy run --targets "$cn" --hide_fails 2>/dev/null \
+    _to "$STAGE_TIMEOUT" subzy run --targets "$cn" --hide_fails --timeout "$REQ_TIMEOUT" 2>/dev/null \
       | sed -E 's/\x1B\[[0-9;]*[A-Za-z]//g' \
       | sed -nE 's/^\[ *VULNERABLE *\][[:space:]]+-[[:space:]]+([^[:space:]]+)[[:space:]]*\[[[:space:]]*(.*[^[:space:]])[[:space:]]*\].*$/\1\t\2/p' \
       | while IFS="$(printf '\t')" read -r _h _svc; do
@@ -1357,7 +1486,7 @@ PYTK
   fi
   if have nuclei; then
     nuclei_oast_args
-    _to "$SCAN_TIMEOUT" nuclei -l "$cn" -tags takeover -silent "${_NO[@]}" "${rr2[@]}" 2>/dev/null \
+    _to "$SCAN_TIMEOUT" nuclei -l "$cn" -tags takeover -silent "${_NO[@]}" -elog "$raw/nuclei_elog.takeover.jsonl" -rl "$RATE" -timeout "$REQ_TIMEOUT" "${PA_H[@]}" "${rr2[@]}" 2>/dev/null \
       | sed "s#^#[$domain] nuclei-takeover #" >> "$out" || true
   fi
 }
@@ -1389,7 +1518,7 @@ origin_check() {
   grep -E '^https?://[^/]+/?$' "$live" 2>/dev/null | sort -u > "$raw/origin_roots.txt" || true
   [ -s "$raw/origin_roots.txt" ] || return 0
   _to "$STAGE_TIMEOUT" "$HTTPX_BIN" -l "$raw/origin_roots.txt" -silent -json -irh -title -hash sha256 -favicon \
-      -nfs -nc -timeout 10 -retries "$HTTP_RETRIES" -rl "$RATE" "${rr[@]}" 2>>"$raw/httpx.err" > "$ref" || true
+      -nfs -nc -timeout "$REQ_TIMEOUT" -retries "$HTTP_RETRIES" -rl "$RATE" "${PA_H[@]}" "${rr[@]}" 2>>"$raw/httpx.err" > "$ref" || true
   # the reference fetch already has the favicon hashes: record them (no second request)
   if [ -n "$favhash" ] && [ ! -s "$favhash" ]; then favhash_from_json "$ref" >> "$favhash"; fi
   : > "$jarm"; : > "$cdn"
@@ -1649,7 +1778,7 @@ PYOC
       _body="$raw/origin_body.$$"; _code=""; _rc=0
       if [ -n "$PROXY" ]; then
         printf '%s://%s:%s/\n' "$_sch" "$_rip" "$_port" | _to 30 "$HTTPX_BIN" -silent -json -title -hash sha256 -nfs -nc \
-          -timeout 10 -retries 0 -H "Host: $_h" -proxy "$PROXY" 2>/dev/null > "$_body.json" || true
+          -timeout "$REQ_TIMEOUT" -retries 0 -H "Host: $_h" "${PA_H[@]}" -proxy "$PROXY" 2>/dev/null > "$_body.json" || true
         _got="$(python3 -c 'import sys,json
 try: j=json.loads(open(sys.argv[1]).readline())
 except Exception: sys.exit(0)
@@ -1659,7 +1788,7 @@ print("\x1f".join([str((j.get("hash") or {}).get("body_sha256","")), str(j.get("
         # Direct by design: the question is whether the origin answers WITHOUT the edge.
         # Like httpx, the comparison fetch accepts any certificate (cert validity is the
         # TLS posture stage's job); --noproxy keeps it off any environment proxy.
-        _code="$(_to 20 curl -s -k --noproxy '*' --max-time 10 --max-filesize 5000000 -o "$_body" -w '%{http_code}' \
+        _code="$(_to 20 curl -s -k "${PA_CURL[@]}" --noproxy '*' --max-time "$REQ_TIMEOUT" --max-filesize 5000000 -o "$_body" -w '%{http_code}' \
           --resolve "$_h:$_port:$_rip" "$_sch://$_h:$_port/" 2>/dev/null)" || _rc=$?
         [ -f "$_body" ] || : > "$_body"
         if [ -s "$_body" ]; then
@@ -1744,8 +1873,8 @@ host_favicons() {
   grep -E '^https?://[^/]+/?$' "$raw/live_hosts.txt" 2>/dev/null | sort -u > "$roots" || true
   [ -s "$roots" ] || return 0
   local rr=(); [ -n "$RESOLVERS" ] && rr=(-r "$RESOLVERS"); [ -n "$PROXY" ] && rr+=(-proxy "$PROXY")
-  _to "$STAGE_TIMEOUT" "$HTTPX_BIN" -l "$roots" -silent -json -favicon -nfs -nc -timeout 10 \
-      -retries "$HTTP_RETRIES" -rl "$RATE" "${rr[@]}" 2>>"$raw/httpx.err" > "$js" || true
+  _to "$STAGE_TIMEOUT" "$HTTPX_BIN" -l "$roots" -silent -json -favicon -nfs -nc -timeout "$REQ_TIMEOUT" \
+      -retries "$HTTP_RETRIES" -rl "$RATE" "${PA_H[@]}" "${rr[@]}" 2>>"$raw/httpx.err" > "$js" || true
   favhash_from_json "$js" >> "$out"
   return 0
 }
@@ -1781,7 +1910,7 @@ favicon_pivot() {
   [ -s "$hits" ] && have tlsx || return 0
   awk -F: '{ print $1 ":" ($2 == "" ? 443 : $2) }' "$hits" | sort -u | scope_ip_filter "$domain" internet-scan-hit > "$raw/favicon_hits_hp.txt"
   [ -s "$raw/favicon_hits_hp.txt" ] || return 0
-  local ftl=(-l "$raw/favicon_hits_hp.txt" -san -cn -resp-only -silent -timeout 10)
+  local ftl=(-l "$raw/favicon_hits_hp.txt" -san -cn -resp-only -silent -timeout "$REQ_TIMEOUT")
   { [ -n "$RESOLVERS" ] && [ -s "$RESOLVERS" ]; } && ftl+=(-r "$RESOLVERS")
   _to "$STAGE_TIMEOUT" tlsx "${ftl[@]}" < /dev/null 2>/dev/null | scope_filter "$domain" | sort -u > "$raw/favpivot.raw" || : > "$raw/favpivot.raw"
   comm -13 <(sort -u "$raw/hosts.txt" 2>/dev/null) "$raw/favpivot.raw" > "$raw/favpivot.new" 2>/dev/null || cp "$raw/favpivot.raw" "$raw/favpivot.new"
@@ -1816,7 +1945,7 @@ extras_check() {
   # are computed here. An icon declared elsewhere on the same host is fetched in one
   # follow-up run, only for the hosts that need it.
   _to "$STAGE_TIMEOUT" "$HTTPX_BIN" -l "$roots" -path "/,/favicon.ico,/robots.txt,/.well-known/security.txt,/security.txt,$probe" \
-      -silent -json -irrb -nfs -nc -timeout 10 -retries "$HTTP_RETRIES" -rl "$RATE" "${rr[@]}" 2>>"$raw/httpx.err" > "$js" || true
+      -silent -json -irrb -nfs -nc -timeout "$REQ_TIMEOUT" -retries "$HTTP_RETRIES" -rl "$RATE" "${PA_H[@]}" "${rr[@]}" 2>>"$raw/httpx.err" > "$js" || true
   python3 - "$js" "$domain" "$probe" "$out" "$hinfo" "$urls" "$favhash" "$raw/extras_icons.txt" <<'PYEX' 2>>"$raw/extras.err" || true
 import sys, json, re, datetime, base64, hashlib
 from urllib.parse import urljoin, urlparse
@@ -1989,8 +2118,8 @@ PYEX
   # icons declared at another path on the same host: one more run, only when needed
   if [ -s "$raw/extras_icons.txt" ]; then
     cut -f2 "$raw/extras_icons.txt" | sort -u > "$raw/extras_icon_urls.txt"
-    _to "$STAGE_TIMEOUT" "$HTTPX_BIN" -l "$raw/extras_icon_urls.txt" -silent -json -irrb -nfs -nc -timeout 10 \
-        -retries "$HTTP_RETRIES" -rl "$RATE" "${rr[@]}" 2>>"$raw/httpx.err" > "$raw/extras_icons.jsonl" || true
+    _to "$STAGE_TIMEOUT" "$HTTPX_BIN" -l "$raw/extras_icon_urls.txt" -silent -json -irrb -nfs -nc -timeout "$REQ_TIMEOUT" \
+        -retries "$HTTP_RETRIES" -rl "$RATE" "${PA_H[@]}" "${rr[@]}" 2>>"$raw/httpx.err" > "$raw/extras_icons.jsonl" || true
     python3 - "$raw/extras_icons.txt" "$raw/extras_icons.jsonl" >> "$favhash" <<'PYICON' 2>>"$raw/extras.err" || true
 import sys, json, base64, hashlib
 def mmh3_32(data, seed=0):
@@ -2089,7 +2218,7 @@ analyze_hosts() {
       cache_split tlsx_posture_v2 "$_tlskeys" "$_tlshit" "$_tlsmiss"   # reuse cached posture
       cat "$_tlshit" >> "$P/tlsx.$safe.jsonl" 2>/dev/null || true
       if [ -s "$_tlsmiss" ]; then
-        local _tlsargs=(-l "$_tlsmiss" -json -tls-version -cipher -expired -self-signed -mismatched -untrusted -wildcard-cert -cert -silent -timeout 10)
+        local _tlsargs=(-l "$_tlsmiss" -json -tls-version -cipher -expired -self-signed -mismatched -untrusted -wildcard-cert -cert -silent -timeout "$REQ_TIMEOUT")
         _tlsargs+=("${rr2[@]}")
         local _tlsfresh="$raw/tls_fresh.jsonl" _tlsrc=0
         _to "$STAGE_TIMEOUT" tlsx "${_tlsargs[@]}" 2>>"$raw/tlsx.err" > "$_tlsfresh" || _tlsrc=$?
@@ -2186,7 +2315,9 @@ for ln in sys.stdin:
         # ignores NO_PROXY, so names meant to be reached directly were sent to the proxy
         # and the "screenshot" was the proxy's error page. SS_* (set in the main process)
         # give the browser the same routing; -json records what the browser rendered.
-        local _ssargs=(-l "$_sstarget" -ss -srd "$_ssfresh" -silent -json -esb -o "$raw/ss.jsonl")
+        # the policy headers: httpx sends them on its own request and the browser adds them to
+        # its requests, but the browser keeps its own User-Agent (README, "Request policy")
+        local _ssargs=(-l "$_sstarget" -ss -srd "$_ssfresh" -silent -json -esb -o "$raw/ss.jsonl" -timeout "$REQ_TIMEOUT" "${PA_H[@]}")
         [ "${SS_CHROME:-0}" = "1" ] && _ssargs+=(-system-chrome)
         [ -n "${SS_PROXY_SERVER:-}" ] && _ssargs+=(-ho "--proxy-server=$SS_PROXY_SERVER")
         [ -n "${SS_PROXY_BYPASS:-}" ] && _ssargs+=(-ho "--proxy-bypass-list=$SS_PROXY_BYPASS")
@@ -2234,7 +2365,7 @@ print(", ".join(rules))' "${SCOPE_ON:-0}" 2>/dev/null)" || _hrr=""
         # does. --write-jsonl records each capture (url, rendered title, status, file);
         # only successful loads are written. Its Chrome takes the environment proxy and
         # NO_PROXY itself, and the system resolver (no --host-resolver-rules equivalent).
-        local _gwargs=(--screenshot-path "$_ssfresh" --write-jsonl --write-jsonl-file "$raw/gw.jsonl")
+        local _gwargs=(--screenshot-path "$_ssfresh" --write-jsonl --write-jsonl-file "$raw/gw.jsonl" "${PA_GOWITNESS[@]}")
         local _gwc
         for _gwc in google-chrome google-chrome-stable chromium chromium-browser; do
           have "$_gwc" && { _gwargs+=(--chrome-path "$(command -v "$_gwc")"); break; }
@@ -2352,7 +2483,7 @@ PYSS
   # nuclei templated scan (opt-in; OFF by default -- widens scope to scanning)
   if [ "$NUCLEI" = "1" ] && have nuclei; then
     nuclei_oast_args
-    _to "$SCAN_TIMEOUT" nuclei -l "$live" -severity "$NUCLEI_SEV" -silent "${_NO[@]}" "${rr2[@]}" 2>/dev/null \
+    _to "$SCAN_TIMEOUT" nuclei -l "$live" -severity "$NUCLEI_SEV" -silent "${_NO[@]}" -elog "$raw/nuclei_elog.scan.jsonl" -rl "$RATE" -timeout "$REQ_TIMEOUT" "${PA_H[@]}" "${rr2[@]}" 2>/dev/null \
       | sed "s/^/[$domain] /" >> "$P/nuclei.$safe.txt" || true
   fi
 
@@ -2361,7 +2492,7 @@ PYSS
   if [ "$PARAMS" = "1" ] && have arjun; then
     local pin="$raw/arjun_in.txt" pout="$raw/arjun_out.txt"
     head -n 50 "$live" > "$pin" 2>/dev/null || : > "$pin"
-    _to "$STAGE_TIMEOUT" arjun -i "$pin" -oT "$pout" -q -t 10 2>/dev/null || true
+    _to "$STAGE_TIMEOUT" arjun -i "$pin" -oT "$pout" -q -t 10 --rate-limit "$RATE" -T "$REQ_TIMEOUT" "${PA_ARJUN[@]}" 2>/dev/null || true
     [ -s "$pout" ] && sed "s/^/[$domain] /" "$pout" >> "$P/params.$safe.txt" || true
   fi
 
@@ -2370,13 +2501,13 @@ PYSS
     if have secretfinder; then
       local jsu
       while IFS= read -r jsu; do [ -z "$jsu" ] && continue
-        _to "$STAGE_TIMEOUT" secretfinder -i "$jsu" -o cli 2>/dev/null || true
+        _to "$STAGE_TIMEOUT" secretfinder -i "$jsu" -o cli "${PA_SECRETFINDER[@]}" 2>/dev/null || true
       done < "$raw/jsfiles.txt" | sed "s/^/[$domain] /" >> "$P/secrets.$safe.txt" || true
     elif have trufflehog; then
       # NOTE: --no-update omitted on purpose (errors "cannot be repeated" on some v3.88+ builds)
       local sd="$raw/js_bodies" i=0 jsu; mkdir -p "$sd"
       while IFS= read -r jsu; do [ -z "$jsu" ] && continue
-        curl -fsSL "$jsu" -o "$sd/$i.js" 2>/dev/null || true; i=$((i+1))
+        curl -fsSL "${PA_CURL[@]}" --max-time "$REQ_TIMEOUT" "$jsu" -o "$sd/$i.js" 2>/dev/null || true; i=$((i+1))
       done < "$raw/jsfiles.txt"
       _to "$STAGE_TIMEOUT" trufflehog filesystem "$sd" --no-verification 2>/dev/null \
         | sed "s/^/[$domain] /" >> "$P/secrets.$safe.txt" || true
@@ -2419,12 +2550,12 @@ cms_scan() {
     fp=""
     if have whatweb; then
       local _wwr=(); [ "${SCOPE_ON:-0}" = 1 ] && _wwr=(--follow-redirect=never)
-      fp="$(_to "$STAGE_TIMEOUT" whatweb --no-errors --color=never "${_wwr[@]}" "$u" 2>/dev/null || true)"
+      fp="$(_to "$STAGE_TIMEOUT" whatweb --no-errors --color=never "${_wwr[@]}" "${PA_WHATWEB[@]}" "$u" 2>/dev/null || true)"
     elif have nuclei; then
       nuclei_oast_args
-      fp="$(printf '%s\n' "$u" | _to "$STAGE_TIMEOUT" nuclei -tags tech -silent "${_NO[@]}" "${rr2[@]}" 2>/dev/null || true)"
+      fp="$(printf '%s\n' "$u" | _to "$STAGE_TIMEOUT" nuclei -tags tech -silent "${_NO[@]}" -rl "$RATE" -timeout "$REQ_TIMEOUT" "${PA_H[@]}" "${rr2[@]}" 2>/dev/null || true)"
     else
-      fp="$(curl -fsSL --max-time 10 "$u" 2>/dev/null | grep -iE 'name=."?generator' | head -1 || true)"
+      fp="$(curl -fsSL "${PA_CURL[@]}" --max-time "$REQ_TIMEOUT" "$u" 2>/dev/null | grep -iE 'name=."?generator' | head -1 || true)"
     fi
     [ -n "$fp" ] && printf '[%s] fingerprint %s :: %s\n' "$domain" "$u" "$(printf '%s' "$fp" | tr '\n' ' ' | cut -c1-240)" >> "$out"
     low="$(printf '%s' "$fp" | tr 'A-Z' 'a-z')"; matched=0
@@ -2438,7 +2569,7 @@ cms_scan() {
   if [ -s "$wp" ]; then
     if have wpscan; then
       while IFS= read -r u; do [ -z "$u" ] && continue
-        cache_or_run wpscan "$u" -- _to "$SCAN_TIMEOUT" wpscan --url "$u" --no-banner --format cli-no-color --random-user-agent \
+        cache_or_run wpscan "$u${POLICY_TAG:-}" -- _to "$SCAN_TIMEOUT" wpscan --url "$u" --no-banner --format cli-no-color "${PA_WPSCAN[@]}" \
           --enumerate vp,vt,u --plugins-detection mixed "${wptok[@]}" 2>/dev/null \
           | grep -aiE '\[[!+]\]|version|user|plugin|theme|vulnerab' \
           | sed "s#^#[$domain] wpscan #" >> "$out" || true
@@ -2446,11 +2577,11 @@ cms_scan() {
     else
       while IFS= read -r u; do [ -z "$u" ] && continue
         base="${u%/}"
-        local v; v="$(curl -fsSL --max-time 10 "$base/readme.html" 2>/dev/null | grep -oiE 'version [0-9.]+' | head -1 || true)"
+        local v; v="$(curl -fsSL "${PA_CURL[@]}" --max-time "$REQ_TIMEOUT" "$base/readme.html" 2>/dev/null | grep -oiE 'version [0-9.]+' | head -1 || true)"
         [ -n "$v" ] && echo "[$domain] wp-version $u $v" >> "$out"
-        curl -fsSL --max-time 10 "$base/wp-json/wp/v2/users" 2>/dev/null \
+        curl -fsSL "${PA_CURL[@]}" --max-time "$REQ_TIMEOUT" "$base/wp-json/wp/v2/users" 2>/dev/null \
           | grep -oE '"slug":"[^"]*"' | sed "s#^#[$domain] wp-user $u #" >> "$out" || true
-        curl -fsSL --max-time 10 "$base/" 2>/dev/null \
+        curl -fsSL "${PA_CURL[@]}" --max-time "$REQ_TIMEOUT" "$base/" 2>/dev/null \
           | grep -oE "/wp-content/(plugins|themes)/[^/\"' ]+" | sort -u \
           | sed "s#^#[$domain] wp-asset $u #" >> "$out" || true
       done < "$wp"
@@ -2458,10 +2589,10 @@ cms_scan() {
       if [ -f "$CMS_WORDLIST" ] && have ffuf; then
         while IFS= read -r u; do [ -z "$u" ] && continue
           base="${u%/}"
-          _to "$FUZZ_TIMEOUT" ffuf -u "$base/wp-content/plugins/FUZZ/readme.txt" -w "$CMS_WORDLIST" -mc 200 -s \
-               -t "$FUZZ_THREADS" -rate "$RATE" 2>/dev/null | sed "s#^#[$domain] wp-plugin $u #" >> "$out" || true
-          _to "$FUZZ_TIMEOUT" ffuf -u "$base/wp-content/themes/FUZZ/style.css" -w "$CMS_WORDLIST" -mc 200 -s \
-               -t "$FUZZ_THREADS" -rate "$RATE" 2>/dev/null | sed "s#^#[$domain] wp-theme $u #" >> "$out" || true
+          _to "$FUZZ_TIMEOUT" ffuf -u "$base/wp-content/plugins/FUZZ/readme.txt" -w "$CMS_WORDLIST" -mc 200 -ac -s \
+               -t "$FUZZ_THREADS" -rate "$RATE" -timeout "$REQ_TIMEOUT" "${PA_H[@]}" 2>/dev/null | sed "s#^#[$domain] wp-plugin $u #" >> "$out" || true
+          _to "$FUZZ_TIMEOUT" ffuf -u "$base/wp-content/themes/FUZZ/style.css" -w "$CMS_WORDLIST" -mc 200 -ac -s \
+               -t "$FUZZ_THREADS" -rate "$RATE" -timeout "$REQ_TIMEOUT" "${PA_H[@]}" 2>/dev/null | sed "s#^#[$domain] wp-theme $u #" >> "$out" || true
         done < "$wp"
       fi
     fi
@@ -2471,12 +2602,12 @@ cms_scan() {
   if [ -s "$dr" ]; then
     while IFS= read -r u; do [ -z "$u" ] && continue
       if have droopescan; then
-        _to "$STAGE_TIMEOUT" droopescan scan drupal -u "$u" 2>/dev/null \
+        _to "$STAGE_TIMEOUT" droopescan scan drupal -u "$u" "${PA_DROOPESCAN[@]}" 2>/dev/null \
           | grep -aiE 'found|version|http' | sed "s#^#[$domain] droopescan #" >> "$out" || true
       else
         base="${u%/}"; local dv
-        dv="$(curl -fsSL --max-time 10 "$base/CHANGELOG.txt" 2>/dev/null | grep -oiE 'drupal [0-9.]+' | head -1 || true)"
-        [ -z "$dv" ] && dv="$(curl -fsSL --max-time 10 "$base/core/CHANGELOG.txt" 2>/dev/null | grep -oiE 'drupal [0-9.]+' | head -1 || true)"
+        dv="$(curl -fsSL "${PA_CURL[@]}" --max-time "$REQ_TIMEOUT" "$base/CHANGELOG.txt" 2>/dev/null | grep -oiE 'drupal [0-9.]+' | head -1 || true)"
+        [ -z "$dv" ] && dv="$(curl -fsSL "${PA_CURL[@]}" --max-time "$REQ_TIMEOUT" "$base/core/CHANGELOG.txt" 2>/dev/null | grep -oiE 'drupal [0-9.]+' | head -1 || true)"
         [ -n "$dv" ] && echo "[$domain] drupal-version $u $dv" >> "$out"
       fi
     done < "$dr"
@@ -2486,11 +2617,11 @@ cms_scan() {
   if [ -s "$jm" ]; then
     while IFS= read -r u; do [ -z "$u" ] && continue
       if have joomscan; then
-        _to "$STAGE_TIMEOUT" joomscan --url "$u" 2>/dev/null \
+        _to "$STAGE_TIMEOUT" joomscan --url "$u" "${PA_JOOMSCAN[@]}" 2>/dev/null \
           | grep -aiE '\[\+\+\]|version|vulnerab|core|component' | sed "s#^#[$domain] joomscan #" >> "$out" || true
       else
         base="${u%/}"; local jv
-        jv="$(curl -fsSL --max-time 10 "$base/administrator/manifests/files/joomla.xml" 2>/dev/null | grep -oiE '<version>[^<]+' | head -1 || true)"
+        jv="$(curl -fsSL "${PA_CURL[@]}" --max-time "$REQ_TIMEOUT" "$base/administrator/manifests/files/joomla.xml" 2>/dev/null | grep -oiE '<version>[^<]+' | head -1 || true)"
         [ -n "$jv" ] && echo "[$domain] joomla-version $u ${jv#<version>}" >> "$out"
       fi
     done < "$jm"
@@ -2500,7 +2631,7 @@ cms_scan() {
   if [ -s "$ot" ] && have cmseek; then
     while IFS= read -r u; do [ -z "$u" ] && continue
       local _cmr=(--follow-redirect); [ "${SCOPE_ON:-0}" = 1 ] && _cmr=()
-      _to "$STAGE_TIMEOUT" cmseek -u "$u" "${_cmr[@]}" 2>/dev/null < /dev/null \
+      _to "$STAGE_TIMEOUT" cmseek -u "$u" "${_cmr[@]}" "${PA_CMSEEK[@]}" 2>/dev/null < /dev/null \
         | grep -aiE 'detected|version|cms' | sed "s#^#[$domain] cmseek #" >> "$out" || true
     done < "$ot"
   fi
@@ -2509,7 +2640,7 @@ cms_scan() {
   if [ -s "$all" ] && have nuclei; then
     sort -u "$all" -o "$all" 2>/dev/null || true
     nuclei_oast_args
-    _to "$SCAN_TIMEOUT" nuclei -l "$all" -tags tech,cms -silent "${_NO[@]}" "${rr2[@]}" 2>/dev/null \
+    _to "$SCAN_TIMEOUT" nuclei -l "$all" -tags tech,cms -silent "${_NO[@]}" -elog "$raw/nuclei_elog.cms.jsonl" -rl "$RATE" -timeout "$REQ_TIMEOUT" "${PA_H[@]}" "${rr2[@]}" 2>/dev/null \
       | sed "s#^#[$domain] nuclei-cms #" >> "$out" || true
   fi
   return 0
@@ -2541,7 +2672,7 @@ activescan() {
     wlname="$(basename "$wl")"
     stage "$domain" "activescan content ($wlname)"
     if have feroxbuster; then
-      local fxa=(--stdin -w "$wl" --silent -t "$FUZZ_THREADS" --rate-limit "$RATE" --timeout 10 --depth 2 -k -C 404)
+      local fxa=(--stdin -w "$wl" --silent -t "$FUZZ_THREADS" --rate-limit "$RATE" --timeout "$REQ_TIMEOUT" --depth 2 -k -C 404 "${PA_FEROX[@]}")
       [ "$FUZZ_TIMEOUT" -gt 0 ] 2>/dev/null && fxa+=(--time-limit "${FUZZ_TIMEOUT}s")
       cat "$live" | _to "$FUZZ_TIMEOUT" feroxbuster "${fxa[@]}" 2>/dev/null | tee -a "$asurls" \
         | sed "s#^#[$domain] content($wlname) #" >> "$out" || true
@@ -2550,7 +2681,7 @@ activescan() {
         # shellcheck disable=SC2054  # comma-separated -mc value for ffuf, not array separators
         local afa=(-u "${base%/}/FUZZ" -w "$wl" \
                    -mc 200,204,301,302,307,308,401,403,405 \
-                   -t "$FUZZ_THREADS" -rate "$RATE" -timeout 10 -s)
+                   -t "$FUZZ_THREADS" -rate "$RATE" -timeout "$REQ_TIMEOUT" -ac -s "${PA_H[@]}")
         _to "$FUZZ_TIMEOUT" ffuf "${afa[@]}" 2>/dev/null | awk -v b="${base%/}/" 'NF{print b $0}' | tee -a "$asurls" \
           | sed "s#^#[$domain] content($wlname) #" >> "$out" || true
       done < "$live"
@@ -2569,7 +2700,7 @@ activescan() {
     stage "$domain" "activescan nuclei ($NUCLEI_SEV)"
     cat "$live" "$ascln" 2>/dev/null | sort -u > "$raw/activescan_targets.txt" || cp "$live" "$raw/activescan_targets.txt"
     nuclei_oast_args
-    _to "$SCAN_TIMEOUT" nuclei -l "$raw/activescan_targets.txt" -severity "$NUCLEI_SEV" -silent "${_NO[@]}" "${rr2[@]}" 2>/dev/null \
+    _to "$SCAN_TIMEOUT" nuclei -l "$raw/activescan_targets.txt" -severity "$NUCLEI_SEV" -silent "${_NO[@]}" -elog "$raw/nuclei_elog.activescan.jsonl" -rl "$RATE" -timeout "$REQ_TIMEOUT" "${PA_H[@]}" "${rr2[@]}" 2>/dev/null \
       | sed "s#^#[$domain] nuclei #" >> "$out" || true
   fi
   return 0
@@ -2853,7 +2984,7 @@ process_one() {
       if [ -n "$_cc" ]; then printf '%s\n' "$_cc" > "$raw/host_tlsx.txt"; _certc=1; fi
     fi
     if [ "$_certc" = "0" ]; then
-      local tlsxargs=(-l "$hosts" -san -cn -resp-only -silent -timeout 10)
+      local tlsxargs=(-l "$hosts" -san -cn -resp-only -silent -timeout "$REQ_TIMEOUT")
       { [ -n "$RESOLVERS" ] && [ -s "$RESOLVERS" ]; } && tlsxargs+=(-r "$RESOLVERS")
       _to "$STAGE_TIMEOUT" tlsx "${tlsxargs[@]}" 2>>"$raw/tlsx.err" | scope_filter "$domain" | sort -u \
         > "$raw/host_tlsx.txt" || : > "$raw/host_tlsx.txt"
@@ -2878,7 +3009,7 @@ process_one() {
       scope_ip_filter "$domain" internet-scan-hit < "$favips" > "$favips.in"; mv "$favips.in" "$favips"
     fi
     if [ -s "$favips" ] && have tlsx; then
-      local ftl=(-l "$favips" -san -cn -resp-only -silent -timeout 10)
+      local ftl=(-l "$favips" -san -cn -resp-only -silent -timeout "$REQ_TIMEOUT")
       { [ -n "$RESOLVERS" ] && [ -s "$RESOLVERS" ]; } && ftl+=(-r "$RESOLVERS")
       _to "$STAGE_TIMEOUT" tlsx "${ftl[@]}" 2>/dev/null | scope_filter "$domain" | sort -u \
         > "$raw/host_favicon.txt" || : > "$raw/host_favicon.txt"
@@ -3029,7 +3160,7 @@ process_one() {
       cat "$_lphit" >> "$live" 2>/dev/null || true
       if [ -s "$_lpmiss" ]; then
         local _lpfresh="$raw/live_fresh.txt" _lprc=0
-        cat "$_lpmiss" | _to "$STAGE_TIMEOUT" "$HTTPX_BIN" -silent -rl "$RATE" -timeout 10 -retries "$HTTP_RETRIES" "${rr[@]}" 2>>"$raw/httpx.err" > "$_lpfresh" || _lprc=$?
+        cat "$_lpmiss" | _to "$STAGE_TIMEOUT" "$HTTPX_BIN" -silent -rl "$RATE" -timeout "$REQ_TIMEOUT" -retries "$HTTP_RETRIES" "${PA_H[@]}" "${rr[@]}" 2>>"$raw/httpx.err" > "$_lpfresh" || _lprc=$?
         # late retry for the scheme: httpx tries HTTPS first and falls back to HTTP, so a
         # host that came back as http://host either serves HTTP only or failed its HTTPS
         # attempts in a load spike (the farm at -t 10 lost a host's TLS posture this way).
@@ -3041,7 +3172,7 @@ process_one() {
           sed -nE 's#^http://([^/:]+)/?$#https://\1#p' "$_lpfresh" | sort -u > "$_lphttp"
           log "[$domain] live probe: $(wc -l < "$_lphttp" | tr -d ' ') host(s) answered on HTTP only; one more HTTPS try after a pause"
           late_pause
-          _to "$STAGE_TIMEOUT" "$HTTPX_BIN" -silent -rl "$RATE" -timeout 10 -retries 0 -nfs "${rr[@]}" < "$_lphttp" 2>>"$raw/httpx.err" > "$_lpre" || true
+          _to "$STAGE_TIMEOUT" "$HTTPX_BIN" -silent -rl "$RATE" -timeout "$REQ_TIMEOUT" -retries 0 -nfs "${PA_H[@]}" "${rr[@]}" < "$_lphttp" 2>>"$raw/httpx.err" > "$_lpre" || true
           if [ -s "$_lpre" ]; then
             awk 'NR == FNR { h = $0; sub(/^https:\/\//, "", h); sub(/[\/:].*$/, "", h); ok[tolower(h)] = 1; print; next }
                  { u = $0; h = u; sub(/^http:\/\//, "", h); sub(/\/$/, "", h)
@@ -3076,7 +3207,8 @@ process_one() {
         awk 'NR==FNR{m[$0]=1;next}{h=$0;sub(/^[a-z]+:\/\//,"",h);sub(/[/:].*$/,"",h);if(h in m)print}' \
           "$_kmiss" "$live" > "$_kmissurls" 2>/dev/null || : > "$_kmissurls"
         if [ -s "$_kmissurls" ]; then
-          local katargs=(-list "$_kmissurls" -d "$DEPTH" -silent -jc -kf all -fs rdn -rl "$RATE" -timeout 10)
+          local katargs=(-list "$_kmissurls" -d "$DEPTH" -silent -jc -kf all -fs rdn -rl "$RATE" -timeout "$REQ_TIMEOUT" "${PA_H[@]}")
+          katargs+=(-elog "$raw/katana_elog.jsonl")   # its request errors, for the run-health count
           # same resolvers as httpx/dnsx/tlsx: without -r katana used the system
           # resolver, so with --resolvers (e.g. a Pi-hole bypass, or a lab DNS) the
           # crawl silently found nothing for names only those resolvers know
@@ -3104,16 +3236,16 @@ process_one() {
     # extra crawlers (gospider + hakrawler) for wider coverage
     if [ "$CRAWLERS_ALL" = "1" ] && [ -s "$live" ]; then
       stage "$domain" "extra crawlers (gospider/hakrawler)"
-      have gospider  && { _to "$STAGE_TIMEOUT" gospider -S "$live" -q -d "$DEPTH" -t "$FUZZ_THREADS" 2>/dev/null | grep -oE 'https?://[^ ]+' >> "$gs" || true; }
-      have hakrawler && { cat "$live" | _to "$STAGE_TIMEOUT" hakrawler -d "$DEPTH" 2>/dev/null >> "$hk" || true; }
+      have gospider  && { _to "$STAGE_TIMEOUT" gospider -S "$live" -q -d "$DEPTH" -t "$FUZZ_THREADS" -m "$REQ_TIMEOUT" "${PA_GOSPIDER[@]}" 2>/dev/null | grep -oE 'https?://[^ ]+' >> "$gs" || true; }
+      have hakrawler && { cat "$live" | _to "$STAGE_TIMEOUT" hakrawler -d "$DEPTH" "${PA_HAKRAWLER[@]}" 2>/dev/null >> "$hk" || true; }
     fi
 
     # JS endpoint mining (subjs/getJS pull JS URLs -> xnLinkFinder extracts endpoints)
     if [ "$JS" = "1" ] && [ -s "$live" ]; then
       stage "$domain" "JS endpoint mining (subjs/getJS/xnLinkFinder)"
       local jsfiles="$raw/jsfiles.txt"; : > "$jsfiles"
-      have subjs && { cat "$live" | _to "$STAGE_TIMEOUT" subjs 2>/dev/null >> "$jsfiles" || true; }
-      have getJS && { _to "$STAGE_TIMEOUT" getJS --input "$live" --complete 2>/dev/null >> "$jsfiles" || true; }
+      have subjs && { cat "$live" | _to "$STAGE_TIMEOUT" subjs -t "$REQ_TIMEOUT" "${PA_SUBJS[@]}" 2>/dev/null >> "$jsfiles" || true; }
+      have getJS && { _to "$STAGE_TIMEOUT" getJS --input "$live" --complete -timeout "${REQ_TIMEOUT}s" "${PA_GETJS[@]}" 2>/dev/null >> "$jsfiles" || true; }
       sort -u "$jsfiles" -o "$jsfiles" 2>/dev/null || true
       # --scope: xnLinkFinder fetches the JS files; only those on this seed's live hosts
       if [ "${SCOPE_ON:-0}" = 1 ] && [ -s "$jsfiles" ]; then
@@ -3123,7 +3255,7 @@ process_one() {
         mv "$jsfiles.in" "$jsfiles"
       fi
       if [ -s "$jsfiles" ]; then
-        have xnLinkFinder && { _to "$STAGE_TIMEOUT" xnLinkFinder -i "$jsfiles" -sf "$domain" -o cli 2>/dev/null | grep -oE 'https?://[^ ]+' >> "$js" || true; }
+        have xnLinkFinder && { _to "$STAGE_TIMEOUT" xnLinkFinder -i "$jsfiles" -sf "$domain" -o cli -t "$REQ_TIMEOUT" "${PA_XN[@]}" 2>/dev/null | grep -oE 'https?://[^ ]+' >> "$js" || true; }
         cat "$jsfiles" >> "$js" || true   # the JS file URLs are themselves assets
       fi
     fi
@@ -3136,7 +3268,7 @@ process_one() {
         # --silent => print only discovered URLs; -C 404 filters not-found; -k allows self-signed;
         # --time-limit caps feroxbuster's own (recursive) runtime as a second belt to _to.
         local fxargs=(--stdin -w "$WORDLIST" --silent -t "$FUZZ_THREADS" \
-                      --rate-limit "$RATE" --timeout 10 --depth 2 -k -C 404)
+                      --rate-limit "$RATE" --timeout "$REQ_TIMEOUT" --depth 2 -k -C 404 "${PA_FEROX[@]}")
         [ "$FUZZ_TIMEOUT" -gt 0 ] 2>/dev/null && fxargs+=(--time-limit "${FUZZ_TIMEOUT}s")
         [ -n "$FUZZ_EXT" ] && fxargs+=(-x "$FUZZ_EXT")
         cat "$live" | _to "$FUZZ_TIMEOUT" feroxbuster "${fxargs[@]}" 2>/dev/null >> "$fz" || true
@@ -3150,7 +3282,7 @@ process_one() {
           # shellcheck disable=SC2054  # 200,204,... is one comma-separated value for ffuf -mc, not array separators
           local ffargs=(-u "${base%/}/FUZZ" -w "$WORDLIST" \
                         -mc 200,204,301,302,307,308,401,403,405 \
-                        -t "$FUZZ_THREADS" -rate "$RATE" -timeout 10 -s)
+                        -t "$FUZZ_THREADS" -rate "$RATE" -timeout "$REQ_TIMEOUT" -ac -s "${PA_H[@]}")
           [ -n "$ffext" ] && ffargs+=(-e "$ffext")
           _to "$FUZZ_TIMEOUT" ffuf "${ffargs[@]}" 2>/dev/null | awk -v b="${base%/}/" 'NF{print b $0}' >> "$fz" || true
         done < "$live"
@@ -3160,7 +3292,7 @@ process_one() {
     # virtual-host bruteforce (ffuf Host header) -> new candidate hosts
     if [ "$VHOST" = "1" ] && [ -s "$live" ] && have ffuf && [ -f "$BRUTE_WORDLIST" ]; then
       local vtarget; vtarget="$(head -n1 "$live")"
-      _to "$FUZZ_TIMEOUT" ffuf -u "$vtarget" -H "Host: FUZZ.$domain" -w "$BRUTE_WORDLIST" -ac -s \
+      _to "$FUZZ_TIMEOUT" ffuf -u "$vtarget" -H "Host: FUZZ.$domain" "${PA_H[@]}" -w "$BRUTE_WORDLIST" -ac -s -timeout "$REQ_TIMEOUT" \
            -mc 200,204,301,302,307,401,403 -t "$FUZZ_THREADS" -rate "$RATE" 2>/dev/null \
         | awk -v d="$domain" 'NF{print $0"."d}' | scope_filter "$domain" | sort -u \
         > "$raw/host_vhost.txt" || : > "$raw/host_vhost.txt"
@@ -3170,7 +3302,7 @@ process_one() {
     # cert feedback loop (phase 2): grab certs off the LIVE hosts, harvest new
     # sibling SAN/CN names, resolve, feed them in as discovered host rows.
     if [ "$CERTS" = "1" ] && have tlsx && [ -s "$livehosts" ]; then
-      local tl2=(-l "$livehosts" -san -cn -resp-only -silent -timeout 10)
+      local tl2=(-l "$livehosts" -san -cn -resp-only -silent -timeout "$REQ_TIMEOUT")
       { [ -n "$RESOLVERS" ] && [ -s "$RESOLVERS" ]; } && tl2+=(-r "$RESOLVERS")
       _to "$STAGE_TIMEOUT" tlsx "${tl2[@]}" 2>>"$raw/tlsx.err" | scope_filter "$domain" | sort -u > "$raw/tlsxlive.raw" || : > "$raw/tlsxlive.raw"
       comm -13 <(sort -u "$hosts") <(sort -u "$raw/tlsxlive.raw") > "$raw/tlsxlive.new" 2>/dev/null || : > "$raw/tlsxlive.new"
@@ -3304,7 +3436,7 @@ process_one() {
     local _hxout="$WORKDIR/parts/httpx.$safe.jsonl"; : > "$_hxout"
     local _enrkeys="$raw/enrich_keys.txt" _enrhit="$raw/enrich_hit.jsonl" _enrmiss="$raw/enrich_miss.txt"
     cut -f1 "$mapurls" | head -n "$capped" > "$_enrkeys"
-    cache_split httpx_json_v3 "$_enrkeys" "$_enrhit" "$_enrmiss"   # reuse cached per-URL JSON
+    cache_split httpx_json_v4 "$_enrkeys" "$_enrhit" "$_enrmiss"   # reuse cached per-URL JSON
     cat "$_enrhit" >> "$_hxout" 2>/dev/null || true
     if [ -s "$_enrmiss" ]; then
       local _enrfresh="$raw/enrich_fresh.jsonl" _enrrc=0
@@ -3316,7 +3448,8 @@ process_one() {
       # HTTP columns (redirect target, security headers, cookies, HSTS, Alt-Svc, auth, body
       # SHA-256); no extra request. The cache key moved to httpx_json_v2 so records cached
       # before 1.19 (no headers) are fetched again instead of leaving those columns blank,
-      # and to httpx_json_v3 in 1.20 for the login-form matches (-er, see _hx_enrich).
+      # to httpx_json_v3 in 1.20 for the login-form matches (-er, see _hx_enrich), and to
+      # httpx_json_v4 in 1.21 for the WAF block-page markers.
       # -nfs (-no-fallback-scheme): probe each URL with ITS OWN scheme. Without it
       # httpx tries HTTPS first even for an http:// input, so http:// rows were
       # silently enriched with the HTTPS response (wrong status/title for plain-HTTP
@@ -3339,7 +3472,7 @@ process_one() {
       # cache each fresh record by its input URL. No negative entries: these URLs
       # belong to hosts the live probe just confirmed, so a missing record is a
       # failed request, not an absent page (see cache_store).
-      [ "$_enrrc" -eq 0 ] && cache_store httpx_json_v3 "$_enrmiss" "$_enrfresh" httpxjson noneg
+      [ "$_enrrc" -eq 0 ] && cache_store httpx_json_v4 "$_enrmiss" "$_enrfresh" httpxjson noneg
     fi
     # --extras: follow redirects past the targets the run did not probe (same host only); a
     # seed with no redirect in its records starts nothing
@@ -3419,6 +3552,17 @@ TUNING:
   -t, --threads N         Parallel seed domains            (default: $THREADS)
       --crawl-depth N     katana crawl depth               (default: $DEPTH)
       --rate N            Requests/sec where supported      (default: $RATE)
+      --user-agent UA     The User-Agent every tool sends to targets (default: $USER_AGENT):
+                          browser  a current Chrome: '$UA_BROWSER'
+                          outcrop  '$UA_OUTCROP'
+                          tool     each tool's own default (random or tool-named; WAFs block some)
+                          or the exact string to send
+      --header 'N: v'     An extra request header for every tool (repeatable; e.g. a token your
+                          WAF allowlists scanner traffic by). Host and User-Agent cannot be set.
+      --req-timeout N     Seconds per request, HTTP and TLS, for every tool  (default: $REQ_TIMEOUT)
+      --max-runtime S     Stop the run after S seconds, as SIGTERM would: every tool is stopped
+                          (SIGKILL after STOP_GRACE=$STOP_GRACE s), the work dir is kept for --resume,
+                          exit 124 (SIGTERM: 143, Ctrl-C: 130)
       --max-urls N        Max URLs validated per domain     (default: $MAX_URLS)
 
 MODES:
@@ -3690,6 +3834,10 @@ while [ $# -gt 0 ]; do
     -t|--threads)      THREADS="${2:?}"; shift 2;;
     --crawl-depth)     DEPTH="${2:?}"; shift 2;;
     --rate)            RATE="${2:?}"; shift 2;;
+    --user-agent)      USER_AGENT="${2:?}"; shift 2;;
+    --header)          REQ_HEADERS="${REQ_HEADERS:+$REQ_HEADERS$'\n'}${2:?}"; shift 2;;
+    --req-timeout)     REQ_TIMEOUT="${2:?}"; shift 2;;
+    --max-runtime)     MAX_RUNTIME="${2:?}"; shift 2;;
     --max-urls)        MAX_URLS="${2:?}"; shift 2;;
     --passive-only)    PASSIVE_ONLY=1; shift;;
     --no-validate)     NO_VALIDATE=1; shift;;
@@ -3788,6 +3936,13 @@ if [ -n "$LIMITS_FILE" ]; then
   fi
 fi
 
+# --- the request policy (--user-agent, --header, --req-timeout): built and checked once ---
+_policy_init; _policy_check
+case "$MAX_RUNTIME" in ''|*[!0-9]*) err "--max-runtime: a whole number of seconds (0 = no limit)"; exit 2;; esac
+case "$STOP_GRACE" in ''|*[!0-9]*) err "STOP_GRACE: a whole number of seconds"; exit 2;; esac
+case "$THROTTLE_MIN$THROTTLE_PCT" in *[!0-9]*|'') err "THROTTLE_MIN and THROTTLE_PCT: whole numbers"; exit 2;; esac
+# every process of this run inherits this tag, so a stop finds the ones that left the tree
+OUTCROP_RUN="$$.$(date +%s%N 2>/dev/null || date +%s)"; export OUTCROP_RUN
 # --- validate input --------------------------------------------------------
 if [ -z "$INPUT" ]; then err "Missing required --input FILE"; usage; exit 2; fi
 # run-recon never reads stdin, but several ProjectDiscovery tools do even when given
@@ -3809,7 +3964,7 @@ if [ -n "$SCOPE_FILE" ] || [ "$LIST_TARGETS" = "1" ]; then
   if ! have python3; then err "python3 is required"; exit 1; fi
   if [ -n "$SCOPE_FILE" ] && [ ! -f "$SCOPE_FILE" ]; then err "Scope file not found: $SCOPE_FILE"; exit 2; fi
   SCOPE_TMP="$(mktemp -d "${TMPDIR:-/tmp}/outcrop-scope.XXXXXX")" || { err "cannot create a temporary directory"; exit 1; }
-  trap '[ -n "${HEARTBEAT_PID:-}" ] && kill "$HEARTBEAT_PID" 2>/dev/null; [ -n "${SCOPE_TMP:-}" ] && rm -rf "$SCOPE_TMP"; true' EXIT
+  trap '[ -n "${HEARTBEAT_PID:-}" ] && kill "$HEARTBEAT_PID" 2>/dev/null; [ -n "${WATCHDOG_PID:-}" ] && { pkill -P "$WATCHDOG_PID" 2>/dev/null || true; kill "$WATCHDOG_PID" 2>/dev/null || true; }; [ -n "${SCOPE_TMP:-}" ] && rm -rf "$SCOPE_TMP"; true' EXIT
   _scrc=0
   python3 - "$INPUT" "${SCOPE_FILE:-}" "$SCOPE_TMP" "$DROP_OUT_OF_SCOPE" <<'PYSCOPE' || _scrc=$?
 import sys, os, re, json, hashlib, ipaddress
@@ -4466,30 +4621,97 @@ else
   RUN_ID="$(sed -n 's/^run_id=//p' "$WORKDIR/state" | head -n 1)"
   if [ -z "$RUN_ID" ]; then RUN_ID="$(_uuid4)"; printf 'run_id=%s\n' "$RUN_ID" >> "$WORKDIR/state"; fi
 fi
-# Ctrl-C / SIGTERM: stop every stage this run started, keep the work dir, say how to resume.
-# The whole tree is frozen first (a stopped process cannot start the next stage), listed
-# again (to catch a child forked meanwhile), then terminated and continued.
+# Ctrl-C / SIGTERM (or --max-runtime): stop every process this run started, keep the work dir,
+# say how to resume. The run's processes are frozen first (a stopped process cannot start the
+# next stage), listed again (to catch a child forked meanwhile), then sent SIGTERM and
+# continued. Outcrop exits only when they are gone: what still runs STOP_GRACE seconds later is
+# killed (SIGKILL), so no tool keeps sending to a target after the run has ended.
+# _run_procs: the PIDs of this run's processes. The tree below this shell, plus any process
+# whose environment carries this run's OUTCROP_RUN tag (a tool's child that daemonized and was
+# re-parented away from the tree). Zombies, this shell and the lister itself are left out.
 _tree(){ local _c; for _c in $(pgrep -P "$1" 2>/dev/null); do printf '%s\n' "$_c"; _tree "$_c"; done; }
+_run_procs(){
+  python3 -c '
+import os, sys
+me, tag = int(sys.argv[1]), sys.argv[2]
+want = ("OUTCROP_RUN=" + tag).encode() if tag else None
+kids, out, parent = {}, set(), {}
+for d in os.listdir("/proc"):
+    if not d.isdigit():
+        continue
+    p = int(d)
+    try:
+        st = open("/proc/%d/stat" % p, "rb").read()
+        f = st[st.rindex(b")") + 2:].split()
+        parent[p] = int(f[1])
+        if f[0] == b"Z":
+            continue
+        kids.setdefault(int(f[1]), []).append(p)
+        if want and want in open("/proc/%d/environ" % p, "rb").read().split(b"\0"):
+            out.add(p)
+    except (OSError, ValueError, IndexError):
+        continue
+todo = [me]
+while todo:
+    for c in kids.get(todo.pop(), []):
+        if c not in out:
+            out.add(c)
+        todo.append(c)
+skip, p = {me}, os.getpid()
+while p and p not in skip:     # the lister and the shells between it and the run
+    skip.add(p); p = parent.get(p, 0)
+print(" ".join(str(p) for p in sorted(out - skip)))' "$$" "${OUTCROP_RUN:-}" 2>/dev/null \
+    || { have pgrep && _tree $$ | tr '\n' ' '; }
+}
+_ms(){ local t; t="$(date +%s%N 2>/dev/null)"; case "$t" in *N|'') printf '%s000' "$(date +%s)";; *) printf '%s' "${t%??????}";; esac; }
+_stop_run(){
+  local _p _n _end
+  _p="$(_run_procs)"; [ -n "${_p// /}" ] || return 0
+  # shellcheck disable=SC2086  # one PID per word
+  kill -STOP $_p 2>/dev/null || true; _p="$(_run_procs)"
+  # shellcheck disable=SC2086
+  { kill -STOP $_p; kill -TERM $_p; kill -CONT $_p; } 2>/dev/null || true
+  _end=$(( $(_ms) + ${STOP_GRACE:-10} * 1000 ))
+  while :; do
+    _p="$(_run_procs)"; [ -n "${_p// /}" ] || return 0
+    [ "$(_ms)" -lt "$_end" ] || break
+    sleep 0.2
+  done
+  # shellcheck disable=SC2086
+  _n="$(printf '%s\n' $_p | grep -c .)"
+  # shellcheck disable=SC2086
+  { kill -STOP $_p; } 2>/dev/null || true; _p="$(_run_procs)"
+  # shellcheck disable=SC2086
+  { kill -KILL $_p; } 2>/dev/null || true
+  _end=$(( $(_ms) + 5000 ))
+  while _p="$(_run_procs)"; [ -n "${_p// /}" ] && [ "$(_ms)" -lt "$_end" ]; do sleep 0.1; done
+  err "stopped: $_n process(es) were still running ${STOP_GRACE:-10}s after SIGTERM and were killed (SIGKILL)"
+}
 _on_interrupt(){
   trap - INT TERM
-  if have pgrep; then
-    local _p
-    _p="$(_tree $$)"
-    if [ -n "$_p" ]; then
-      # shellcheck disable=SC2086  # one PID per word
-      kill -STOP $_p 2>/dev/null || true; _p="$(_tree $$)"
-      # shellcheck disable=SC2086
-      { kill -STOP $_p; kill -TERM $_p; kill -CONT $_p; } 2>/dev/null || true
-    fi
-  fi
+  local _why=interrupted _rc="$1"
+  if [ -n "${DEADLINE_FLAG:-}" ] && [ -e "$DEADLINE_FLAG" ]; then _why=timed-out; _rc=124; fi
+  _stop_run
   [ -n "${HEARTBEAT_PID:-}" ] && { kill "$HEARTBEAT_PID" 2>/dev/null || true; HEARTBEAT_PID=""; }
-  sed -i 's/^status=.*/status=interrupted/' "$WORKDIR/state" 2>/dev/null || true
-  err "interrupted: $(find "$WORKDIR/done" -type f 2>/dev/null | wc -l | tr -d ' ') of ${NDOM:-?} seed(s) had finished. The work so far is kept in $WORKDIR;"
+  sed -i "s/^status=.*/status=$_why/" "$WORKDIR/state" 2>/dev/null || true
+  if [ "$_why" = timed-out ]; then
+    err "stopped: --max-runtime ${MAX_RUNTIME}s reached. $(find "$WORKDIR/done" -type f 2>/dev/null | wc -l | tr -d ' ') of ${NDOM:-?} seed(s) had finished. The work so far is kept in $WORKDIR;"
+  else
+    err "interrupted: $(find "$WORKDIR/done" -type f 2>/dev/null | wc -l | tr -d ' ') of ${NDOM:-?} seed(s) had finished. The work so far is kept in $WORKDIR;"
+  fi
   err "  run the same command again with --resume to continue from there."
-  exit "$1"
+  exit "$_rc"
 }
 trap '_on_interrupt 130' INT
 trap '_on_interrupt 143' TERM
+# --max-runtime: a watchdog stops the run as SIGTERM would when the time is up (status timed-out,
+# exit 124, the work dir kept for --resume; a resumed session gets the full time again)
+DEADLINE_FLAG=""; WATCHDOG_PID=""
+if [ "${MAX_RUNTIME:-0}" -gt 0 ] 2>/dev/null; then
+  DEADLINE_FLAG="$WORKDIR/.deadline"; rm -f "$DEADLINE_FLAG"
+  ( sleep "$MAX_RUNTIME"; : > "$DEADLINE_FLAG"; kill -TERM $$ 2>/dev/null ) &
+  WATCHDOG_PID=$!
+fi
 
 # --- detect ASN / CIDR seeds (expanded to hostnames after resolvers are set) --
 HAS_RANGES=0
@@ -4519,7 +4741,7 @@ if [ "$RESOLVE" = "1" ] || [ "$CERTS" = "1" ] || [ "$PERMUTE" = "1" ] \
     if [ "$REFRESH_RESOLVERS" = "1" ]; then
       if have dnsvalidator; then
         log "Refreshing resolvers with dnsvalidator (validates public resolvers; can take a few minutes)..."
-        if dnsvalidator -tL https://public-dns.info/nameservers.txt -threads 100 -o "$WORKDIR/resolvers.txt" 2>/dev/null \
+        if _fg dnsvalidator -tL https://public-dns.info/nameservers.txt -threads 100 -o "$WORKDIR/resolvers.txt" 2>/dev/null \
            && [ -s "$WORKDIR/resolvers.txt" ]; then
           ok "dnsvalidator: $(wc -l < "$WORKDIR/resolvers.txt" | tr -d ' ') validated resolvers."
         else
@@ -4590,9 +4812,9 @@ if [ "$HAS_RANGES" = "1" ]; then
         # asnmap prints its key prompt on stdout, so only CIDR lines are kept
         _amout="$WORKDIR/asnmap.out"; : > "$_amout"
         if have setsid; then
-          _to "$STAGE_TIMEOUT" setsid -w asnmap -a "$asn" -silent < /dev/null 2>>"$ASNMAP_ERR" > "$_amout" || true
+          _fg _to "$STAGE_TIMEOUT" setsid -w asnmap -a "$asn" -silent < /dev/null 2>>"$ASNMAP_ERR" > "$_amout" || true
         else
-          _to "$STAGE_TIMEOUT" asnmap -a "$asn" -silent < /dev/null 2>>"$ASNMAP_ERR" > "$_amout" || true
+          _fg _to "$STAGE_TIMEOUT" asnmap -a "$asn" -silent < /dev/null 2>>"$ASNMAP_ERR" > "$_amout" || true
         fi
         grep -E '^[0-9a-fA-F:.]+/[0-9]{1,3}$' "$_amout" >> "$CIDRS" || true
         if [ "$(wc -l < "$CIDRS")" -eq "$_n0" ]; then
@@ -4662,9 +4884,10 @@ PYSCR
   if [ -s "$CIDRS" ] && have tlsx; then
     # JSON keeps which address presented which name: the names seed the run, and the
     # (address, name) pairs become --origin candidates (an owned address serving the site)
-    tlsxr=(-l "$CIDRS" -p "$RANGE_TLS_PORTS" -san -cn -json -silent -timeout 10)
+    tlsxr=(-l "$CIDRS" -p "$RANGE_TLS_PORTS" -san -cn -json -silent -timeout "$REQ_TIMEOUT")
     { [ -n "$RESOLVERS" ] && [ -s "$RESOLVERS" ]; } && tlsxr+=(-r "$RESOLVERS")
-    tlsx "${tlsxr[@]}" < /dev/null 2>/dev/null | python3 -c '
+    _fg tlsx "${tlsxr[@]}" < /dev/null 2>/dev/null > "$WORKDIR/range_tlsx.jsonl" || true
+    python3 -c '
 import sys, json, re
 NAME = re.compile(r"^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$")
 names, pairs = set(), set()
@@ -4683,7 +4906,7 @@ for line in sys.stdin:
             if ip:
                 pairs.add((ip, n))
 open(sys.argv[1], "w").write("".join("%s\t%s\n" % p for p in sorted(pairs)))
-print("\n".join(sorted(names)))' "$RANGE_CERTS_FILE" | sort -u > "$EXPANDED" || : > "$EXPANDED"
+print("\n".join(sorted(names)))' "$RANGE_CERTS_FILE" < "$WORKDIR/range_tlsx.jsonl" | sort -u > "$EXPANDED" || : > "$EXPANDED"
   fi
   # --scope: a name found on a range certificate becomes a seed only if the scope allows it
   if [ "$SCOPE_ON" = 1 ] && [ -s "$EXPANDED" ]; then
@@ -4737,6 +4960,8 @@ log "--------------------------------------------------------------"
 log " Input domains : $NDOM"
 log " Scope         : $([ "$SCOPE_ON" = 1 ] && echo "$SCOPE_FILE: ${_scsum:-}" || echo 'none (--scope FILE holds the run to a list)')"
 log " Threads       : $THREADS"
+case "$USER_AGENT" in outcrop|browser) _uad="$USER_AGENT";; tool|"") _uad="each tool's own";; *) _uad="custom";; esac
+log " Requests      : User-Agent $_uad${POLICY_UA:+ ($POLICY_UA)}; extra headers ${#POL_HDRS[@]}; timeout ${REQ_TIMEOUT}s; rate $RATE/s per tool"
 log " Mode          : $([ "$PASSIVE_ONLY" = 1 ] && echo passive-only || { [ "$NO_VALIDATE" = 1 ] && echo 'crawl, no-validate' || echo 'passive + crawl + validate'; })"
 log " Subdomains    : $(onoff $DO_SUBS)    Deep(waymore): $(onoff $DEEP)    Rounds: $ROUNDS"
 log " Discovery     : resolve=$(onoff $RESOLVE)  certs=$(onoff $CERTS)  permute=$(onoff $PERMUTE)  brute=$(onoff $BRUTE)  ports=$(onoff $PORTS)  favicon=$(onoff $FAVICON)$([ -n "$RESOLVERS" ] && echo "  (dedicated resolvers)" || echo "")"
@@ -4857,6 +5082,7 @@ fi
 # --- export config for workers, then run domains in parallel ---------------
 
 export WORKDIR PASSIVE_ONLY NO_VALIDATE DO_SUBS DEPTH RATE FILTER_STATIC MAX_URLS DEEP STATIC_EXT
+export USER_AGENT REQ_HEADERS REQ_TIMEOUT STOP_GRACE
 export FUZZ WORDLIST FUZZ_THREADS FUZZ_EXT SECLISTS HTTPX_BIN
 export RESOLVE CERTS PERMUTE PERMUTE_MAX RESOLVERS
 export BRUTE BRUTE_WORDLIST BRUTE_MAX PORTS PORT_SPEC CRAWLERS_ALL JS TAKEOVER SCREENSHOTS ORIGIN FAVICON
@@ -4918,7 +5144,7 @@ if [ "$ZONE_EXPOSURE" = "1" ]; then
     mkdir -p "$WORKDIR/parts"
     ZONE_RES=""; [ -n "$RESOLVERS" ] && [ -s "$RESOLVERS" ] && ZONE_RES="$(grep -vE '^\s*(#|$)' "$RESOLVERS" | head -n 1 | sed -E 's/:[0-9]+$//')"
     log "DNS zone exposure: checking the zones of $(grep -c . "$DOMAINS_FILE") seed(s)${ZONE_RES:+ (resolver $ZONE_RES)}"
-    python3 - "$DOMAINS_FILE" "$WORKDIR/parts/zone.all.txt" "$WORKDIR/zone_names.txt" "$ZONE_RES" "$ZONE_WALK_MAX" <<'PYZONE' 2>>"$WORKDIR/zone.err" || warn "zone exposure check failed (see $WORKDIR/zone.err)"
+    _fg python3 - "$DOMAINS_FILE" "$WORKDIR/parts/zone.all.txt" "$WORKDIR/zone_names.txt" "$ZONE_RES" "$ZONE_WALK_MAX" <<'PYZONE' 2>>"$WORKDIR/zone.err" || warn "zone exposure check failed (see $WORKDIR/zone.err)"
 import subprocess, sys, re
 seeds_f, out_f, names_f, resolver, walk_max = sys.argv[1:6]
 walk_max = int(walk_max or 5000)
@@ -5041,7 +5267,7 @@ if [ "$DNS_POSTURE" = "1" ]; then
   mkdir -p "$WORKDIR/parts"
   POSTURE_RES=""; [ -n "$RESOLVERS" ] && [ -s "$RESOLVERS" ] && POSTURE_RES="$(grep -vE '^\s*(#|$)' "$RESOLVERS" | head -n 1 | sed -E 's/:[0-9]+$//')"
   log "Email/DNS posture: $(grep -c . "$DOMAINS_FILE") seed(s) and their zones${POSTURE_RES:+ (resolver $POSTURE_RES)}"
-  python3 - "$DOMAINS_FILE" "$WORKDIR/parts/dnsposture.all.txt" "$WORKDIR/dnsposture.tsv" "$POSTURE_RES" "$MTA_STS_CA" "$PASSIVE_ONLY" \
+  POLICY_UA="$POLICY_UA" _fg python3 - "$DOMAINS_FILE" "$WORKDIR/parts/dnsposture.all.txt" "$WORKDIR/dnsposture.tsv" "$POSTURE_RES" "$MTA_STS_CA" "$PASSIVE_ONLY" \
       "$([ "$SCOPE_ON" = 1 ] && printf '%s' "$SCOPE_DIR")" <<'PYPOSTURE' 2>>"$WORKDIR/dnsposture.err" || warn "email/DNS posture check failed (see $WORKDIR/dnsposture.err)"
 import subprocess, sys, re, os
 from concurrent.futures import ThreadPoolExecutor
@@ -5170,7 +5396,14 @@ def mta_sts_policy(name):
     """fetch https://mta-sts.<name>/.well-known/mta-sts.txt with certificate verification (RFC
     8461 requires a valid certificate; MTA_STS_CA adds a CA, e.g. a lab's) and no redirects"""
     host = "mta-sts." + name
-    args = ["curl", "-sS", "--max-time", "10", "-o", "-", "-w", "\n%{http_code}", "--proto", "=https"]
+    args = ["curl", "-sS", "--max-time", os.environ.get("REQ_TIMEOUT") or "10", "-o", "-", "-w", "\n%{http_code}"]
+    # the request policy: User-Agent and extra headers, as every other request of the run
+    if os.environ.get("POLICY_UA"):
+        args += ["-A", os.environ["POLICY_UA"]]
+    for h in (os.environ.get("REQ_HEADERS") or "").splitlines():
+        if h.strip():
+            args += ["-H", h]
+    args += ["--proto", "=https"]
     if cafile:
         args += ["--cacert", cafile]
     st, ans, _ = dig(host, "A")
@@ -5403,7 +5636,7 @@ fi
 if [ "$TLD_VARIANTS" = "1" ]; then
   mkdir -p "$WORKDIR/parts"
   log "TLD variants: tldfinder on the seeds' names (public DNS; listed, never scanned)"
-  python3 - "$DOMAINS_FILE" "$WORKDIR/parts/tld-variants.all.txt" "${RESOLVERS:-}" "$PROXY" "$SCAN_TIMEOUT" <<'PYTLD' 2>>"$WORKDIR/tld.err" || warn "TLD variant listing failed (see $WORKDIR/tld.err)"
+  _fg python3 - "$DOMAINS_FILE" "$WORKDIR/parts/tld-variants.all.txt" "${RESOLVERS:-}" "$PROXY" "$SCAN_TIMEOUT" <<'PYTLD' 2>>"$WORKDIR/tld.err" || warn "TLD variant listing failed (see $WORKDIR/tld.err)"
 import subprocess, sys, re
 seeds_f, out_f, resolvers, proxy, tmo = sys.argv[1:6]
 res = []
@@ -5496,7 +5729,7 @@ if [ "${PROGRESS:-1}" = "1" ] && [ "${HEARTBEAT:-0}" -gt 0 ] 2>/dev/null; then
 fi
 # make sure the ticker never outlives the run (WORKDIR cleanup stays with the
 # keep-work-aware logic at the end of the script)
-trap '[ -n "${HEARTBEAT_PID:-}" ] && kill "$HEARTBEAT_PID" 2>/dev/null; [ -n "${SCOPE_TMP:-}" ] && rm -rf "$SCOPE_TMP"; true' EXIT
+trap '[ -n "${HEARTBEAT_PID:-}" ] && kill "$HEARTBEAT_PID" 2>/dev/null; [ -n "${WATCHDOG_PID:-}" ] && { pkill -P "$WATCHDOG_PID" 2>/dev/null || true; kill "$WATCHDOG_PID" 2>/dev/null || true; }; [ -n "${SCOPE_TMP:-}" ] && rm -rf "$SCOPE_TMP"; true' EXIT
 
 # xargs runs the per-domain worker N at a time. Invoke via 'bash' explicitly so
 # this does not depend on the script's execute bit (survives Windows round-trips).
@@ -5533,7 +5766,7 @@ cat "$WORKDIR"/parts/tlsx.*.jsonl  2>/dev/null > "$WORKDIR/tlsx.jsonl"  || : > "
 # added to or removed from the trust store between runs.
 if [ "$TLS_POSTURE" = "1" ] && [ "$TLS_CHAIN_CHECK" = "1" ] && [ -s "$WORKDIR/tlsx.jsonl" ]; then
   log "TLS: validating certificate chains against the system trust store ($(grep -c . "$WORKDIR/tlsx.jsonl") record(s))"
-  tls_chain_check "$WORKDIR/tlsx.jsonl"
+  _fg tls_chain_check "$WORKDIR/tlsx.jsonl"
 fi
 cat "$WORKDIR"/parts/aaaa.*.txt    2>/dev/null > "$WORKDIR/aaaa.tsv"    || : > "$WORKDIR/aaaa.tsv"
 # redirect hops (--extras) and the TLS version matrix (--tls-enum), joined by the aggregator
@@ -6758,6 +6991,186 @@ if [ "$USE_DB" = "1" ] && [ "$ENRICH" = "1" ] && [ -s "$RDAP_CACHE_FILE" ]; then
   db_bulk_cache rdap_ip "$RDAP_CACHE_FILE" || true
 fi
 
+# --- run health: WAF block pages and throttling, per host (no extra request) ------------------
+# Read from what the run already has: the enrichment records (status, headers, title, and the
+# block-page markers httpx -er matched in the same response), the requests httpx could not
+# complete (-probe: resets, timeouts, TLS name errors, refusals), and the crawl's and nuclei's
+# error logs (-elog). A host whose answers were a WAF vendor's block page gets a waf_blocked
+# warning naming the vendor; a host with THROTTLE_MIN or more 429s, resets, timeouts and TLS
+# name errors, at least THROTTLE_PCT % of its requests, gets a throttled warning. Both say its
+# results are incomplete. <out>.health.tsv lists every host with a signal; the warnings carry
+# the same counts in warnings.jsonl (kind, host, fields, counts).
+HEALTH_HOSTS=0
+if [ "$PASSIVE_ONLY" != "1" ]; then
+  _hl="$(python3 - "$WORKDIR" "$DOMAINS_FILE" "$OUTPUT.health.tsv" "$WORKDIR/warnings.kind.jsonl" "$THROTTLE_MIN" "$THROTTLE_PCT" \
+          2>>"$WORKDIR/health.err" <<'PYHEALTH'
+# RUN-HEALTH
+import sys, os, re, json, glob
+from urllib.parse import urlsplit
+wd, domf, tsv, kindf, tmin, tpct = sys.argv[1:7]
+tmin, tpct = int(tmin or 5), int(tpct or 10)
+seeds = {}
+for l in open(domf, encoding="utf-8", errors="replace"):
+    d = l.strip()
+    if d:
+        seeds[re.sub(r"[^A-Za-z0-9.-]", "_", d)] = d
+def host_of(u):
+    try:
+        return (urlsplit(u).hostname or "").lower()
+    except ValueError:
+        return ""
+def hdrs(j):
+    h = j.get("header") if isinstance(j.get("header"), dict) else {}
+    return {str(k).lower().replace("-", "_"): (", ".join(map(str, v)) if isinstance(v, list) else str(v)) for k, v in h.items()}
+def marks(j):
+    ex = j.get("extracts")
+    return " ".join(str(x) for v in (ex.values() if isinstance(ex, dict) else []) if isinstance(v, list) for x in v).lower()
+def vendor(st, h, title, m):
+    srv, ck, t = h.get("server", "").lower(), h.get("set_cookie", "").lower(), title.lower().strip()
+    if (srv == "cloudflare" or "cf_ray" in h) and st in (403, 429, 503) and (
+            t in ("attention required! | cloudflare", "just a moment...") or t.startswith("access denied |")
+            or "cf-error-details" in m or re.search(r"error code: 10\d\d", m) or "cf_mitigated" in h):
+        return "cloudflare"
+    if "akamaighost" in srv and st in (400, 403) and (t == "access denied" or "reference&#32;&#35;" in m or "errors.edgesuite.net" in m):
+        return "akamai"
+    if ("x_iinfo" in h or re.search(r"incapsula|imperva", h.get("x_cdn", "").lower()) or "incap_ses_" in ck or "visid_incap_" in ck) \
+            and ("incapsula incident id" in m or "_incapsula_resource" in m):
+        return "imperva"
+    if ("cloudfront" in srv or "x_amz_cf_id" in h) and st == 403 and ("request blocked." in m or "generated by cloudfront" in m):
+        return "aws-waf (cloudfront)"
+    if srv.startswith("awselb") and st == 403:
+        return "aws-waf (alb)"
+    if "the requested url was rejected" in m or (t == "request rejected" and st in (200, 403)):
+        return "f5-asm"
+    if ("sucuri" in srv or "x_sucuri_id" in h or "x_sucuri_block" in h) and st in (403, 503):
+        return "sucuri"
+    if "sucuri website firewall" in m and st in (403, 503):
+        return "sucuri"
+    if re.search(r"mod_?security", m) and st in (403, 406, 500, 501):
+        return "modsecurity"
+    if ("generated by wordfence" in m or "limited by the site owner" in m) and st in (403, 503):
+        return "wordfence"
+    if ("fortiweb" in m or "web page blocked" in m or "fortiwafsid" in ck) and st in (200, 403, 500):
+        return "fortiweb"
+    if ("barra_counter_session" in m or "barra_counter_session" in ck or "bni__barracuda_lb_cookie" in ck) and st in (403, 503):
+        return "barracuda"
+    if (("x_azure_ref" in h and "the request is blocked." in m) or srv.startswith("microsoft-azure-application-gateway")) and st == 403:
+        return "azure-waf"
+    if "ddos-guard" in srv and st in (403, 429):
+        return "ddos-guard"
+    return ""
+def err_class(e):
+    e = str(e or "").lower()
+    if "unrecognized name" in e:
+        return "tls_name_errors"
+    if re.search(r"deadline exceeded|timeout|timed out", e):
+        return "timeouts"
+    if re.search(r"reset by peer|connection reset|eof|broken pipe|connection closed|server closed", e):
+        return "resets"
+    if "refused" in e:
+        return "refused"
+    return "other_errors"
+H = {}
+def hrec(seed, host):
+    k = (seed, host)
+    if k not in H:
+        H[k] = {"requests": 0, "blocked": 0, "http_429": 0, "timeouts": 0, "resets": 0, "tls_name_errors": 0,
+                "refused": 0, "other_errors": 0, "crawl_errors": 0, "nuclei_errors": 0, "vendors": {}, "statuses": set()}
+    return H[k]
+def jl(p):
+    try:
+        with open(p, encoding="utf-8", errors="replace") as f:
+            for l in f:
+                try:
+                    j = json.loads(l)
+                except ValueError:
+                    continue
+                if isinstance(j, dict):
+                    yield j
+    except OSError:
+        return
+for p in glob.glob(os.path.join(wd, "parts", "httpx.*.jsonl")):
+    safe = os.path.basename(p)[len("httpx."):-len(".jsonl")]
+    seed = seeds.get(safe, safe)
+    for j in jl(p):
+        u = str(j.get("url") or j.get("input") or "")
+        h = host_of(u)
+        if not h:
+            continue
+        r = hrec(seed, h); r["requests"] += 1
+        try:
+            st = int(j.get("status_code") or 0)
+        except (TypeError, ValueError):
+            st = 0
+        if st == 429:
+            r["http_429"] += 1
+        v = vendor(st, hdrs(j), str(j.get("title") or ""), marks(j))
+        if v:
+            r["blocked"] += 1; r["vendors"][v] = r["vendors"].get(v, 0) + 1; r["statuses"].add(st)
+for d in glob.glob(os.path.join(wd, "raw", "*")):
+    seed = seeds.get(os.path.basename(d), os.path.basename(d))
+    for j in jl(os.path.join(d, "hx_failed.jsonl")):
+        h = host_of(str(j.get("url") or j.get("input") or ""))
+        if h:
+            r = hrec(seed, h); r["requests"] += 1; r[err_class(j.get("error"))] += 1
+    for src, files in (("crawl_errors", [os.path.join(d, "katana_elog.jsonl")]),
+                       ("nuclei_errors", glob.glob(os.path.join(d, "nuclei_elog.*.jsonl")))):
+        for p in files:
+            for j in jl(p):
+                h = host_of(str(j.get("endpoint") or j.get("input") or ""))
+                if not h:
+                    continue
+                r = hrec(seed, h); r[src] += 1
+                c = err_class(j.get("error"))
+                if c in ("timeouts", "resets", "tls_name_errors"):
+                    r[c] += 1
+rows, kinds, msgs = [], [], []
+for (seed, h), r in sorted(H.items()):
+    sig = r["http_429"] + r["timeouts"] + r["resets"] + r["tls_name_errors"]
+    att = r["requests"] + r["crawl_errors"] + r["nuclei_errors"]
+    if not r["blocked"] and not sig:
+        continue
+    kind = []
+    counts = {k: r[k] for k in ("requests", "blocked", "http_429", "timeouts", "resets", "tls_name_errors", "refused",
+                                "crawl_errors", "nuclei_errors")}
+    vend = max(r["vendors"], key=r["vendors"].get) if r["vendors"] else ""
+    sts = ",".join(str(x) for x in sorted(r["statuses"]))
+    if r["blocked"]:
+        kind.append("waf_blocked")
+        m = "waf_blocked: %s (seed %s): %d of %d URL(s) got %s's block page (status %s); its results are incomplete" % (
+            h, seed, r["blocked"], r["requests"], vend, sts)
+        msgs.append(m)
+        kinds.append({"message": m, "kind": "waf_blocked", "seed": seed, "host": h,
+                      "fields": {"vendor": vend, "statuses": sts}, "counts": counts})
+    if sig >= tmin and sig * 100 >= tpct * max(att, 1):
+        kind.append("throttled")
+        m = ("throttled: %s (seed %s): %d of %d request(s) were refused or slowed (429: %d, timeouts: %d, resets: %d, "
+             "TLS name errors: %d); its results may be incomplete") % (
+            h, seed, sig, att, r["http_429"], r["timeouts"], r["resets"], r["tls_name_errors"])
+        msgs.append(m)
+        kinds.append({"message": m, "kind": "throttled", "seed": seed, "host": h, "fields": {}, "counts": counts})
+    rows.append([seed, h, "+".join(kind) or "-", vend or "-"] + [str(counts[k]) for k in counts])
+if rows:
+    with open(tsv, "w", encoding="utf-8") as f:
+        f.write("seed\thost\tkind\tvendor\trequests\tblocked\thttp_429\ttimeouts\tresets\ttls_name_errors\trefused\tcrawl_errors\tnuclei_errors\n")
+        for r in rows:
+            f.write("\t".join(r) + "\n")
+elif os.path.exists(tsv):
+    os.remove(tsv)
+with open(kindf, "w", encoding="utf-8") as f:
+    for k in kinds:
+        f.write(json.dumps(k, separators=(",", ":")) + "\n")
+print("HOSTS %d" % len(rows))
+for m in msgs:
+    print(m)
+PYHEALTH
+)" || _hl=""
+  while IFS= read -r _l; do
+    case "$_l" in "HOSTS "*) HEALTH_HOSTS="${_l#HOSTS }";; ?*) warn "$_l";; esac
+  done <<< "$_hl"
+  [ -s "$OUTPUT.health.tsv" ] && ok " run health      : $OUTPUT.health.tsv ($HEALTH_HOSTS host(s) blocked by a WAF or throttled, or with errors)"
+fi
+
 # --- summary ---------------------------------------------------------------
 RES_ROWS="$(grep -c '^' "$OUTPUT" 2>/dev/null || true)"; RES_ROWS="${RES_ROWS:-1}"
 RES_ROWS=$((RES_ROWS>0 ? RES_ROWS-1 : 0))   # minus header
@@ -6940,7 +7353,7 @@ fi
 # --- cloud inventory diff (cloudlist): your accounts vs what the scan found ----------
 if [ "$CLOUDLIST" = "1" ]; then
   log "cloudlist: listing the assets of the accounts in $CLOUDLIST_CONFIG"
-  _to "$SCAN_TIMEOUT" cloudlist -pc "$CLOUDLIST_CONFIG" -json -silent -duc < /dev/null > "$WORKDIR/cloudlist.jsonl" 2>>"$WORKDIR/cloudlist.err" || true
+  _fg _to "$SCAN_TIMEOUT" cloudlist -pc "$CLOUDLIST_CONFIG" -json -silent -duc < /dev/null > "$WORKDIR/cloudlist.jsonl" 2>>"$WORKDIR/cloudlist.err" || true
   if [ ! -s "$WORKDIR/cloudlist.jsonl" ]; then
     warn " cloudlist listed no assets (check the provider config and credentials; see $WORKDIR/cloudlist.err)."
   else
@@ -7149,7 +7562,8 @@ RR_VERSION="$VERSION" RR_STARTED="$RUN_STARTED" RR_DURATION="$(( RUN_T1 - RUN_T0
 RR_NDOM="${NDOM:-0}" RR_TOOLVERS="${_tvline:-}" RR_LABVER="${LAB_VERIFIED:-}" RR_RESOLVERS="$RESOLVERS" \
 RR_RESOLVERS_N="$RUN_RESOLVERS_N" RR_DNS_CHECK="$RUN_DNS_CHECK" RR_PROXY="$PROXY" RR_SS_CHROME="$SS_CHROME" \
 RR_SS_PROXY="$SS_PROXY_SERVER" RR_SS_BYPASS="$SS_PROXY_BYPASS" RR_ROWS="$RES_ROWS" RR_EXIT="$RUN_EXIT" \
-RR_RUN_ID="$RUN_ID" RR_ENGAGEMENT="$ENGAGEMENT" RR_JOB_ID="$JOB_ID" \
+RR_RUN_ID="$RUN_ID" RR_ENGAGEMENT="$ENGAGEMENT" RR_JOB_ID="$JOB_ID" RR_POLICY_UA="$POLICY_UA" RR_UA_MODE="$USER_AGENT" \
+RR_RATE="$RATE" \
 python3 - "$OUTPUT" "$WORKDIR" <<'PYRUN' 2>/dev/null || warn " could not write $OUTPUT.run.json"
 import sys, json, os, re
 out, wd = sys.argv[1:3]
@@ -7160,6 +7574,8 @@ def num(v):
     return int(v) if (v or "").isdigit() else None
 raw = open(os.path.join(wd, "run_args.bin"), "rb").read().decode("utf-8", "replace")
 args = [red(a) for a in raw.split("\0")[:-1]] if raw else []
+# --header values can be secrets (a token a WAF allowlists scanners by): only the name is kept
+args = [(a.split(":", 1)[0] + ": ***") if i and args[i - 1] == "--header" else a for i, a in enumerate(args)]
 seeds = []
 for line in open(os.path.join(wd, "seedstat.tsv"), encoding="utf-8", errors="replace"):
     f = line.rstrip("\n").split("\t")
@@ -7199,6 +7615,13 @@ rec = {
     "tool_versions": tv, "lab_verified": E("RR_LABVER", ""),
     "resolvers": {"file": E("RR_RESOLVERS", ""), "count": num(E("RR_RESOLVERS_N")) or 0, "check": E("RR_DNS_CHECK", "")},
     "proxy": red(E("RR_PROXY")),
+    # the request policy every tool sent with (header values left out: they can be secrets)
+    "request_policy": {
+        "user_agent": E("RR_POLICY_UA") or None,
+        "user_agent_mode": (E("RR_UA_MODE") if E("RR_UA_MODE") in ("outcrop", "browser", "tool") else "custom"),
+        "headers": [h.split(":", 1)[0].strip() for h in (E("REQ_HEADERS") or "").splitlines() if h.strip()],
+        "timeout_s": num(E("REQ_TIMEOUT")), "rate": num(E("RR_RATE")),
+    },
     "screenshot_browser": {"system_chrome": E("RR_SS_CHROME") == "1", "proxy_server": red(E("RR_SS_PROXY")),
                            "bypass_list": bool(E("RR_SS_BYPASS"))},
     "url_rows": num(E("RR_ROWS")) or 0, "artifacts": arts,
@@ -7330,7 +7753,18 @@ if os.path.isfile(wf):
         l = ANSI.sub("", l).strip()
         if l and l not in warns:
             warns.append(l)
-write("warnings", [{"message": w} for w in warns])
+# a warning the run-health check made carries its kind, host and counts (run-recon.warning/1, x-minor 1)
+kinded = {}
+kf = os.path.join(wd, "warnings.kind.jsonl")
+if os.path.isfile(kf):
+    for l in open(kf, encoding="utf-8", errors="replace"):
+        try:
+            o = json.loads(l)
+        except ValueError:
+            continue
+        if isinstance(o, dict) and o.get("message"):
+            kinded.setdefault(o["message"], o)
+write("warnings", [kinded.get(w) or {"message": w} for w in warns])
 def num(v):
     return int(v) if (v or "").isdigit() else None
 seeds = []
@@ -7407,6 +7841,8 @@ fi
 # of them; its state goes to <out>.ship-state.json. A failure leaves the run complete
 # locally (exit 4); `ship-recon.sh ship <csv>` retries and sends only what is missing.
 if [ -n "$SHIP_URL" ]; then
+  # --max-runtime bounds the scan, not the delivery: the scan is over, so its watchdog goes
+  if [ -n "${WATCHDOG_PID:-}" ]; then { pkill -P "$WATCHDOG_PID" || true; kill "$WATCHDOG_PID" || true; } 2>/dev/null; WATCHDOG_PID=""; fi
   _ship_int(){ trap - INT TERM; err "shipping interrupted: the run itself is complete. Send it later with: $SHIP_SH ship $OUTPUT"; exit "$1"; }
   trap '_ship_int 130' INT
   trap '_ship_int 143' TERM

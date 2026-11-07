@@ -2,13 +2,39 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:tideline:schema:run-recon.warning/1",
   "title": "run-recon warning",
-  "description": "One warning the run logged, in order, duplicates removed (run.json keeps the first 200).",
+  "description": "One warning the run logged, in order, duplicates removed (run.json keeps the first 200). Since x-minor 1 (Outcrop 1.21) a run-health warning also carries its kind, the host and seed it is about, and its counts.",
   "x-tideline-schema": "run-recon.warning/1",
-  "x-minor": 0,
+  "x-minor": 1,
   "type": "object",
   "properties": {
     "message": {
       "type": "string"
+    },
+    "kind": {
+      "description": "What the warning is about, for a warning the run-health check made: waf_blocked (the host answered with a WAF vendor's block page) or throttled (429s, resets, timeouts and TLS name errors over the run's threshold). Absent on other warnings. Later minors may add kinds.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,39}$"
+    },
+    "seed": {
+      "type": "string"
+    },
+    "host": {
+      "type": "string"
+    },
+    "fields": {
+      "description": "waf_blocked: vendor and statuses (comma-separated HTTP status codes of the block pages).",
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "counts": {
+      "description": "Per host: requests (the validation pass's attempts), blocked (block pages among them), http_429, timeouts, resets, tls_name_errors, refused, crawl_errors and nuclei_errors (lines in those tools' error logs).",
+      "type": "object",
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 0
+      }
     }
   },
   "required": [

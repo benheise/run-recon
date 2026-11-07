@@ -785,6 +785,36 @@ if os.path.isfile(_dp):
                        f'<td>{worst}{len(fs) if fs else "-"}</td></tr>')
         out.append('</tbody></table></div>')
 
+# Run health (Outcrop 1.21): hosts that answered with a WAF's block page, or were throttled.
+# Their rows are what the scan could see, not the whole host: a clean result there proves little.
+_hp = f"{csv_path}.health.tsv"
+if os.path.isfile(_hp):
+    try:
+        with open(_hp, newline="", encoding="utf-8", errors="replace") as fh:
+            hrows = list(csv.DictReader(fh, delimiter="\t"))
+    except Exception:
+        hrows = []
+    flagged = [r for r in hrows if (r.get("kind") or "-") != "-"]
+    if hrows:
+        out.append('<h3 style="font-size:15px;margin-top:22px">Run health</h3>')
+        if flagged:
+            out.append(f'<div class="note"><b>{len(flagged)} host(s) blocked the scan or slowed it down.</b> A WAF answered '
+                       'with its block page, or the host refused or delayed requests (429, resets, timeouts, TLS name '
+                       'errors): what the report shows for these hosts is incomplete, and a clean result there proves little.</div>')
+        out.append('<div class="tbl"><table><thead><tr><th>Host</th><th>Seed</th><th>Signal</th><th>WAF</th>'
+                   '<th>Requests</th><th>Block pages</th><th>429</th><th>Timeouts</th><th>Resets</th><th>TLS name</th>'
+                   '<th>Crawl / nuclei errors</th></tr></thead><tbody>')
+        _hk = {"waf_blocked": "blocked by a WAF", "throttled": "throttled", "waf_blocked+throttled": "blocked and throttled"}
+        for r in sorted(hrows, key=lambda r: ((r.get("kind") or "-") == "-", r.get("seed", ""), r.get("host", ""))):
+            k = r.get("kind") or "-"
+            out.append(f'<tr><td>{hlink((r.get("host") or "").lower())}</td><td>{esc(r.get("seed") or "")}</td>'
+                       f'<td>{esc(_hk.get(k, "errors below the threshold"))}</td><td>{esc(r.get("vendor") if r.get("vendor") != "-" else "")}</td>'
+                       f'<td>{esc(r.get("requests") or "0")}</td><td>{esc(r.get("blocked") or "0")}</td>'
+                       f'<td>{esc(r.get("http_429") or "0")}</td><td>{esc(r.get("timeouts") or "0")}</td>'
+                       f'<td>{esc(r.get("resets") or "0")}</td><td>{esc(r.get("tls_name_errors") or "0")}</td>'
+                       f'<td>{esc(r.get("crawl_errors") or "0")} / {esc(r.get("nuclei_errors") or "0")}</td></tr>')
+        out.append('</tbody></table></div>')
+
 # ---- Findings table (highlighted first: vulns/weaknesses/misconfigs) -------
 out.append('<h2 id="findings">Findings</h2>')
 hi = [f for f in findings if f["kind"] in highlight_kinds]
@@ -1022,7 +1052,8 @@ for kind in ["nuclei", "activescan", "takeover", "secrets", "buckets", "zone", "
     if os.path.isfile(p):
         arts.append(f'<a href="{esc(rel_out(p))}">{esc(kind)}</a>')
 for suf, lab in ((".edge.tsv", "edge/origin"), (".cname.tsv", "CNAMEs"), (".zone-names.txt", "zone names"),
-                 (".screenshots.tsv", "screenshot list"), (".delta.tsv", "changes"), (".run.json", "run record")):
+                 (".screenshots.tsv", "screenshot list"), (".delta.tsv", "changes"), (".health.tsv", "run health"),
+                 (".run.json", "run record")):
     if os.path.isfile(csv_path + suf):
         arts.append(f'<a href="{esc(rel_out(csv_path + suf))}">{esc(lab)}</a>')
 arts.append(f'<a href="{esc(rel_out(csv_path))}">CSV</a>')
