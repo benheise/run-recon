@@ -978,8 +978,12 @@ db_vulns() {
   [ -n "$kev" ]  && [ ! -f "$kev" ]  && { echo "[!] vulns: --kev-file not found: $kev" >&2; return 2; }
   [ -n "$epss" ] && [ ! -f "$epss" ] && { echo "[!] vulns: --epss-file not found: $epss" >&2; return 2; }
   [ -n "$out" ] || out="${csv%.csv}.vulns.csv"
+  # CPE alias groups (1.20): one product filed under several NVD names; next to this script
+  # (CPE_ALIASES_FILE overrides, empty turns it off)
+  local _self; _self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+  local aliases="${CPE_ALIASES_FILE-$(dirname "$_self")/cpe-aliases.json}"
   # -I: isolated mode -- the feeds are files you downloaded; don't let cwd/env inject code.
-  python3 -I - "$csv" "$nvd" "$kev" "$epss" "$out" <<'PYVULN'
+  python3 -I - "$csv" "$nvd" "$kev" "$epss" "$out" "$aliases" <<'PYVULN'
 import sys, os, csv, json, gzip, re, hashlib, datetime
 from urllib.parse import urlparse
 
@@ -1108,6 +1112,38 @@ with open(csv_path, newline="", encoding="utf-8", errors="replace") as f:
                 sv = (sv + update)
             rows_by_prod.setdefault((vendor, product), []).append((idx, sv, c))
 
+# --- CPE aliases (1.20): NVD files one product under several names (Atlassian's Jira as
+# jira, jira_server, jira_data_center...; Varnish Cache under three vendors). A CVE filed under
+# any name in a group (cpe-aliases.json: WebInventory's curated groups) joins the services
+# carrying another; a name the inventory carries itself keeps its own rows only.
+alias_path = sys.argv[6] if len(sys.argv) > 6 else ""
+alias_meta = {"file": "", "sha256": "", "version": "", "groups": 0, "names_added": 0}
+if alias_path and os.path.isfile(alias_path):
+    try:
+        with open(alias_path, encoding="utf-8") as f:
+            aj = json.load(f)
+        alias_meta.update(file=os.path.basename(alias_path), sha256=_sha256(alias_path),
+                          version=str(aj.get("version") or ""), groups=len(aj.get("aliases") or []))
+        own = set(rows_by_prod.keys())
+        added = {}
+        for g in aj.get("aliases") or []:
+            members = []
+            for x in (g if isinstance(g, list) else []):
+                p = str(x).lower().split(":")
+                if len(p) == 3 and p[1] and p[2]:
+                    members.append((p[1], p[2]))
+            have = [vp for vp in members if vp in own]
+            for other in members:
+                if other in own:
+                    continue
+                for vp in have:
+                    for ent in rows_by_prod[vp]:
+                        if ent not in added.setdefault(other, []):
+                            added[other].append(ent)
+        rows_by_prod.update(added)
+        alias_meta["names_added"] = len(added)
+    except Exception as e:
+        sys.stderr.write("[!] CPE alias file load failed (%s): %s\n" % (alias_path, e))
 inv_products = set(rows_by_prod.keys())
 
 # --- KEV --------------------------------------------------------------------
@@ -1356,6 +1392,7 @@ prov = {
     "nvd_feeds": nvd_meta,
     "kev": kev_meta,
     "epss": epss_meta,
+    "cpe_aliases": alias_meta,
     "services_with_cpes": len(rows),
     "vuln_rows": len(out_rows),
 }

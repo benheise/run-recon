@@ -15,12 +15,16 @@ control; never point the scanner anywhere else.
 
 | file | what it is |
 |---|---|
-| `docker-compose.yml` | the range: `dns` (CoreDNS), `bind` (BIND 9.18, for the NSEC3 zone), `ingress` (Caddy TLS vhost router), `nginx`, `wordpress` + `db`, `spa`, `jenkins` — all pinned. `nginx` is also published directly on `LAB_ORIGIN_IP:80` (default `127.0.0.5`): the "forgotten origin" fixture. The ingress also answers `403` to everything on `LAB_PROTECTED_IP:80` (default `127.0.0.6`): the "protected origin". BIND answers as `ns.nsec3.test` on `LAB_NSEC3_IP:53` (default `127.0.0.7`) |
+| `docker-compose.yml` | the range: `dns` (CoreDNS), `bind` (BIND 9.18, for the NSEC3 zone), `ingress` (Caddy TLS vhost router), `nginx`, `wordpress` + `db`, `spa`, `jenkins` — all pinned. `nginx` is also published directly on `LAB_ORIGIN_IP:80` (default `127.0.0.5`): the "forgotten origin" fixture. The ingress also answers `403` to everything on `LAB_PROTECTED_IP:80` (default `127.0.0.6`): the "protected origin". BIND answers as `ns.nsec3.test` on `LAB_NSEC3_IP:53` (default `127.0.0.7`). `tlslab` (nginx 1.21.6) serves the TLS fixtures, each on its own address: `LAB_TLS_LEGACY_IP` … `LAB_TLS_MODERN_IP` (default `127.0.0.9`–`127.0.0.12`) |
+| `tls-nginx.conf` | the TLS fixtures' nginx: one listener per fixture, its own protocols and ciphers (see "TLS fixtures" below) |
+| `gen-tls-certs.py` | makes the TLS fixtures' certificates at `up` (needs `openssl` and `python3-cryptography`) |
 | `Caddyfile` | vhost routing; serves every name on both `http://` and `https://` with certificates from Caddy's local CA, plus the HTTP-detail fixtures below |
 | `Corefile` | CoreDNS: authoritative for `test.`, `walk.test.` and `xfr.test.` from the generated zone files; forwards `nsec3.test.` to BIND |
 | `named.conf` | BIND: authoritative only, for `nsec3.test.`, transfers refused; shares the `dns` container's network and listens on `:5353` |
 | `resolvers.txt` | the lab DNS server, passed to run-recon as `--resolvers` (dnsx/tlsx/httpx use it) |
 | `targets.txt` | lab seeds: `nginx.test wp.test spa.test ci.test` |
+| `targets-http.txt`, `targets-tls.txt` | *generated*: the seeds of the `http` and `tls` checks |
+| `tls/` | *generated*: the TLS fixtures' certificates and throwaway keys (gitignored) |
 | `expected.csv` | ground truth for the lab seeds (status, technologies, CPEs, TLS flags, IPv6) |
 | *generated at `up`* | |
 | `spa/index.html` | the 120 KB single-bundle SPA (WebInventory's SPA size) |
@@ -69,21 +73,24 @@ sudo sh -c './bench-run-recon.sh hosts >> /etc/hosts'   # once: names for tools 
 ./bench-run-recon.sh takeover                                                  # CNAME fixtures, real dnsx/subzy
 ./bench-run-recon.sh zone                                                      # AXFR / NSEC fixtures, real dig
 ./bench-run-recon.sh origin                                                    # forgotten-origin fixture
-./bench-run-recon.sh http                                                      # headers, cookies, auth, robots/security.txt, favicon, PTR
+./bench-run-recon.sh http                                                      # headers, cookies, auth, robots/security.txt, favicon, PTR, redirects, login forms
+./bench-run-recon.sh tls                                                       # --tls-enum: version matrix, weak suites, weak/default/future certificates
 ./bench-run-recon.sh posture                                                   # SPF/DMARC/MTA-STS/CAA, dangling MX/NS, lame NS, cloudlist
 ./bench-run-recon.sh discovery                                                 # naabu, alterx, shuffledns, cdncheck, uncover, notify
 ./bench-run-recon.sh scope                                                     # --scope / --list-targets; proved at the origin's access log
 ./bench-run-recon.sh resume                                                    # SIGTERM mid-run, --resume, CSV equals an uninterrupted run
 RECON_DB_DSN=postgresql://... ./bench-run-recon.sh history                     # --monitor delta + recon-db history (store with RECON_DB_DSN)
-./bench-run-recon.sh checks                                                    # all nine; non-zero if any fails
+./bench-run-recon.sh checks                                                    # all ten; non-zero if any fails
 
 ./bench-run-recon.sh down                # tear down and remove volumes
 ```
 
 `up` needs **ldnsutils** (`sudo apt install ldnsutils`; the setup scripts install it) to sign
 `walk.test` and `nsec3.test`; without it the zones are served unsigned and `zone` skips the NSEC and
-NSEC3 cases. If `127.0.0.5`, `127.0.0.6` or `127.0.0.7` is taken, set `LAB_ORIGIN_IP`,
-`LAB_PROTECTED_IP` or `LAB_NSEC3_IP` to another loopback address for `up` and the checks.
+NSEC3 cases. It also needs **python3-cryptography** and `openssl` for the TLS fixtures' certificates
+(the setup scripts install it too). If `127.0.0.5`, `127.0.0.6`, `127.0.0.7` or `127.0.0.9`–`127.0.0.12` is taken,
+set `LAB_ORIGIN_IP`, `LAB_PROTECTED_IP`, `LAB_NSEC3_IP` or `LAB_TLS_LEGACY_IP` … `LAB_TLS_MODERN_IP` to
+another loopback address for `up` and the checks.
 
 First boot takes a minute or two (WordPress install, Jenkins start). `up`
 installs WordPress with a throwaway admin password that is generated, used once
@@ -238,6 +245,41 @@ the first run's under `compare --exact`, with the second run as the noise floor.
 
 The basic-auth password in the Caddyfile is a throwaway lab value. katana reads robots.txt too, so
 `/private/` and the sitemap URL also appear in default runs of the lab, for every version alike.
+
+## Redirect and login-form fixtures (run-recon 1.20)
+
+Part of `bench-run-recon.sh http` (`--extras`), from the Caddyfile:
+
+| URL | what the lab serves | run-recon must report |
+|---|---|---|
+| `https://redir.test/` | `302` → `/login`, a page with a password form whose `action` is `http://redir.test/session` | `final_url=https://redir.test/login`, `redirect_chain=302->https://redir.test/login` (`/login` is a hop `--extras` fetched, not a URL row), `login_form=http://redir.test/session`, `auth=Form`, `CleartextAuth` on the HTTPS row |
+| `http://redir.test/session` | found by the crawl in that form; `301` → `https://redir.test/session` (`200`) | the http:// → https:// hop followed |
+| `https://redir.test/old` | `301` → `https://elsewhere.test/` (no such site) | the hop listed in `redirect_chain`, not followed; `final_url` stays `https://redir.test/old` |
+| `http://plainlogin.redir.test/` | a password form on a plain-HTTP page | `login_form=http://plainlogin.redir.test/login`, `http_flags=PlainHttp;CleartextAuth` |
+
+## TLS fixtures (run-recon 1.20)
+
+`bench-run-recon.sh tls` runs `--tls-enum` against `targets-tls.txt`. One nginx 1.21.6 (OpenSSL 1.1.1n)
+serves four names, each on its own loopback address so each has its own protocol and cipher policy
+(`tls-nginx.conf`). The certificates are made at `up` by `gen-tls-certs.py`; the legacy one with the
+`openssl` command, since python3-cryptography refuses to sign with SHA-1.
+
+| name | what it serves | run-recon must report |
+|---|---|---|
+| `legacy.tls.test` | TLS 1.0–1.2; CBC-SHA suites, and `NULL-SHA` when a client offers only weak suites; RSA 1024 / SHA-1, self-signed | `tls_supported=TLS 1.2;TLS 1.1;TLS 1.0`, `tls_weak_cipher=TLS 1.2:TLS_RSA_WITH_NULL_SHA`, `cert_key=RSA 1024`; `WeakTLS`, `WeakCipher`, `WeakKey`, `WeakSig`, `SelfSigned`, `CertUntrusted` |
+| `future.tls.test` | a certificate valid from 30 days after `up` | `CertNotYetValid` (tlsx sets no `expired` for it) |
+| `default.tls.test` | OpenSSL's default subject, `O=Internet Widgits Pty Ltd` | `DefaultCert` |
+| `modern.tls.test` | TLS 1.2–1.3, ECDSA P-256: the control | `tls_supported=TLS 1.3;TLS 1.2`, `cert_key=EC P-256`, none of the flags above |
+
+The check also reads the matrix a second way, with tlsx's own per-version handshakes
+(`-min-version`/`-max-version`), and asks the container's openssl whether `legacy.tls.test` negotiates
+`NULL-SHA`. Debian's OpenSSL 1.1.1 is built without 3DES and RC4, so `NULL-SHA` stands in for them: the
+same `WeakCipher`. Nothing here can serve SSL 3.0; the probe's SSL 3.0 hello is covered by the suite's
+local TLS speaker instead.
+
+`legacy.tls.test` also shows why the chain check retries: the local OpenSSL refuses its key size
+and protocol before it gets to the chain, so the first handshake fails without a verdict. The
+second try, at security level 0, reaches one (`self-signed certificate` → `CertUntrusted`).
 
 ## Accuracy notes
 

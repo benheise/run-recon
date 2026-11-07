@@ -1443,3 +1443,54 @@ B4.3, B4.4 and B4.5 were checked against the lab with the real tools, and B4.4 a
 - [x] **Found while building this**: see BENCHMARK.md (`--monitor --db` hiding changes, a pipefail abort in a
       new screenshot pipeline, the heartbeat's `sleep` holding the lock, children forked during the kill, a
       resume racing a live run).
+
+## v1.20.0 (unreleased) — Batch 5: redirect chains, login forms, TLS version matrix, certificate strength, CPE aliases
+
+Tracked in `PLAN.md` (B2.8, T1, T2, X1), on `batch-5-redirects-tls` (stacked on Batch 4). Every item has suite
+tests and was checked against new lab fixtures with the real tools.
+
+- [x] **B2.8 redirect chain** (WebInventory `FinalUrl` / `RedirectChain`): `final_url` (the last URL of the
+      chain that answered) and `redirect_chain` (`code->absolute URL`, joined ` | `), built by the aggregator
+      from the run's own enrichment records (no request); same-host hops followed up to `REDIRECT_MAX` (5), a
+      hop to another host listed and never followed, a loop stopped when it comes back. `--extras` fetches the
+      same-host hops the run did not probe, with the enrichment request itself (`_hx_enrich`, cached), into
+      `parts/hops.*.jsonl`: evidence for the chain, never URL rows.
+- [x] **B2.8 password forms** (WebInventory `Auth=Form`, `_CleartextAuth`): httpx `-er` on the enrichment
+      request lists the page's `<form>` tags and password inputs in page order (no extra request; cache key
+      `httpx_json_v3`). The form before the first password field gives `login_form` (absolute; the page
+      itself without `action`, entities decoded), on the page the URL ends on; `auth` gains `Form`;
+      `CleartextAuth` when the form posts to `http://` or sits on a plain-HTTP page and does not post to
+      `https://`. Report: one finding per (login page, form target).
+- [x] **T1 `--tls-enum`** (`--tls-full` kept as its alias; in `--all`): `tls_enum_probe`, WebInventory's
+      plan in stdlib Python: one ClientHello per version (TLS 1.3, 1.2, 1.1, 1.0, SSL 3.0) and one at TLS 1.2
+      offering only weak suites (NULL, EXPORT, anon, RC4, DES, 3DES, RC2), each stopped at the ServerHello;
+      only host:port keys tlsx completed a handshake with, at the address tlsx used; cached as `tls_enum_v1`.
+      → `tls_supported`, `tls_ciphers` (the suite chosen per version), `tls_weak_cipher` (`version:suite`);
+      `WeakTLS` for SSL 3.0/TLS 1.0/1.1 accepted, `WeakCipher` for an accepted weak suite. tlsx `-ve`/`-ce`
+      are no longer used: `-ci` cannot offer weak suites (ctls refuses their names; ztls sends an empty
+      cipher list), and the local OpenSSL can no longer offer SSL 3.0 or RC4.
+- [x] **T2 the leaf certificate**: tlsx `-cert` on the posture call (cache key `tlsx_posture_v2`); a stdlib
+      DER reader → `cert_key` (`RSA 2048`, `EC P-256`, `Ed25519`, …), `cert_sig_alg`, `cert_not_before`;
+      flags `WeakKey` (RSA/DSA < 2048, EC < 224), `WeakSig` (MD2/MD5/SHA-1), `CertNotYetValid` (tlsx sets no
+      `expired` for it), `DefaultCert` (WebInventory's rules: Splunk, Nessus, pfSense, VMware installer,
+      OpenSSL's `Internet Widgits`, mod_ssl's `SomeOrganization`; plus ingress-nginx's fake certificate and
+      Traefik's default). `CertExpired` also from the dates. Report: the detail in each finding's text;
+      `WeakTLS` with SSL 3.0 graded high.
+- [x] **Chain check retry**: when the local OpenSSL refuses the handshake below its security level (a small
+      key, TLS 1.0), the chain check tries once more at level 0 so the verification answers
+      (`legacy.tls.test`: `self-signed certificate` → `CertUntrusted`; before, no verdict).
+- [x] **X1 CPE aliases**: `cpe-aliases.json` (WebInventory's 184 groups, commit a8383ec, with its NVD
+      notice) next to `recon-db.sh`; `vulns` joins a CVE filed under any name of a group to the services
+      carrying another (exact names first; `CPE_ALIASES_FILE=` off); provenance records the file's SHA-256.
+      The setup scripts install it next to `recon-db.sh`, and `recon-db` finds it through its symlink.
+- [x] **Lab**: `bench-run-recon.sh tls` (new; in `checks`): four nginx fixtures on their own loopback
+      addresses (legacy TLS 1.0–1.2 + NULL-SHA + RSA 1024/SHA-1, not-yet-valid, OpenSSL default subject,
+      modern control), certificates from `lab/gen-tls-certs.py`, cross-checked against tlsx per version and
+      the container's openssl. `http` extended with the redirect and login-form fixtures (Caddyfile).
+      The setup scripts install python3-cryptography for the fixtures.
+- [x] **Checks:** suite 762 → **831/831**; `bench-run-recon.sh checks` **PASS** on all ten; A/B vs Batch 4: the
+      default path's output identical on the farm, and on the lab except WordPress's plain-HTTP login page
+      (`Form`, `CleartextAuth`: the new detection); timing equal run by run (BENCHMARK.md).
+- [x] **Found while building this**: see BENCHMARK.md (`--tls-full` gave no CSV with tlsx 1.4.0 since 1.17,
+      tlsx cannot offer weak suites, `expired` is false for a not-yet-valid certificate, the chain check's
+      missing verdict on weak hosts, tlsx's `auto` mode reading an open stdin).

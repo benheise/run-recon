@@ -11,7 +11,8 @@
 #
 # Installs system-wide under /opt/recon, with binaries/shims on PATH via
 # /usr/local/bin:
-#   - apt/dnf/pacman base packages (git, python3-venv, build tools, jq, ldnsutils for the lab's signed zones, libpcap, postgresql-client...)
+#   - apt/dnf/pacman base packages (git, python3-venv, build tools, jq, ldnsutils for the lab's signed zones,
+#     python3-cryptography for the lab's TLS fixture certificates, libpcap, postgresql-client...)
 #   - Go toolchain (pinned) -> /usr/local/go
 #   - Go tools -> /usr/local/bin: gau, waybackurls, httpx, katana, subfinder,
 #     dnsx, tlsx, alterx, nuclei, hakrawler, gospider, ffuf, subjs, getJS,
@@ -279,7 +280,7 @@ install_base_packages(){
       as_root apt-get update -y || warn "apt-get update reported errors"
       as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         git curl wget unzip zip ca-certificates build-essential pkg-config \
-        python3 python3-venv python3-pip pipx \
+        python3 python3-venv python3-pip pipx python3-cryptography \
         jq dnsutils ldnsutils whois libpcap-dev gcc make \
         ruby ruby-dev whatweb \
         postgresql-client \
@@ -290,7 +291,7 @@ install_base_packages(){
       log "dnf: installing base packages..."
       as_root dnf install -y \
         git curl wget unzip zip ca-certificates pkgconf-pkg-config \
-        python3 python3-pip pipx jq bind-utils ldns-utils whois libpcap-devel gcc make postgresql \
+        python3 python3-pip pipx python3-cryptography jq bind-utils ldns-utils whois libpcap-devel gcc make postgresql \
         ruby ruby-devel \
         || warn "some dnf packages failed to install"
       as_root dnf groupinstall -y "Development Tools" 2>/dev/null || true
@@ -299,7 +300,7 @@ install_base_packages(){
       log "pacman: installing base packages..."
       as_root pacman -Sy --noconfirm --needed \
         git curl wget unzip zip ca-certificates base-devel pkgconf \
-        python python-pip python-pipx jq bind ldns whois libpcap gcc make \
+        python python-pip python-pipx python-cryptography jq bind ldns whois libpcap gcc make \
         ruby whatweb \
         || warn "some pacman packages failed to install"
       ;;
@@ -651,6 +652,14 @@ if [ "$RUNNER_FOUND" = "yes" ]; then
       warn "$_companion not found next to this installer; the ${_cmd} feature will be unavailable from the installed command."
     fi
   done
+  # data the vulns join reads next to recon-db.sh: the CPE alias groups (1.20)
+  if [ -f "$SCRIPT_DIR/cpe-aliases.json" ]; then
+    if as_root install -m 0644 "$SCRIPT_DIR/cpe-aliases.json" "$INSTALL_ROOT/bin/cpe-aliases.json"; then
+      ok "Installed: $INSTALL_ROOT/bin/cpe-aliases.json  (CPE alias groups for recon-db vulns)"
+    else
+      warn "Could not install cpe-aliases.json; recon-db vulns will join exact CPE names only."
+    fi
+  fi
 else
   warn "run-recon.sh not found next to this script ($SCRIPT_DIR)."
   warn "Place run-recon.sh (with generate-report.sh + recon-db.sh) alongside this installer and re-run."

@@ -92,7 +92,9 @@ RECON_DIR="$(dirname "$RECON_SELF")"
 : "${ZONE_EXPOSURE:=0}"    # 1 = per seed zone: open AXFR, walkable NSEC chain, NSEC3 params -> side artifact
 : "${ZONE_WALK_MAX:=5000}" # stop an NSEC walk after this many names
 : "${TLS_POSTURE:=0}"      # 1 = TLS posture via tlsx (neg. version/cipher, cert expiry, self-signed, name mismatch)
-: "${TLS_ENUM:=0}"         # 1 = also enumerate TLS versions + ciphers (noisier; adds WeakTLS/WeakCipher flags)
+: "${TLS_ENUM:=0}"         # 1 = TLS version matrix + weak-cipher probe (--tls-enum; 6 short handshakes per https host)
+: "${TLS_ENUM_TIMEOUT:=8}" # --tls-enum: seconds per handshake
+: "${REDIRECT_MAX:=5}"     # redirect hops followed per URL (same host; --extras fetches the ones the run did not probe)
 : "${IPV6:=0}"             # 1 = resolve AAAA records (dnsx) -> ipv6 column
 : "${ENRICH:=0}"           # 1 = per-IP cloud provider + RDAP network org -> cloud, rdap_org columns
 : "${GEO_DB:=}"            # path to a MaxMind GeoLite2 .mmdb for the geo column (implies --enrich; needs mmdblookup)
@@ -501,26 +503,41 @@ def key(j):
     except Exception:
         port = 443
     return (str(j.get("ip") or host), port, host)
+def _ctx(legacy):
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False            # name mismatch has its own flag
+    if legacy:
+        # the local OpenSSL refuses a small key or an old protocol below its security level
+        # before it gets to the chain (a handshake failure, not a verdict): the second try at
+        # level 0 lets the verification answer. Weak keys and signatures have flags of their own.
+        import warnings
+        ctx.set_ciphers("DEFAULT:@SECLEVEL=0")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            ctx.minimum_version = ssl.TLSVersion.TLSv1
+    return ctx
 def verify(k):
     # one handshake per (address, port, name): seeds that share hosts are checked once
     addr, port, host = k
     r = {}
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False            # name mismatch has its own flag
-    try:
-        with socket.create_connection((addr, port), timeout=6) as sock:
-            with ctx.wrap_socket(sock, server_hostname=host):
+    for legacy in (False, True):
+        try:
+            with socket.create_connection((addr, port), timeout=6) as sock:
+                with _ctx(legacy).wrap_socket(sock, server_hostname=host):
+                    r["chain_trusted"] = True
+        except ssl.SSLCertVerificationError as e:
+            code = getattr(e, "verify_code", 0)
+            if code in (9, 10):            # not yet valid / expired: the chain itself is fine
                 r["chain_trusted"] = True
-    except ssl.SSLCertVerificationError as e:
-        code = getattr(e, "verify_code", 0)
-        if code in (9, 10):                # not yet valid / expired: the chain itself is fine
-            r["chain_trusted"] = True
-        else:
-            r["chain_trusted"] = False
-            r["chain_error"] = (getattr(e, "verify_message", "") or str(e))[:120]
-            r["untrusted"] = True
-    except Exception:
-        pass                               # no handshake: say nothing
+            else:
+                r["chain_trusted"] = False
+                r["chain_error"] = (getattr(e, "verify_message", "") or str(e))[:120]
+                r["untrusted"] = True
+        except ssl.SSLError:
+            continue                       # refused below the local security level: try level 0
+        except Exception:
+            pass                           # no handshake: say nothing
+        break
     return r
 keys = sorted(set(key(j) for j in recs if isinstance(j, dict) and j.get("host")))
 with ThreadPoolExecutor(max_workers=16) as ex:
@@ -536,6 +553,327 @@ with open(path + ".chk", "w", encoding="utf-8") as fh:
 import os
 os.replace(path + ".chk", path)
 PYCHAIN
+  return 0
+}
+
+# tls_enum_probe KEYS TLSXJSON : the TLS version matrix and weak-cipher probe (--tls-enum),
+# WebInventory's plan (engine.cs Scan): one ClientHello per version (TLS 1.3, 1.2, 1.1, 1.0,
+# SSL 3.0), then one at TLS 1.2 offering only weak suites (NULL, EXPORT, anon, RC4, DES, 3DES,
+# RC2). Each handshake stops at the ServerHello: nothing is negotiated past it, so the result
+# does not depend on the local OpenSSL build (which can no longer offer SSL 3.0 or RC4) or on
+# tlsx -cipher-input (ctls refuses weak suite names; ztls sends an empty cipher list).
+# Only host:port keys tlsx completed a handshake with, at the address tlsx connected to: the
+# names and addresses the scope already allowed, and no resolution of its own. One JSON record
+# per key: tls_supported (in plan order), tls_ciphers (version -> the suite the server chose),
+# tls_weak_cipher ("version:suite" when it accepted a weak one).
+tls_enum_probe() {
+  local keys="$1" tlsx="$2"
+  [ -s "$keys" ] || return 0
+  _to "$STAGE_TIMEOUT" python3 - "$keys" "$tlsx" <<'PYENUM'
+# TLSENUM-PROBE (the suite extracts this program by that marker)
+import sys, os, socket, struct, json, ipaddress
+from concurrent.futures import ThreadPoolExecutor
+keys_path, tlsx_path = sys.argv[1], sys.argv[2]
+TIMEOUT = float(os.environ.get("TLS_ENUM_TIMEOUT") or 8)
+NAMES = {
+    0x1301: "TLS_AES_128_GCM_SHA256", 0x1302: "TLS_AES_256_GCM_SHA384", 0x1303: "TLS_CHACHA20_POLY1305_SHA256",
+    0xC02B: "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", 0xC02C: "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+    0xC02F: "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", 0xC030: "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+    0xCCA8: "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256", 0xCCA9: "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+    0xC023: "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256", 0xC024: "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
+    0xC027: "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256", 0xC028: "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384",
+    0xC009: "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA", 0xC00A: "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA",
+    0xC013: "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA", 0xC014: "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA",
+    0x009E: "TLS_DHE_RSA_WITH_AES_128_GCM_SHA256", 0x009F: "TLS_DHE_RSA_WITH_AES_256_GCM_SHA384",
+    0xCCAA: "TLS_DHE_RSA_WITH_CHACHA20_POLY1305_SHA256", 0x0067: "TLS_DHE_RSA_WITH_AES_128_CBC_SHA256",
+    0x006B: "TLS_DHE_RSA_WITH_AES_256_CBC_SHA256", 0x0033: "TLS_DHE_RSA_WITH_AES_128_CBC_SHA",
+    0x0039: "TLS_DHE_RSA_WITH_AES_256_CBC_SHA", 0x009C: "TLS_RSA_WITH_AES_128_GCM_SHA256",
+    0x009D: "TLS_RSA_WITH_AES_256_GCM_SHA384", 0x003C: "TLS_RSA_WITH_AES_128_CBC_SHA256",
+    0x003D: "TLS_RSA_WITH_AES_256_CBC_SHA256", 0x002F: "TLS_RSA_WITH_AES_128_CBC_SHA",
+    0x0035: "TLS_RSA_WITH_AES_256_CBC_SHA", 0x0041: "TLS_RSA_WITH_CAMELLIA_128_CBC_SHA",
+    0x0084: "TLS_RSA_WITH_CAMELLIA_256_CBC_SHA",
+    0xC012: "TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA", 0xC008: "TLS_ECDHE_ECDSA_WITH_3DES_EDE_CBC_SHA",
+    0x0016: "TLS_DHE_RSA_WITH_3DES_EDE_CBC_SHA", 0x000A: "TLS_RSA_WITH_3DES_EDE_CBC_SHA",
+    0xC011: "TLS_ECDHE_RSA_WITH_RC4_128_SHA", 0xC007: "TLS_ECDHE_ECDSA_WITH_RC4_128_SHA",
+    0x0005: "TLS_RSA_WITH_RC4_128_SHA", 0x0004: "TLS_RSA_WITH_RC4_128_MD5",
+    0x0009: "TLS_RSA_WITH_DES_CBC_SHA", 0x0015: "TLS_DHE_RSA_WITH_DES_CBC_SHA",
+    0x0003: "TLS_RSA_EXPORT_WITH_RC4_40_MD5", 0x0006: "TLS_RSA_EXPORT_WITH_RC2_CBC_40_MD5",
+    0x0008: "TLS_RSA_EXPORT_WITH_DES40_CBC_SHA", 0x0014: "TLS_DHE_RSA_EXPORT_WITH_DES40_CBC_SHA",
+    0x0062: "TLS_RSA_EXPORT1024_WITH_DES_CBC_SHA", 0x0064: "TLS_RSA_EXPORT1024_WITH_RC4_56_SHA",
+    0x0001: "TLS_RSA_WITH_NULL_MD5", 0x0002: "TLS_RSA_WITH_NULL_SHA", 0x003B: "TLS_RSA_WITH_NULL_SHA256",
+    0xC010: "TLS_ECDHE_RSA_WITH_NULL_SHA", 0xC006: "TLS_ECDHE_ECDSA_WITH_NULL_SHA",
+    0x0018: "TLS_DH_anon_WITH_RC4_128_MD5", 0x001B: "TLS_DH_anon_WITH_3DES_EDE_CBC_SHA",
+    0x0034: "TLS_DH_anon_WITH_AES_128_CBC_SHA", 0x003A: "TLS_DH_anon_WITH_AES_256_CBC_SHA",
+    0xC018: "TLS_ECDH_anon_WITH_AES_128_CBC_SHA", 0xC019: "TLS_ECDH_anon_WITH_AES_256_CBC_SHA",
+    0xC016: "TLS_ECDH_anon_WITH_RC4_128_SHA",
+}
+TLS13 = (0x1301, 0x1302, 0x1303)
+MODERN = (0xC02B, 0xC02F, 0xC02C, 0xC030, 0xCCA9, 0xCCA8, 0x009E, 0x009F, 0xCCAA, 0xC023, 0xC027, 0xC024,
+          0xC028, 0xC009, 0xC013, 0xC00A, 0xC014, 0x0067, 0x006B, 0x0033, 0x0039, 0x009C, 0x009D, 0x003C,
+          0x003D, 0x002F, 0x0035, 0x0041, 0x0084, 0xC012, 0xC008, 0x0016, 0x000A, 0xC011, 0xC007, 0x0005, 0x0004)
+WEAK = (0xC011, 0xC007, 0x0005, 0x0004, 0xC012, 0xC008, 0x0016, 0x000A, 0x0009, 0x0015, 0x0003, 0x0006,
+        0x0008, 0x0014, 0x0062, 0x0064, 0x0001, 0x0002, 0x003B, 0xC010, 0xC006, 0x0018, 0x001B, 0x0034,
+        0x003A, 0xC018, 0xC019, 0xC016)
+VNAME = {0x0304: "TLS 1.3", 0x0303: "TLS 1.2", 0x0302: "TLS 1.1", 0x0301: "TLS 1.0", 0x0300: "SSL 3.0"}
+PLAN = (("tls13", "TLS 1.3"), ("tls12", "TLS 1.2"), ("tls11", "TLS 1.1"), ("tls10", "TLS 1.0"), ("ssl3", "SSL 3.0"))
+
+def suite_name(s):
+    return NAMES.get(s, "0x%04X" % s)
+def is_weak(s):
+    n = suite_name(s)
+    return any(w in n for w in ("_NULL_", "EXPORT", "_anon_", "RC4", "_DES_", "3DES", "RC2"))
+def u16(v):
+    return struct.pack(">H", v)
+def ext(t, body):
+    return u16(t) + u16(len(body)) + body
+def is_ip(s):
+    try:
+        ipaddress.ip_address(s)
+        return True
+    except ValueError:
+        return False
+
+def client_hello(mode, sni):
+    ver = {"tls13": 0x0303, "tls12": 0x0303, "weak": 0x0303, "tls11": 0x0302, "tls10": 0x0301, "ssl3": 0x0300}[mode]
+    suites = (TLS13 + MODERN) if mode == "tls13" else WEAK if mode == "weak" else MODERN
+    body = u16(ver) + os.urandom(32)
+    body += b"\x00" if mode == "ssl3" else b"\x20" + os.urandom(32)
+    cs = list(suites) + ([] if mode == "ssl3" else [0x00FF])        # + TLS_EMPTY_RENEGOTIATION_INFO_SCSV
+    body += u16(2 * len(cs)) + b"".join(u16(s) for s in cs) + b"\x01\x00"
+    if mode != "ssl3":
+        e = b""
+        if sni and not is_ip(sni):
+            h = sni.rstrip(".").encode("ascii", "ignore")
+            e += ext(0x0000, u16(len(h) + 3) + b"\x00" + u16(len(h)) + h)
+        e += ext(0x000a, bytes.fromhex("000a001d0017001800190100"))   # groups
+        e += ext(0x000b, b"\x01\x00")                                   # ec_point_formats
+        if mode in ("tls13", "tls12", "weak"):
+            e += ext(0x000d, bytes.fromhex("001a0403050306030804080508060401050106010203020104020202"))   # sigalgs
+        if mode in ("tls13", "tls12"):
+            e += ext(0x0010, b"\x00\x0c\x02h2\x08http/1.1")
+        e += ext(0x0017, b"") + ext(0xff01, b"\x00")                     # EMS, renegotiation_info
+        if mode == "tls13":
+            e += ext(0x002b, b"\x02\x03\x04")                            # supported_versions: TLS 1.3 only
+            e += ext(0x002d, b"\x01\x01")                                # psk_key_exchange_modes
+            e += ext(0x0033, u16(36) + u16(0x001d) + u16(32) + os.urandom(32))   # any 32 bytes: an x25519 share
+        body += u16(len(e)) + e
+    hs = b"\x01" + struct.pack(">I", len(body))[1:] + body
+    return b"\x16" + u16(0x0300 if mode == "ssl3" else 0x0301) + u16(len(hs)) + hs
+
+def read_exact(s, n):
+    b = b""
+    while len(b) < n:
+        c = s.recv(n - len(b))
+        if not c:
+            return None
+        b += c
+    return b
+
+def server_hello(d, r):
+    if len(d) < 38:
+        return
+    ver = (d[0] << 8) | d[1]
+    q = 34
+    q += 1 + d[q]
+    if q + 3 > len(d):
+        return
+    r["cipher"] = (d[q] << 8) | d[q + 1]
+    q += 3
+    if q + 2 <= len(d):
+        ee = min(len(d), q + 2 + ((d[q] << 8) | d[q + 1]))
+        q += 2
+        while q + 4 <= ee:
+            et, el = (d[q] << 8) | d[q + 1], (d[q + 2] << 8) | d[q + 3]
+            if q + 4 + el > ee:
+                break
+            if et == 0x002b and el == 2:                                 # TLS 1.3 (also a HelloRetryRequest)
+                ver = (d[q + 4] << 8) | d[q + 5]
+            q += 4 + el
+    r["version"] = ver
+
+def probe(ip, port, sni, mode):
+    r = {"connected": False}
+    try:
+        s = socket.create_connection((ip, port), timeout=TIMEOUT)
+    except OSError:
+        return r
+    r["connected"] = True
+    try:
+        s.settimeout(TIMEOUT)
+        s.sendall(client_hello(mode, sni))
+        buf = b""
+        while len(buf) < 262144:
+            hdr = read_exact(s, 5)
+            if hdr is None:
+                break
+            ct, rl = hdr[0], (hdr[3] << 8) | hdr[4]
+            if ct < 20 or ct > 23 or hdr[1] > 3:
+                r["not_tls"] = True
+                break
+            if rl > 18432:
+                break
+            frag = read_exact(s, rl)
+            if frag is None:
+                break
+            r["tls"] = True
+            if ct != 22:
+                break                                                    # an alert, or nothing to read
+            buf += frag
+            if len(buf) >= 4 and len(buf) >= 4 + int.from_bytes(buf[1:4], "big"):
+                if buf[0] == 2:
+                    server_hello(buf[4:4 + int.from_bytes(buf[1:4], "big")], r)
+                break
+    except OSError:
+        pass
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+    return r
+
+def scan(job):
+    host, port, ip = job
+    versions, ciphers, is_tls = [], {}, False
+    for mode, label in PLAN:
+        h = probe(ip, port, host, mode)
+        if not h["connected"]:
+            if mode == "tls13":
+                return None                                              # gone since the posture: say nothing
+            continue
+        if h.get("not_tls") and not is_tls:
+            return None
+        is_tls = is_tls or bool(h.get("tls"))
+        if h.get("cipher") is not None and VNAME.get(h.get("version")) == label:
+            versions.append(label)
+            ciphers[label] = suite_name(h["cipher"])
+    weak = ""
+    if is_tls:
+        w = probe(ip, port, host, "weak")
+        if w.get("cipher") is not None and is_weak(w["cipher"]):
+            weak = VNAME.get(w.get("version"), "0x%04X" % (w.get("version") or 0)) + ":" + suite_name(w["cipher"])
+    return {"host": host, "port": str(port), "ip": ip, "tls_supported": versions,
+            "tls_ciphers": ciphers, "tls_weak_cipher": weak}
+
+addr = {}
+try:
+    for line in open(tlsx_path, encoding="utf-8", errors="replace"):
+        try:
+            j = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(j, dict) and j.get("host") and j.get("ip"):
+            addr.setdefault("%s:%s" % (str(j["host"]).lower(), j.get("port") or 443), str(j["ip"]))
+except OSError:
+    pass
+jobs = []
+for line in open(keys_path, encoding="utf-8", errors="replace"):
+    k = line.strip().lower()
+    host, _, port = k.rpartition(":")
+    if not host or not port.isdigit() or k not in addr:
+        continue
+    jobs.append((host, int(port), addr[k]))
+if jobs:
+    with ThreadPoolExecutor(max_workers=min(16, len(jobs))) as ex:
+        for rec in ex.map(scan, sorted(set(jobs))):
+            if rec:
+                print(json.dumps(rec, sort_keys=True))
+PYENUM
+}
+
+# _hx_enrich [ARGS...] : the per-URL enrichment request (httpx -json), one definition for the
+# enrichment pass, its late retry and the redirect hops (--extras), so every record has the
+# same fields. -er: the <form> tags and password inputs of the page, in page order (httpx
+# lists each distinct match once), for login_form / CleartextAuth; no extra request.
+LOGIN_FORM_RE='(?is)<form[^>]*>|<input[^>]+type\s*=\s*["'"'"']?password'
+_hx_enrich() {
+  _to "$STAGE_TIMEOUT" "$HTTPX_BIN" -silent -json -status-code -content-length -title -tech-detect -web-server \
+    -irh -hash sha256 -nfs -er "$LOGIN_FORM_RE" -timeout 10 -retries "$HTTP_RETRIES" -rl "$RATE" "$@"
+}
+
+# redirect_hops DOMAIN RAW ENRICHED HOPS [HTTPX-ARGS...] : --extras. The same-host redirect
+# targets the run did not probe itself, fetched with the enrichment request, up to REDIRECT_MAX
+# hops deep, so final_url / redirect_chain / login_form follow a chain past them (http:// ->
+# https:// -> /login). A target on another host is listed in redirect_chain, never fetched
+# (WebInventory's rule). Same host = the same name, so the scope already allowed it.
+redirect_hops() {
+  local domain="$1" raw="$2" enr="$3" hops="$4" round=0
+  shift 4
+  local next="$raw/hops_next.txt" asked="$raw/hops_asked.txt"
+  : > "$asked"
+  while [ "$round" -lt "${REDIRECT_MAX:-5}" ]; do
+    round=$((round + 1))
+    # after the first round, only the hops just fetched can lead further
+    if [ "$round" -gt 1 ] && ! grep -qE '"status_code": ?30[12378][,}]' "$hops" 2>/dev/null; then break; fi
+    python3 - "$enr" "$hops" "$asked" > "$next" <<'PYHOPS' || : > "$next"
+import sys, json
+from urllib.parse import urljoin, urlparse
+enr, hops, asked = sys.argv[1:4]
+def key(u):             # the aggregator's urlkey(): scheme/host case, default port, trailing slash
+    try:
+        p = urlparse(u)
+        s, h, port = (p.scheme or "").lower(), (p.hostname or "").lower(), p.port
+        if (s, port) in (("http", 80), ("https", 443)):
+            port = None
+        return "%s://%s%s%s%s" % (s, h, ":%d" % port if port else "", (p.path or "").rstrip("/"),
+                                  ("?" + p.query) if p.query else "")
+    except ValueError:
+        return u.rstrip("/")
+known, recs = set(), []
+for path in (enr, hops):
+    try:
+        for line in open(path, encoding="utf-8", errors="replace"):
+            try:
+                j = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(j, dict):
+                recs.append(j)
+                known.update(key(str(j[k])) for k in ("input", "url") if j.get(k))
+    except OSError:
+        pass
+try:
+    known.update(key(l.strip()) for l in open(asked, encoding="utf-8", errors="replace") if l.strip())
+except OSError:
+    pass
+out = set()
+for j in recs:
+    try:
+        if int(j.get("status_code") or 0) not in (301, 302, 303, 307, 308):
+            continue
+    except (TypeError, ValueError):
+        continue
+    hd = j.get("header") if isinstance(j.get("header"), dict) else {}
+    loc = j.get("location") or hd.get("location") or ""
+    loc = str(loc[0] if isinstance(loc, list) and loc else loc).strip()
+    base = str(j.get("input") or j.get("url") or "")
+    if not loc or not base:
+        continue
+    nxt = urljoin(base, loc).split("#", 1)[0]
+    try:
+        pb, pn = urlparse(base), urlparse(nxt)
+        if pn.scheme.lower() not in ("http", "https") or (pn.hostname or "").lower() != (pb.hostname or "").lower():
+            continue
+        pn.port
+    except ValueError:
+        continue
+    if key(nxt) not in known:
+        out.add(nxt)
+for u in sorted(out):
+    print(u)
+PYHOPS
+    [ -s "$next" ] || break
+    cat "$next" >> "$asked"
+    local _hh="$raw/hops_hit.jsonl" _hm="$raw/hops_miss.txt" _hf="$raw/hops_fresh.jsonl" _hrc=0
+    cache_split httpx_json_v3 "$next" "$_hh" "$_hm"
+    cat "$_hh" >> "$hops" 2>/dev/null || true
+    if [ -s "$_hm" ]; then
+      _hx_enrich "$@" < "$_hm" 2>>"$raw/httpx.err" > "$_hf" || _hrc=$?
+      cat "$_hf" >> "$hops" 2>/dev/null || true
+      [ "$_hrc" -eq 0 ] && cache_store httpx_json_v3 "$_hm" "$_hf" httpxjson noneg
+    fi
+  done
+  [ -s "$hops" ] && log "[$domain] redirect hops: $(grep -c . "$hops") same-host target(s) fetched"
   return 0
 }
 
@@ -1733,11 +2071,13 @@ analyze_hosts() {
     if [ -s "$_tlskeys" ]; then
       stage "$domain" "TLS posture (tlsx)"
       local _tlshit="$raw/tls_hit.jsonl" _tlsmiss="$raw/tls_miss.txt"
-      cache_split tlsx_posture "$_tlskeys" "$_tlshit" "$_tlsmiss"   # reuse cached posture
+      # -cert: the leaf certificate (PEM) for cert_key / cert_sig_alg and the WeakKey, WeakSig
+      # and DefaultCert flags (1.20); the cache key moved to tlsx_posture_v2 with it, so records
+      # cached before carry the certificate too
+      cache_split tlsx_posture_v2 "$_tlskeys" "$_tlshit" "$_tlsmiss"   # reuse cached posture
       cat "$_tlshit" >> "$P/tlsx.$safe.jsonl" 2>/dev/null || true
       if [ -s "$_tlsmiss" ]; then
-        local _tlsargs=(-l "$_tlsmiss" -json -tls-version -cipher -expired -self-signed -mismatched -untrusted -wildcard-cert -silent -timeout 10)
-        [ "$TLS_ENUM" = "1" ] && _tlsargs+=(-version-enum -cipher-enum)
+        local _tlsargs=(-l "$_tlsmiss" -json -tls-version -cipher -expired -self-signed -mismatched -untrusted -wildcard-cert -cert -silent -timeout 10)
         _tlsargs+=("${rr2[@]}")
         local _tlsfresh="$raw/tls_fresh.jsonl" _tlsrc=0
         _to "$STAGE_TIMEOUT" tlsx "${_tlsargs[@]}" 2>>"$raw/tlsx.err" > "$_tlsfresh" || _tlsrc=$?
@@ -1754,7 +2094,20 @@ analyze_hosts() {
           fi
         fi
         cat "$_tlsfresh" >> "$P/tlsx.$safe.jsonl" 2>/dev/null || true
-        [ "$_tlsrc" -eq 0 ] && cache_store tlsx_posture "$_tlsmiss" "$_tlsfresh" jsonauthority noneg
+        [ "$_tlsrc" -eq 0 ] && cache_store tlsx_posture_v2 "$_tlsmiss" "$_tlsfresh" jsonauthority noneg
+      fi
+      # TLS version matrix + weak-cipher probe (--tls-enum, see tls_enum_probe): cached per
+      # host:port like the posture; only hosts tlsx reached, at the address it used
+      if [ "$TLS_ENUM" = "1" ]; then
+        stage "$domain" "TLS version matrix + weak-cipher probe"
+        local _enhit="$raw/tlsenum_hit.jsonl" _enmiss="$raw/tlsenum_miss.txt" _enfresh="$raw/tlsenum_fresh.jsonl" _enrc=0
+        cache_split tls_enum_v1 "$_tlskeys" "$_enhit" "$_enmiss"
+        cat "$_enhit" >> "$P/tlsenum.$safe.jsonl" 2>/dev/null || true
+        if [ -s "$_enmiss" ]; then
+          tls_enum_probe "$_enmiss" "$P/tlsx.$safe.jsonl" > "$_enfresh" 2>>"$raw/tlsenum.err" || _enrc=$?
+          cat "$_enfresh" >> "$P/tlsenum.$safe.jsonl" 2>/dev/null || true
+          [ "$_enrc" -eq 0 ] && cache_store tls_enum_v1 "$_enmiss" "$_enfresh" jsonauthority noneg
+        fi
       fi
     fi
   fi
@@ -2939,7 +3292,7 @@ process_one() {
     local _hxout="$WORKDIR/parts/httpx.$safe.jsonl"; : > "$_hxout"
     local _enrkeys="$raw/enrich_keys.txt" _enrhit="$raw/enrich_hit.jsonl" _enrmiss="$raw/enrich_miss.txt"
     cut -f1 "$mapurls" | head -n "$capped" > "$_enrkeys"
-    cache_split httpx_json_v2 "$_enrkeys" "$_enrhit" "$_enrmiss"   # reuse cached per-URL JSON
+    cache_split httpx_json_v3 "$_enrkeys" "$_enrhit" "$_enrmiss"   # reuse cached per-URL JSON
     cat "$_enrhit" >> "$_hxout" 2>/dev/null || true
     if [ -s "$_enrmiss" ]; then
       local _enrfresh="$raw/enrich_fresh.jsonl" _enrrc=0
@@ -2950,14 +3303,13 @@ process_one() {
       # -irh -hash sha256: the response headers and body hash of the SAME request feed the
       # HTTP columns (redirect target, security headers, cookies, HSTS, Alt-Svc, auth, body
       # SHA-256); no extra request. The cache key moved to httpx_json_v2 so records cached
-      # before 1.19 (no headers) are fetched again instead of leaving those columns blank.
+      # before 1.19 (no headers) are fetched again instead of leaving those columns blank,
+      # and to httpx_json_v3 in 1.20 for the login-form matches (-er, see _hx_enrich).
       # -nfs (-no-fallback-scheme): probe each URL with ITS OWN scheme. Without it
       # httpx tries HTTPS first even for an http:// input, so http:// rows were
       # silently enriched with the HTTPS response (wrong status/title for plain-HTTP
       # services, redirects, or hosts that serve different content per scheme).
-      cat "$_enrmiss" \
-        | _to "$STAGE_TIMEOUT" "$HTTPX_BIN" -silent -json -status-code -content-length -title -tech-detect -web-server \
-                -irh -hash sha256 -nfs -timeout 10 -retries "$HTTP_RETRIES" -rl "$RATE" "${rr[@]}" 2>>"$raw/httpx.err" > "$_enrfresh" || _enrrc=$?
+      cat "$_enrmiss" | _hx_enrich "${rr[@]}" 2>>"$raw/httpx.err" > "$_enrfresh" || _enrrc=$?
       # late retry: httpx's own retries fire back to back, so a URL that failed
       # during a load spike usually fails all of them (the farm at -t 20 on 2 vCPU
       # blanked 1-3 hosts per run). URLs with no record get one more pass after a
@@ -2968,16 +3320,20 @@ process_one() {
         if [ -s "$_enrlate" ]; then
           log "[$domain] enrichment: $(wc -l < "$_enrlate" | tr -d ' ') URL(s) got no response; retrying once after a pause"
           late_pause
-          cat "$_enrlate" \
-            | _to "$STAGE_TIMEOUT" "$HTTPX_BIN" -silent -json -status-code -content-length -title -tech-detect -web-server \
-                    -irh -hash sha256 -nfs -timeout 10 -retries "$HTTP_RETRIES" -t 5 -rl "$RATE" "${rr[@]}" 2>>"$raw/httpx.err" >> "$_enrfresh" || true
+          cat "$_enrlate" | _hx_enrich -t 5 "${rr[@]}" 2>>"$raw/httpx.err" >> "$_enrfresh" || true
         fi
       fi
       cat "$_enrfresh" >> "$_hxout" 2>/dev/null || true
       # cache each fresh record by its input URL. No negative entries: these URLs
       # belong to hosts the live probe just confirmed, so a missing record is a
       # failed request, not an absent page (see cache_store).
-      [ "$_enrrc" -eq 0 ] && cache_store httpx_json_v2 "$_enrmiss" "$_enrfresh" httpxjson noneg
+      [ "$_enrrc" -eq 0 ] && cache_store httpx_json_v3 "$_enrmiss" "$_enrfresh" httpxjson noneg
+    fi
+    # --extras: follow redirects past the targets the run did not probe (same host only); a
+    # seed with no redirect in its records starts nothing
+    if [ "$EXTRAS" = "1" ] && grep -qE '"status_code": ?30[12378][,}]' "$_hxout" 2>/dev/null; then
+      stage "$domain" "redirect hops (same host)"
+      redirect_hops "$domain" "$raw" "$_hxout" "$WORKDIR/parts/hops.$safe.jsonl" "${rr[@]}"
     fi
     # surface a clear hint if nothing (cached or fresh) came back at all
     if [ ! -s "$_hxout" ] && [ -s "$mapurls" ]; then
@@ -3081,6 +3437,9 @@ DISCOVERY (host expansion; active techniques -- assets you are authorized to ass
                           security.txt (RFC 9116 Contact/Expires) and one random-path 404 probe
                           (catch-all 200, error-page versions), plus favicon hashes. 3-5 extra
                           requests per host -> robots, security_txt, favicon_* columns, <out>.extras.txt
+                          Also fetches the same-host redirect targets the run did not probe
+                          (REDIRECT_MAX=5 hops), so final_url / redirect_chain / login_form follow
+                          http:// -> https:// -> /login. Off-host targets are listed, not fetched.
       --resolvers FILE    Custom resolver list (else a built-in dedicated set is used;
                           both bypass a local Pi-hole and its rate limits). Resolvers are
                           health-checked at startup; a dead set is warned about, not silently
@@ -3124,11 +3483,19 @@ ANALYSIS / TRIAGE (side artifacts written next to the CSV; not URL rows):
                           title) -> <out>.origin.txt (findings), <out>.edge.tsv (per-host edge, origin
                           software, JARM, CDN, favicon mmh3)
       --tls               TLS posture (tlsx) -> CSV cols: tls_version, tls_cipher, cert_not_after,
-                          cert_issuer, tls_flags (CertExpired/CertExpiring/SelfSigned/CertNameMismatch/
-                          CertUntrusted/Wildcard). Joined to https rows. CertExpiring: within
-                          CERT_WARN_DAYS (30). CertUntrusted: the chain does not verify against the
-                          system trust store (TLS_CHAIN_CHECK=0 skips that check).
-      --tls-full          ...also enumerate TLS versions + ciphers (adds WeakTLS/WeakCipher; noisier).
+                          cert_issuer, tls_flags (CertExpired/CertExpiring/CertNotYetValid/SelfSigned/
+                          DefaultCert/CertNameMismatch/CertUntrusted/WeakKey/WeakSig/Wildcard),
+                          cert_key, cert_sig_alg, cert_not_before. Joined to https rows. CertExpiring:
+                          within CERT_WARN_DAYS (30). CertUntrusted: the chain does not verify against
+                          the system trust store (TLS_CHAIN_CHECK=0 skips that check). WeakKey: RSA/DSA
+                          under 2048 bits, EC under 224. WeakSig: MD2/MD5/SHA-1. DefaultCert: a vendor's
+                          or OpenSSL's placeholder certificate (Splunk, Nessus, pfSense, VMware, ...).
+      --tls-enum          --tls plus the version matrix: one short handshake per version (TLS 1.3 down
+                          to SSL 3.0) and one offering only weak suites, each stopped at the
+                          ServerHello -> tls_supported, tls_ciphers (the suite chosen per version),
+                          tls_weak_cipher; WeakTLS for SSL 3.0/TLS 1.0/1.1, WeakCipher for an accepted
+                          NULL/EXPORT/anon/RC4/DES/3DES/RC2 suite. 6 handshakes per https host.
+      --tls-full          Same as --tls-enum.
       --ipv6              Resolve AAAA records (dnsx) -> ipv6 CSV column.
       --enrich            Per-IP cloud provider (AWS/Azure/GCP/Cloudflare/Oracle/DO IP-range feeds) +
                           RDAP network org + reverse DNS -> cloud, rdap_org, ptr CSV columns. PTR
@@ -3202,7 +3569,7 @@ UMBRELLA:
       --all               Enable the full discovery + defensive set: --subs --resolve --certs
                           --permute --brute --ports --js --crawlers-all --takeover
                           --zone-exposure --dns-posture --screenshots --origin --extras --active
-                          --activescan --osint --tls --ipv6 --enrich. (Scanning stages
+                          --activescan --osint --tls-enum --ipv6 --enrich. (Scanning stages
                           nuclei/params/secrets and favicon/vhost/monitor/cloudlist/tld-variants/vulnx
                           stay opt-in.)
 
@@ -3293,7 +3660,7 @@ while [ $# -gt 0 ]; do
     --resolve)         RESOLVE=1; shift;;
     --certs)           CERTS=1; shift;;
     --tls)             TLS_POSTURE=1; shift;;
-    --tls-full)        TLS_POSTURE=1; TLS_ENUM=1; shift;;
+    --tls-enum|--tls-full) TLS_POSTURE=1; TLS_ENUM=1; shift;;
     --ipv6)            IPV6=1; shift;;
     --enrich)          ENRICH=1; shift;;
     --geodb)           GEO_DB="${2:?}"; ENRICH=1; shift 2;;
@@ -3344,7 +3711,7 @@ while [ $# -gt 0 ]; do
     --social-user)     SOCIAL_USER="${2:?}"; SOCIAL=1; shift 2;;
     --all)             DO_SUBS=1; RESOLVE=1; CERTS=1; PERMUTE=1; BRUTE=1; PORTS=1; \
                        JS=1; CRAWLERS_ALL=1; TAKEOVER=1; SCREENSHOTS=1; ORIGIN=1; ACTIVE=1; \
-                       ACTIVESCAN=1; OSINT=1; TLS_POSTURE=1; IPV6=1; ENRICH=1; ZONE_EXPOSURE=1; EXTRAS=1; DNS_POSTURE=1; shift;;
+                       ACTIVESCAN=1; OSINT=1; TLS_POSTURE=1; TLS_ENUM=1; IPV6=1; ENRICH=1; ZONE_EXPOSURE=1; EXTRAS=1; DNS_POSTURE=1; shift;;
     --fuzz)            FUZZ=1; shift;;
     --wordlist)        WORDLIST="${2:?}"; shift 2;;
     --fuzz-threads)    FUZZ_THREADS="${2:?}"; shift 2;;
@@ -4413,7 +4780,7 @@ export WORKDIR PASSIVE_ONLY NO_VALIDATE DO_SUBS DEPTH RATE FILTER_STATIC MAX_URL
 export FUZZ WORDLIST FUZZ_THREADS FUZZ_EXT SECLISTS HTTPX_BIN
 export RESOLVE CERTS PERMUTE PERMUTE_MAX RESOLVERS
 export BRUTE BRUTE_WORDLIST BRUTE_MAX PORTS PORT_SPEC CRAWLERS_ALL JS TAKEOVER SCREENSHOTS ORIGIN FAVICON
-export TLS_POSTURE TLS_ENUM IPV6
+export TLS_POSTURE TLS_ENUM TLS_ENUM_TIMEOUT REDIRECT_MAX IPV6
 export ROUNDS VHOST NUCLEI NUCLEI_SEV PARAMS SECRETS
 export GITHUB GITHUB_TOKEN_FILE BUCKETS
 export ACTIVE CMS_WORDLIST CMS_MAX WPSCAN_API_TOKEN
@@ -5089,6 +5456,11 @@ if [ "$TLS_POSTURE" = "1" ] && [ "$TLS_CHAIN_CHECK" = "1" ] && [ -s "$WORKDIR/tl
   tls_chain_check "$WORKDIR/tlsx.jsonl"
 fi
 cat "$WORKDIR"/parts/aaaa.*.txt    2>/dev/null > "$WORKDIR/aaaa.tsv"    || : > "$WORKDIR/aaaa.tsv"
+# redirect hops (--extras) and the TLS version matrix (--tls-enum), joined by the aggregator
+HOPS_FILE="$WORKDIR/hops.jsonl"; TLSENUM_FILE="$WORKDIR/tlsenum.jsonl"
+cat "$WORKDIR"/parts/hops.*.jsonl    2>/dev/null > "$HOPS_FILE"    || : > "$HOPS_FILE"
+cat "$WORKDIR"/parts/tlsenum.*.jsonl 2>/dev/null > "$TLSENUM_FILE" || : > "$TLSENUM_FILE"
+export HOPS_FILE TLSENUM_FILE
 
 # fetch_cloud_ranges : emit "cidr<TAB>provider" for the public cloud IP-range feeds.
 fetch_cloud_ranges() {
@@ -5445,6 +5817,24 @@ def _ms(t):
     v = float(m.group(1)); u = m.group(2) or "s"
     f = {"ns": 1e-6, "µs": 1e-3, "us": 1e-3, "ms": 1.0, "s": 1000.0, "m": 60000.0}[u]
     return str(int(round(v * f)))
+def _login_action(j):
+    # A password field on the page (httpx -er, _hx_enrich): the action of the <form> before it
+    # ("" = the page itself), or None when the page has none. httpx lists each distinct match
+    # once, in page order; a repeated identical <form> tag has the same action anyway.
+    ex = j.get("extracts")
+    items = [str(x) for v in (ex.values() if isinstance(ex, dict) else []) if isinstance(v, list) for x in v]
+    last_form = None
+    for it in items:
+        low = it.lower()
+        if low.startswith("<form"):
+            last_form = it
+        elif low.startswith("<input") and "password" in low:
+            if last_form is None:
+                return ""
+            m = re.search(r"""action\s*=\s*["']?([^"'\s>]+)""", last_form, re.I)
+            import html as _html
+            return _html.unescape(m.group(1)) if m else ""
+    return None
 def http_fields(j, url):
     h = _hdrs(j)
     scheme = url.split("://", 1)[0].lower() if "://" in url else ""
@@ -5493,6 +5883,7 @@ def http_fields(j, url):
         m = re.search(r"max-age\s*=\s*\"?(\d+)", h["strict_transport_security"], re.I)
         hsts = m.group(1) if m else "0"
     return {
+        "login_action": _login_action(j),
         "redirect_location": h.get("location", "") or str(j.get("location") or ""),
         "response_ms": _ms(j.get("time")),
         "body_sha256": sha,
@@ -5744,6 +6135,72 @@ for _in, _ur, rec in _hx_recs:          # tier 3: root record per host
             if hj:
                 host_root.setdefault(hj, rec)
 
+# --- redirect chains (B2.8): follow each row's same-host hops through the run's own records,
+# plus the hops --extras fetched (HOPS_FILE). WebInventory's rule: a hop to another host is
+# listed in the chain, not followed; final_url is the last URL that answered. Nothing here
+# sends a request.
+hop_meta, hop_norm = {}, {}
+try:
+    with open(os.environ.get("HOPS_FILE") or "/nonexistent", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            try:
+                j = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(j, dict):
+                continue
+            rec = {"status_code": first(j, "status_code", "status-code"), "title": first(j, "title")}
+            rec.update(http_fields(j, str(j.get("url") or j.get("input") or "")))
+            for v in (str(j.get("input") or ""), str(j.get("url") or "")):
+                if v:
+                    hop_meta.setdefault(v, rec)
+                    hop_norm.setdefault(urlkey(v), rec)
+except OSError:
+    pass
+from urllib.parse import urljoin as _urljoin
+REDIRECT_MAX = int(os.environ.get("REDIRECT_MAX") or 5)
+def _rec_for(u):
+    return meta.get(u) or meta_norm.get(urlkey(u)) or hop_meta.get(u) or hop_norm.get(urlkey(u))
+def follow(url, m):
+    """final_url, redirect_chain, and the record of the last URL that answered."""
+    cur_url, cur, chain, seen = url, m, [], {urlkey(url)}
+    for _ in range(REDIRECT_MAX):
+        try:
+            st = int(cur.get("status_code") or 0)
+        except (TypeError, ValueError):
+            break
+        loc = str(cur.get("redirect_location") or "").strip()
+        if st not in (301, 302, 303, 307, 308) or not loc:
+            break
+        nxt = _urljoin(cur_url, loc).split("#", 1)[0]
+        try:
+            pn, pc = urlparse(nxt), urlparse(cur_url)
+            if pn.scheme.lower() not in ("http", "https"):
+                break
+            same = (pn.hostname or "").lower() == (pc.hostname or "").lower()
+        except ValueError:
+            break
+        chain.append("%d->%s" % (st, nxt))
+        if not same or urlkey(nxt) in seen:
+            break                          # off-host (listed, not followed), or a loop
+        seen.add(urlkey(nxt))
+        n = _rec_for(nxt)
+        if not n:
+            break                          # not fetched (without --extras: not a URL the run probed)
+        cur_url, cur = nxt, n
+    return (cur_url if chain else ""), " | ".join(chain)[:1000], cur, cur_url
+def login_of(page_url, rec):
+    """(login_form, cleartext): the absolute target of the page's password form."""
+    la = rec.get("login_action") if isinstance(rec, dict) else None
+    if la is None:
+        return "", False
+    tgt = _urljoin(page_url, la) if la else page_url
+    try:
+        ts, ps = (urlparse(tgt).scheme or "").lower(), (urlparse(page_url).scheme or "").lower()
+    except ValueError:
+        ts, ps = "", ""
+    return tgt[:300], (ts == "http" or (ps == "http" and ts != "https"))
+
 # --- TLS posture (tlsx): index by host:port and host; compute hygiene flags ----
 def _truthy(v):
     if isinstance(v, bool): return v
@@ -5781,16 +6238,155 @@ def _days_until(s):
             continue
     return None
 
-def _posture(rec):
+
+# --- the leaf certificate (tlsx -cert, 1.20): key, signature algorithm, vendor defaults -----
+# A small DER reader (stdlib only): the subjectPublicKeyInfo and the signature algorithm are
+# all that is needed, and a run should not depend on python3-cryptography being installed.
+_KEY_OIDS = {"1.2.840.113549.1.1.1": "RSA", "1.2.840.113549.1.1.10": "RSA-PSS", "1.2.840.10045.2.1": "EC",
+             "1.2.840.10040.4.1": "DSA", "1.3.101.112": "Ed25519", "1.3.101.113": "Ed448"}
+_CURVES = {"1.2.840.10045.3.1.1": ("P-192", 192), "1.3.132.0.33": ("P-224", 224),
+           "1.2.840.10045.3.1.7": ("P-256", 256), "1.3.132.0.34": ("P-384", 384), "1.3.132.0.35": ("P-521", 521),
+           "1.3.36.3.3.2.8.1.1.7": ("brainpoolP256r1", 256), "1.3.36.3.3.2.8.1.1.11": ("brainpoolP384r1", 384),
+           "1.3.36.3.3.2.8.1.1.13": ("brainpoolP512r1", 512), "1.3.132.0.10": ("secp256k1", 256)}
+_SIG_OIDS = {"1.2.840.113549.1.1.2": "md2WithRSAEncryption", "1.2.840.113549.1.1.4": "md5WithRSAEncryption",
+             "1.2.840.113549.1.1.5": "sha1WithRSAEncryption", "1.2.840.113549.1.1.14": "sha224WithRSAEncryption",
+             "1.2.840.113549.1.1.11": "sha256WithRSAEncryption", "1.2.840.113549.1.1.12": "sha384WithRSAEncryption",
+             "1.2.840.113549.1.1.13": "sha512WithRSAEncryption", "1.2.840.113549.1.1.10": "rsassaPss",
+             "1.3.14.3.2.29": "sha1WithRSA", "1.2.840.10045.4.1": "ecdsa-with-SHA1",
+             "1.2.840.10045.4.3.1": "ecdsa-with-SHA224", "1.2.840.10045.4.3.2": "ecdsa-with-SHA256",
+             "1.2.840.10045.4.3.3": "ecdsa-with-SHA384", "1.2.840.10045.4.3.4": "ecdsa-with-SHA512",
+             "1.2.840.10040.4.3": "dsa-with-sha1", "2.16.840.1.101.3.4.3.1": "dsa-with-sha224",
+             "2.16.840.1.101.3.4.3.2": "dsa-with-sha256", "1.3.101.112": "Ed25519", "1.3.101.113": "Ed448"}
+def _tlv(d, i):
+    t = d[i]; ln = d[i + 1]; i += 2
+    if ln & 0x80:
+        n = ln & 0x7F
+        ln = int.from_bytes(d[i:i + n], "big"); i += n
+    if i + ln > len(d):
+        raise ValueError("truncated")
+    return t, i, i + ln
+def _kids(d, s, e):
+    out = []
+    while s < e:
+        t, vs, ve = _tlv(d, s); out.append((t, vs, ve)); s = ve
+    return out
+def _oid(b):
+    if not b:
+        return ""
+    parts = [min(b[0] // 40, 2), b[0] - 40 * min(b[0] // 40, 2)]
+    v = 0
+    for x in b[1:]:
+        v = (v << 7) | (x & 0x7F)
+        if not x & 0x80:
+            parts.append(v); v = 0
+    return ".".join(str(p) for p in parts)
+def _int_bits(d, vs, ve):
+    return int.from_bytes(d[vs:ve], "big").bit_length()
+def _cert_info(pem):
+    """(cert_key, key_type, key_bits, cert_sig_alg) of a PEM certificate; blanks on any error."""
+    try:
+        import base64
+        m = re.search(r"-----BEGIN CERTIFICATE-----(.+?)-----END CERTIFICATE-----", pem or "", re.S)
+        if not m:
+            return "", "", 0, ""
+        d = base64.b64decode("".join(m.group(1).split()))
+        _, cs, ce = _tlv(d, 0)
+        cert = _kids(d, cs, ce)                          # tbsCertificate, signatureAlgorithm, signature
+        tbs = _kids(d, cert[0][1], cert[0][2])
+        i = 1 if tbs[0][0] == 0xA0 else 0                # [0] version
+        spki = _kids(d, tbs[i + 5][1], tbs[i + 5][2])    # serial, sig, issuer, validity, subject, SPKI
+        alg = _kids(d, spki[0][1], spki[0][2])
+        ko = _oid(d[alg[0][1]:alg[0][2]])
+        ktype = _KEY_OIDS.get(ko, ko)
+        bits, label = 0, ""
+        if ktype in ("RSA", "RSA-PSS"):
+            _, ps, pe = spki[1]                          # BIT STRING: unused-bits byte, RSAPublicKey
+            rk = _kids(d, ps + 1, pe)
+            rk = _kids(d, rk[0][1], rk[0][2])
+            bits = _int_bits(d, rk[0][1], rk[0][2])
+        elif ktype == "EC" and len(alg) > 1 and alg[1][0] == 0x06:
+            label, bits = _CURVES.get(_oid(d[alg[1][1]:alg[1][2]]), (_oid(d[alg[1][1]:alg[1][2]]), 0))
+        elif ktype == "DSA" and len(alg) > 1 and alg[1][0] == 0x30:
+            pqg = _kids(d, alg[1][1], alg[1][2])
+            bits = _int_bits(d, pqg[0][1], pqg[0][2])
+        elif ktype == "Ed25519":
+            bits = 256
+        elif ktype == "Ed448":
+            bits = 456
+        sa = _kids(d, cert[1][1], cert[1][2])
+        so = _oid(d[sa[0][1]:sa[0][2]])
+        key = "%s %s" % (ktype, label or bits) if (label or bits) and not ktype.startswith("Ed") else ktype
+        return key, ktype, bits, _SIG_OIDS.get(so, so)
+    except Exception:
+        return "", "", 0, ""
+def _weak_key(ktype, bits):
+    if not bits:
+        return False
+    if ktype in ("RSA", "RSA-PSS", "DSA"):
+        return bits < 2048
+    return ktype == "EC" and bits < 224
+# WeakSig: MD2, MD5 or SHA-1 (WebInventory's rule: sha1|md5|md2)
+_WEAK_SIG = re.compile(r"sha1|md5|md2", re.I)
+# DefaultCert: a vendor's or OpenSSL's placeholder certificate, still in place. WebInventory's
+# rules (builtin-rules.json) plus the ingress-nginx and Traefik defaults.
+_DEFAULT_SUBJECT = re.compile(r"CN=SplunkServerDefaultCert|O=SplunkUser|O=Nessus Users United|"
+                              r"pfSense webConfigurator Self-Signed|O=Internet Widgits Pty Ltd|"
+                              r"O=SomeOrganization|OU=SomeOrganizationalUnit|"
+                              r"Kubernetes Ingress Controller Fake Certificate|TRAEFIK DEFAULT CERT", re.I)
+_DEFAULT_ISSUER = re.compile(r"OU=VMware Engineering|O=VMware Installer", re.I)
+def _dn(rec, kind):
+    dn = first(rec, kind + "_dn")
+    if dn:
+        return str(dn)
+    org = first(rec, kind + "_org")
+    if isinstance(org, list):
+        org = ", ".join("O=" + str(o) for o in org)
+    elif org:
+        org = "O=" + str(org)
+    cn = first(rec, kind + "_cn")
+    return ", ".join(x for x in (("CN=" + str(cn)) if cn else "", org or "") if x)
+def _not_yet_valid(nb):
+    if not nb:
+        return False
+    try:
+        dt = datetime.datetime.fromisoformat(str(nb).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt > datetime.datetime.now(datetime.timezone.utc)
+    except Exception:
+        return False
+
+# --- the TLS version matrix (--tls-enum, tls_enum_probe), by host:port and host -------------
+tlsenum_by_hp, tlsenum_by_host = {}, {}
+try:
+    with open(os.environ.get("TLSENUM_FILE") or "/nonexistent", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            try:
+                j = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(j, dict) and j.get("host"):
+                h = str(j["host"]).lower()
+                tlsenum_by_hp.setdefault(h + ":" + str(j.get("port") or 443), j)
+                tlsenum_by_host.setdefault(h, j)
+except OSError:
+    pass
+_PLAN_ORDER = ("TLS 1.3", "TLS 1.2", "TLS 1.1", "TLS 1.0", "SSL 3.0")
+
+def _posture(rec, en=None):
+    # en: the --tls-enum record for the same host:port (tls_enum_probe), or None
+    en = en if isinstance(en, dict) else {}
     neg_ver = first(rec, "tls_version", "version")
     cipher  = first(rec, "cipher", "cipher_suite")
     not_after = first(rec, "not_after", "notafter")
+    not_before = first(rec, "not_before", "notbefore")
     issuer = first(rec, "issuer_org", "issuer_cn", "issuer_dn")
     if isinstance(issuer, list): issuer = issuer[0] if issuer else ""
     flags = []
     venum = first(rec, "version_enum", "versions_enum", "tls_version_enum", default=[])
     if isinstance(venum, str): venum = [venum]
-    if any(_weak_version(v) for v in ([neg_ver] + list(venum))):
+    supported = [v for v in (en.get("tls_supported") or []) if v in _PLAN_ORDER]
+    if any(_weak_version(v) for v in ([neg_ver] + list(venum) + supported)):
         flags.append("WeakTLS")
     ciphers = []
     cenum = first(rec, "cipher_enum", "ciphers_enum", default=[])
@@ -5798,27 +6394,42 @@ def _posture(rec):
         for e in cenum:
             if isinstance(e, dict):
                 cs = e.get("ciphers") or e.get("cipher_list") or []
+                if isinstance(cs, dict):          # tlsx 1.4: {"weak": [...], "secure": [...]}
+                    cs = [c for v in cs.values() if isinstance(v, list) for c in v]
                 ciphers += cs if isinstance(cs, list) else [cs]
             elif isinstance(e, str):
                 ciphers.append(e)
     if cipher: ciphers.append(cipher)
-    weak_ciphers = sorted({c for c in ciphers if c and _weak_cipher(c)})
-    if weak_ciphers: flags.append("WeakCipher")
-    if _truthy(rec.get("expired")):
+    weak_ciphers = sorted({c for c in ciphers if isinstance(c, str) and c and _weak_cipher(c)})
+    weak_enum = str(en.get("tls_weak_cipher") or "")
+    if weak_ciphers or weak_enum: flags.append("WeakCipher")
+    key, ktype, kbits, sig = _cert_info(str(rec.get("certificate") or ""))
+    if _weak_key(ktype, kbits):            flags.append("WeakKey")
+    if sig and _WEAK_SIG.search(sig):      flags.append("WeakSig")
+    d = _days_until(not_after) if not_after else None
+    if _truthy(rec.get("expired")) or (d is not None and d < 0):
         flags.append("CertExpired")
-    elif not_after:
-        d = _days_until(not_after)
-        if d is not None and 0 <= d <= int(os.environ.get("CERT_WARN_DAYS") or 30): flags.append("CertExpiring")
+    elif _not_yet_valid(not_before):
+        flags.append("CertNotYetValid")
+    elif d is not None and 0 <= d <= int(os.environ.get("CERT_WARN_DAYS") or 30):
+        flags.append("CertExpiring")
     if _truthy(rec.get("self_signed")):   flags.append("SelfSigned")
+    if _DEFAULT_SUBJECT.search(_dn(rec, "subject")) or _DEFAULT_ISSUER.search(_dn(rec, "issuer")):
+        flags.append("DefaultCert")
     if _truthy(rec.get("mismatched")):    flags.append("CertNameMismatch")
     if _truthy(rec.get("untrusted")):     flags.append("CertUntrusted")
     if _truthy(rec.get("revoked")):       flags.append("CertRevoked")
     if _truthy(rec.get("wildcard_certificate")) or _truthy(rec.get("wildcard_cert")):
         flags.append("Wildcard")
+    bycv = en.get("tls_ciphers") if isinstance(en.get("tls_ciphers"), dict) else {}
     return {"tls_version": _tls_label(neg_ver),
             "tls_cipher": cipher or (";".join(weak_ciphers) if weak_ciphers else ""),
             "cert_not_after": not_after or "", "cert_issuer": issuer or "",
-            "tls_flags": ";".join(flags)}
+            "tls_flags": ";".join(flags),
+            "tls_supported": ";".join(supported),
+            "tls_ciphers": ";".join("%s=%s" % (v, bycv[v]) for v in _PLAN_ORDER if v in bycv),
+            "tls_weak_cipher": weak_enum,
+            "cert_key": key, "cert_sig_alg": sig, "cert_not_before": str(not_before or "")}
 
 tls_by_hp, tls_by_host = {}, {}
 if tlsx_path:
@@ -5834,7 +6445,7 @@ if tlsx_path:
                 if not isinstance(j, dict): continue
                 h = (j.get("host") or "").lower()
                 p = str(j.get("port") or "")
-                pv = _posture(j)
+                pv = _posture(j, tlsenum_by_hp.get(h + ":" + p) or (None if p else tlsenum_by_host.get(h)))
                 if h and p: tls_by_hp.setdefault(h + ":" + p, pv)
                 if h:       tls_by_host.setdefault(h, pv)
     except FileNotFoundError:
@@ -5889,6 +6500,15 @@ try:
                     tls = tls_by_hp.get(hh + ":" + str(pr.port or 443)) or tls_by_host.get(hh) or {}
             except Exception:
                 tls = {}
+            # redirect chain (B2.8) and the login form of the page it ends on
+            final_url, chain, fin, fin_url = follow(url, m) if m else ("", "", {}, url)
+            login_form, cleartext = login_of(fin_url, fin)
+            auth = m.get("auth", "")
+            hflags = [f for f in (m.get("http_flags", "") or "").split(";") if f]
+            if login_form and "Form" not in auth.split(";"):
+                auth = (auth + ";Form") if auth else "Form"
+            if cleartext and "CleartextAuth" not in hflags:
+                hflags.append("CleartextAuth")
             rows.append([
                 seed, url, host, sources,
                 m.get("status_code", ""),
@@ -5907,12 +6527,16 @@ try:
                 build_cpes(m.get("technologies", ""), m.get("webserver", "")),  # cpe (FPV-06)
                 # HTTP columns (1.19), appended so existing consumers keep their positions
                 m.get("redirect_location", ""), m.get("response_ms", ""), m.get("body_sha256", ""),
-                m.get("content_type", ""), m.get("powered_by", ""), m.get("auth", ""),
+                m.get("content_type", ""), m.get("powered_by", ""), auth,
                 m.get("cookies", ""), m.get("cookie_issues", ""), m.get("missing_sec_headers", ""),
-                m.get("hsts_max_age", ""), m.get("alt_svc", ""), m.get("http_flags", ""),
+                m.get("hsts_max_age", ""), m.get("alt_svc", ""), ";".join(hflags),
                 _favhash.get(host.lower(), ["", "", ""])[0], _favhash.get(host.lower(), ["", "", ""])[1],
                 lookup_ptr(ip),
                 _hostinfo.get(host.lower(), ["", ""])[0], _hostinfo.get(host.lower(), ["", ""])[1],
+                # 1.20 (appended): redirect chain and login form; TLS version matrix; leaf certificate
+                final_url, chain, login_form,
+                tls.get("tls_supported", ""), tls.get("tls_ciphers", ""), tls.get("tls_weak_cipher", ""),
+                tls.get("cert_key", ""), tls.get("cert_sig_alg", ""), tls.get("cert_not_before", ""),
             ])
 except FileNotFoundError:
     pass
@@ -5923,7 +6547,8 @@ rows.sort(key=lambda r: (r[0], r[1]))
 # Those text cells get a leading apostrophe; generate-report.sh and recon-db.sh import
 # strip it again. Numeric and fixed-format columns are left alone.
 _GUARD_COLS = {0, 1, 2, 3, 6, 7, 8, 11, 13, 15, 18, 19, 20, 21,
-               22, 25, 26, 27, 28, 29, 30, 32, 33, 36, 37, 38}   # 1.19 text columns (not the numbers/hashes)
+               22, 25, 26, 27, 28, 29, 30, 32, 33, 36, 37, 38,   # 1.19 text columns (not the numbers/hashes)
+               39, 40, 41}                                       # 1.20: final_url, redirect_chain, login_form
 def _csv_safe(v):
     v = "" if v is None else str(v)
     return ("'" + v) if v[:1] in ("=", "+", "-", "@", "\t", "\r") else v
@@ -5937,7 +6562,9 @@ with open(out_path, "w", newline="", encoding="utf-8") as fo:
                 "ipv6", "cloud", "rdap_org", "geo", "cpe",
                 "redirect_location", "response_ms", "body_sha256", "content_type", "powered_by",
                 "auth", "cookies", "cookie_issues", "missing_sec_headers", "hsts_max_age",
-                "alt_svc", "http_flags", "favicon_mmh3", "favicon_md5", "ptr", "robots", "security_txt"])
+                "alt_svc", "http_flags", "favicon_mmh3", "favicon_md5", "ptr", "robots", "security_txt",
+                "final_url", "redirect_chain", "login_form",
+                "tls_supported", "tls_ciphers", "tls_weak_cipher", "cert_key", "cert_sig_alg", "cert_not_before"])
     w.writerows(rows)
 
 live = sum(1 for r in rows if str(r[4]).startswith(("2", "3", "401", "403")))

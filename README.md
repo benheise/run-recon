@@ -183,7 +183,10 @@ GITHUB_TOKEN=ghp_xxx run-recon -i domains.txt --github    # or supply the token 
 run-recon -i domains.txt --takeover            # CNAMEs of every candidate, dangling targets, subzy/nuclei
                                                #   -> results.csv.takeover.txt + results.csv.cname.tsv
 run-recon -i domains.txt --extras              # robots.txt (paths become URL rows), security.txt, one 404 probe,
-                                               #   favicon hashes -> robots/security_txt/favicon_* columns + results.csv.extras.txt
+                                               #   favicon hashes -> robots/security_txt/favicon_* columns + results.csv.extras.txt;
+                                               #   also follows same-host redirects to the end (final_url, login_form)
+run-recon -i domains.txt --tls-enum            # --tls + the version matrix (TLS 1.3 .. SSL 3.0) and a weak-only hello
+                                               #   -> tls_supported, tls_ciphers, tls_weak_cipher; WeakTLS / WeakCipher
 run-recon -i domains.txt --zone-exposure       # each seed's DNS zone: AXFR on every name server, NSEC walk, NSEC3
                                                #   -> results.csv.zone.txt + results.csv.zone-names.txt (names feed the scan)
 run-recon -i domains.txt --dns-posture         # SPF, DMARC, MTA-STS, TLS-RPT, CAA, dangling MX/NS, lame NS per seed + zone
@@ -227,7 +230,7 @@ NOTIFY_CONFIG=notify.yaml run-recon -i d.txt --monitor --notify      # one messa
 run-recon -i domains.txt --all                           # full discovery + defensive set (see below)
 ```
 
-`--all` enables `--subs --resolve --certs --permute --brute --ports --js --crawlers-all --takeover --zone-exposure --dns-posture --screenshots --origin --extras --active --activescan --osint --tls --ipv6 --enrich`. The remaining scanning stages (`--nuclei`, `--params`, `--secrets`, `--buckets`) and `--favicon` / `--vhost` / `--virustotal` / `--urlscan` / `--social` / `--monitor` / `--cloudlist` / `--tld-variants` / `--vulnx` stay opt-in. `--enrich` fetches the cloud IP-range feeds and makes per-IP RDAP and reverse-DNS lookups (passive, no packets to targets; PTR lookups of non-public addresses go only to resolvers you pass with `--resolvers`); `geo` still needs `--geodb`.
+`--all` enables `--subs --resolve --certs --permute --brute --ports --js --crawlers-all --takeover --zone-exposure --dns-posture --screenshots --origin --extras --active --activescan --osint --tls-enum --ipv6 --enrich`. The remaining scanning stages (`--nuclei`, `--params`, `--secrets`, `--buckets`) and `--favicon` / `--vhost` / `--virustotal` / `--urlscan` / `--social` / `--monitor` / `--cloudlist` / `--tld-variants` / `--vulnx` stay opt-in. `--enrich` fetches the cloud IP-range feeds and makes per-IP RDAP and reverse-DNS lookups (passive, no packets to targets; PTR lookups of non-public addresses go only to resolvers you pass with `--resolvers`); `geo` still needs `--geodb`.
 
 ### Pipeline (per seed domain)
 
@@ -265,7 +268,7 @@ Active stages (5–8) are skipped under `--passive-only`; enrichment (7) is skip
 | `--fuzz` | content discovery | feroxbuster/ffuf | URL rows |
 | `--vhost` | vhost bruteforce | ffuf | host rows (`vhost`) |
 | `--takeover` | dangling CNAME / takeover | dnsx (CNAMEs of every candidate) + subzy + nuclei `-tags takeover` | `.takeover.txt`, `.cname.tsv` |
-| `--extras` | robots.txt, security.txt, 404 probe, favicon hashes | httpx `-path -irrb` (one pass) | URL rows (`robots`), cols `robots`, `security_txt`, `favicon_*`, `.extras.txt` |
+| `--extras` | robots.txt, security.txt, 404 probe, favicon hashes; same-host redirect hops | httpx `-path -irrb` (one pass); the enrichment request for each hop the run did not probe (`REDIRECT_MAX`=5 deep) | URL rows (`robots`), cols `robots`, `security_txt`, `favicon_*`, `.extras.txt`; `final_url`/`login_form` past the hops |
 | `--zone-exposure` | DNS zone exposure | dig: SOA/NS, AXFR per name server, NSEC walk, NSEC3PARAM | `.zone.txt`, `.zone-names.txt`; names join the candidates |
 | `--dns-posture` | email and DNS posture | dig (SPF/DMARC/MTA-STS/TLS-RPT/CAA/MX/NS, SOA to each name server), curl (MTA-STS policy, verified TLS) | `.dnsposture.txt`, `.dnsposture.tsv` |
 | `--cloudlist [CFG]` | cloud inventory diff | cloudlist (your provider config) | `.cloud.txt`, `.cloud-assets.tsv` |
@@ -273,8 +276,8 @@ Active stages (5–8) are skipped under `--passive-only`; enrichment (7) is skip
 | `--vulnx` | product advisories | vulnx (ProjectDiscovery's CVE API; `PDCP_API_KEY` optional) | `.vulnx.txt`, `.vulnx.tsv` |
 | `--screenshots` | visual triage | httpx -ss (browser routed like httpx) / gowitness | `screenshots-<ts>/`, `.screenshots.tsv` (status per host) |
 | `--origin` | edge detection + origin search | httpx (headers, body hash, favicon), tlsx -jarm, cdncheck, dnsx (A+AAAA), dig (SPF/MX), curl `--resolve` | `.origin.txt` (verified, and protected origins), `.edge.tsv` |
-| `--tls` | TLS posture | tlsx + chain validation (Python `ssl`, system trust store) | CSV cols `tls_version`..`tls_flags` (joined to https rows) |
-| `--tls-full` | TLS + version/cipher enum | tlsx -version-enum -cipher-enum | adds `WeakTLS`/`WeakCipher` (noisier) |
+| `--tls` | TLS posture | tlsx (`-cert`: the leaf certificate) + chain validation (Python `ssl`, system trust store) | CSV cols `tls_version`..`tls_flags`, `cert_key`, `cert_sig_alg`, `cert_not_before` (joined to https rows) |
+| `--tls-enum` (`--tls-full`) | TLS + version matrix + weak-cipher probe | run-recon's own ClientHellos, stopped at the ServerHello (WebInventory's plan: 6 per https host) | cols `tls_supported`, `tls_ciphers`, `tls_weak_cipher`; `WeakTLS` / `WeakCipher` |
 | `--ipv6` | AAAA resolution | dnsx -aaaa | CSV col `ipv6` (`;`-joined v6 addrs per host) |
 | `--enrich` | per-IP attribution | cloud IP-range feeds + RDAP + reverse DNS + MaxMind | CSV cols `cloud`, `rdap_org`, `ptr`, `geo` |
 | `--geodb PATH` | geo country source | mmdblookup (libmaxminddb) | sets `geo`; implies `--enrich` |
@@ -311,10 +314,10 @@ Active stages (5–8) are skipped under `--passive-only`; enrichment (7) is skip
 | `asn` | origin ASN of that IP, e.g. `AS15133` (Team Cymru; free, no key) |
 | `asn_org` | ASN owner/org, e.g. `EDGECAST, US` or `AMAZON-02, US` |
 | `tls_version` | negotiated TLS version (`--tls`), e.g. `TLS 1.3`; blank for http / non-TLS |
-| `tls_cipher` | negotiated cipher (or the weak ciphers found with `--tls-full`) |
+| `tls_cipher` | negotiated cipher |
 | `cert_not_after` | leaf certificate expiry (ISO 8601) |
 | `cert_issuer` | certificate issuer org/CN |
-| `tls_flags` | `;`-joined hygiene flags: `WeakTLS`, `WeakCipher`, `CertExpired`, `CertExpiring` (≤30 days, `CERT_WARN_DAYS`), `SelfSigned`, `CertNameMismatch`, `CertUntrusted` (the chain does not verify against the system trust store, or tlsx's list of bad CAs; `TLS_CHAIN_CHECK=0` turns the chain check off), `CertRevoked`, `Wildcard` |
+| `tls_flags` | `;`-joined hygiene flags: `WeakTLS` (SSL 3.0, TLS 1.0 or 1.1 negotiated, or accepted with `--tls-enum`), `WeakCipher` (a NULL/EXPORT/anon/RC4/DES/3DES/RC2 suite negotiated, or accepted by the weak-only hello), `WeakKey` (RSA/DSA under 2048 bits, EC under 224), `WeakSig` (MD2/MD5/SHA-1 signature), `CertExpired`, `CertNotYetValid`, `CertExpiring` (≤30 days, `CERT_WARN_DAYS`), `SelfSigned`, `DefaultCert` (a vendor's or OpenSSL's placeholder: Splunk, Nessus, pfSense, VMware installer, `O=Internet Widgits Pty Ltd`, mod_ssl's `SomeOrganization`, ingress-nginx's fake certificate, Traefik's default), `CertNameMismatch`, `CertUntrusted` (the chain does not verify against the system trust store, or tlsx's list of bad CAs; `TLS_CHAIN_CHECK=0` turns the chain check off), `CertRevoked`, `Wildcard` |
 | `ipv6` | AAAA records for the host (`--ipv6`), `;`-joined; blank if none / not resolved |
 | `cloud` | cloud provider owning the IP (`--enrich`), by longest-prefix match against the published ranges: `AWS`, `GCP`, `Azure`, `Cloudflare`, `OracleCloud`, `DigitalOcean` |
 | `rdap_org` | network/registrant org for the IP from RDAP (`--enrich`), e.g. `AMAZON-AES` |
@@ -325,17 +328,26 @@ Active stages (5–8) are skipped under `--passive-only`; enrichment (7) is skip
 | `body_sha256` | SHA-256 of the response body |
 | `content_type` | media type of the response, e.g. `text/html` |
 | `powered_by` | `X-Powered-By` header, e.g. `PHP/8.2.17` |
-| `auth` | `WWW-Authenticate` scheme and realm, e.g. `Basic realm="Legacy VPN"` |
+| `auth` | `WWW-Authenticate` scheme and realm, e.g. `Basic realm="Legacy VPN"`; `Form` when the page the URL ends on has a password field |
 | `cookies` | names of the cookies the response sets (`;`-joined; values are never stored) |
 | `cookie_issues` | cookies without `Secure` or `HttpOnly`, e.g. `wordpress_test_cookie:no-HttpOnly` |
 | `missing_sec_headers` | for HTML responses: which of `Content-Security-Policy`, `X-Frame-Options` (satisfied by CSP `frame-ancestors`), `X-Content-Type-Options` and, on HTTPS, `Strict-Transport-Security` are absent |
 | `hsts_max_age` | `max-age` of the HSTS header (HTTPS only) |
 | `alt_svc` | `Alt-Svc` header (e.g. HTTP/3 advertised) |
-| `http_flags` | `CleartextAuth` (Basic/Digest over plain HTTP), `PlainHttp` (an HTML page served on plain HTTP without a redirect) |
+| `http_flags` | `CleartextAuth` (Basic/Digest over plain HTTP, or a password form on a plain-HTTP page or posting to `http://`), `PlainHttp` (an HTML page served on plain HTTP without a redirect) |
 | `favicon_mmh3`, `favicon_md5` | the host's favicon hashes, Shodan-compatible mmh3 and MD5 (`--extras`, `--favicon` or `--origin`) |
 | `ptr` | reverse DNS of `ip` (`--enrich`) |
 | `robots` | robots.txt summary, e.g. `200 disallow=2 allow=0 sitemap=1` (`--extras`) |
 | `security_txt` | `present contact=… expires=…`, `expired …`, `missing` (`--extras`) |
+| `final_url` | for a redirect: the last URL of its chain that answered (1.20; columns from here on are appended in 1.20) |
+| `redirect_chain` | each hop as `code->absolute URL`, joined ` \| `, e.g. `301->https://ex.com/ \| 302->https://ex.com/login`. Hops on the same host are followed (up to `REDIRECT_MAX`=5) through the URLs the run probed, and with `--extras` through the ones it did not; a hop to another host is listed, never followed |
+| `login_form` | the absolute target of the password form on the page the URL ends on (the page itself for a form without `action`); from the enrichment request's body (httpx `-er`), no extra request |
+| `tls_supported` | versions the server accepted, one short handshake each (`--tls-enum`), e.g. `TLS 1.3;TLS 1.2` |
+| `tls_ciphers` | the suite the server chose for each of those versions, e.g. `TLS 1.3=TLS_AES_128_GCM_SHA256;TLS 1.2=…` |
+| `tls_weak_cipher` | `version:suite` when a hello offering only weak suites was accepted, e.g. `TLS 1.2:TLS_RSA_WITH_NULL_SHA` |
+| `cert_key` | leaf certificate key, e.g. `RSA 2048`, `EC P-256`, `Ed25519` (`--tls`) |
+| `cert_sig_alg` | its signature algorithm, e.g. `sha256WithRSAEncryption`, `ecdsa-with-SHA256` |
+| `cert_not_before` | its start of validity (ISO 8601) |
 
 The `tls_*` columns are populated only for `https` rows when `--tls` is on (tlsx is matched to the row by
 `host:port`, default 443). They mirror WebInventory's TLS posture flags, and the HTML report surfaces each
@@ -877,9 +889,13 @@ these CPEs can't confirm), and `product-only` (the service exposed no version; l
 compare including the CPE update field (`9.3:p1` matches a service reporting `9.3p1`),
 `versionStart*/End*` ranges, pre-release ordering (`1.0rc1` < `1.0`), and `2.4` == `2.4.0`;
 when a CVE appears in both a yearly feed and the modified feed, the **newest record
-wins**, and Rejected CVEs are skipped. A `.provenance.json` sidecar records each feed's
-file name, SHA-256 and record count, the KEV catalog version and the EPSS model
-version and score date, so a report ties back to exactly the data behind it. These are
+wins**, and Rejected CVEs are skipped. NVD files some products under several names
+(Jira as `jira`, `jira_server`, `jira_data_center`...; Varnish Cache under three vendor
+strings): `cpe-aliases.json`, next to `recon-db.sh`, holds WebInventory's 184 curated
+groups, and a CVE filed under any name of a group joins the services carrying another
+(1.20; `CPE_ALIASES_FILE=` turns it off, `CPE_ALIASES_FILE=path` uses your own file). A `.provenance.json` sidecar records each feed's
+file name, SHA-256 and record count, the KEV catalog version, the EPSS model
+version and score date, and the alias file's SHA-256 and version, so a report ties back to exactly the data behind it. These are
 **banner-derived** matches — a distro that backports a fix keeps the upstream version
 string — so treat the output as a prioritized worklist, confirmed with an authenticated
 scanner (Qualys/Tenable), not as proof of exposure.

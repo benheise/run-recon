@@ -178,7 +178,10 @@ def new_host(seed=""):
             "tls_flags": set(), "tls_version": "", "tls_cipher": "", "seed": seed, "findings": [],
             "title": "", "_tlen": 10 ** 9, "webserver": "", "ipv6": set(), "cert_not_after": "",
             "cert_issuer": "", "cpe": set(), "cloud": "", "rdap_org": "", "geo": "", "in_csv": True,
-            "http_root": {}, "_hrk": (9, 9, 10 ** 9), "hflags": {}, "cookie_issues": set(), "auths": set()}
+            "http_root": {}, "_hrk": (9, 9, 10 ** 9), "hflags": {}, "cookie_issues": set(), "auths": set(),
+            # run-recon 1.20: the TLS version matrix, the leaf certificate, login forms
+            "tls_supported": "", "tls_weak_cipher": "", "cert_key": "", "cert_sig_alg": "",
+            "cert_not_before": "", "logins": {}}
 # 1.19 HTTP columns that describe the site: taken from its root row (https preferred)
 HTTP_HOST_COLS = ("content_type", "missing_sec_headers", "hsts_max_age", "alt_svc", "powered_by",
                   "favicon_mmh3", "favicon_md5", "ptr", "robots", "security_txt")
@@ -208,8 +211,11 @@ try:
             if row.get("title") and len(u) < d["_tlen"]:
                 d["title"], d["_tlen"] = row["title"], len(u)
             for k in ("webserver", "tls_version", "tls_cipher", "cert_not_after", "cert_issuer",
-                      "cloud", "rdap_org", "geo"):
+                      "cloud", "rdap_org", "geo", "tls_supported", "tls_weak_cipher", "cert_key",
+                      "cert_sig_alg", "cert_not_before"):
                 if row.get(k): d[k] = row[k]
+            if row.get("login_form"):     # the page the row ends on (after its redirects) -> form target
+                d["logins"][u] = (row.get("final_url") or u, row["login_form"])
             for fl in (row.get("tls_flags") or "").split(";"):
                 fl = fl.strip()
                 if fl: d["tls_flags"].add(fl)
@@ -327,11 +333,32 @@ for kind in ["nuclei", "activescan", "takeover", "secrets", "buckets", "zone", "
 
 # --- TLS posture (from the CSV) as findings, expiry graded by days left -----------
 TLS_FLAG_SEV = {"WeakCipher": "high", "CertRevoked": "high", "CertUntrusted": "medium",
-                "WeakTLS": "medium", "SelfSigned": "medium", "CertNameMismatch": "medium"}
+                "WeakTLS": "medium", "SelfSigned": "medium", "CertNameMismatch": "medium",
+                "WeakKey": "medium", "WeakSig": "medium", "CertNotYetValid": "medium", "DefaultCert": "medium"}
 TLS_FLAG_DESC = {"WeakTLS": "obsolete TLS version supported (< TLS 1.2)", "WeakCipher": "weak cipher offered",
                  "SelfSigned": "self-signed certificate", "CertNameMismatch": "certificate name mismatch",
                  "CertUntrusted": "certificate chain not trusted by the system trust store",
-                 "CertRevoked": "revoked certificate"}
+                 "CertRevoked": "revoked certificate", "WeakKey": "weak certificate key",
+                 "WeakSig": "weak certificate signature", "CertNotYetValid": "certificate not valid yet",
+                 "DefaultCert": "a vendor's or OpenSSL's default certificate is still in place"}
+_OLD_VERSIONS = ("SSL 3.0", "TLS 1.0", "TLS 1.1")
+def tls_flag_text(fl, d):
+    # the flag's description with the detail run-recon 1.20 records (blank in older CSVs)
+    desc, ver = TLS_FLAG_DESC.get(fl, fl), d.get("tls_version") or "TLS"
+    sup = [v for v in (d.get("tls_supported") or "").split(";") if v in _OLD_VERSIONS]
+    if fl == "WeakTLS" and sup:
+        return "obsolete protocol versions accepted: " + ", ".join(sup)
+    if fl == "WeakCipher" and d.get("tls_weak_cipher"):
+        v, _, s = d["tls_weak_cipher"].partition(":")
+        return "weak cipher accepted: %s (%s)" % (s or v, v if s else ver)
+    if fl == "WeakKey" and d.get("cert_key"):
+        return "%s (%s)" % (desc, d["cert_key"])
+    if fl == "WeakSig" and d.get("cert_sig_alg"):
+        return "%s (%s)" % (desc, d["cert_sig_alg"])
+    if fl == "CertNotYetValid" and d.get("cert_not_before"):
+        dt = parse_dt(d["cert_not_before"])
+        return "%s (valid from %s)" % (desc, dt.strftime("%Y-%m-%d %H:%M UTC") if dt else d["cert_not_before"])
+    return "%s (%s)" % (desc, ver)
 def days_left(d):
     dt = parse_dt(d.get("cert_not_after"))
     return None if dt is None else (dt - ref_time).total_seconds() / 86400.0
@@ -352,8 +379,10 @@ for _h, _d in hosts.items():
         if _fl in ("CertExpiring", "CertExpired", "Wildcard"):
             continue   # expiry is graded below; a wildcard certificate is an attribute
         _sev = TLS_FLAG_SEV.get(_fl, "info")
+        if _fl == "WeakTLS" and "SSL 3.0" in (_d.get("tls_supported") or "").split(";"):
+            _sev = "high"            # SSL 3.0 (POODLE): WebInventory grades WeakTLS:SSL3 critical too
         _f = {"kind": "tls", "sev": _sev, "host": _h, "seed": _d.get("seed", ""),
-              "text": "%s (%s)" % (TLS_FLAG_DESC.get(_fl, _fl), _d.get("tls_version") or "TLS")}
+              "text": tls_flag_text(_fl, _d)}
         findings.append(_f); _d["findings"].append(_f)
         sev_counts[_sev] = sev_counts.get(_sev, 0) + 1
         kind_counts["tls"] = kind_counts.get("tls", 0) + 1
@@ -379,9 +408,16 @@ def _add(kind, sev, h, d, text):
     sev_counts[sev] = sev_counts.get(sev, 0) + 1
     kind_counts[kind] = kind_counts.get(kind, 0) + 1
 for _h, _d in hosts.items():
+    _forms = set()
     for _u in sorted(_d["hflags"].get("CleartextAuth", ())):
+        if _u in _d["logins"]:
+            _forms.add(_d["logins"][_u])   # one finding per (login page, form target)
+            continue
         _realm = next((a for (uu, a) in sorted(_d["auths"]) if uu == _u), "basic auth")
         _add("http", "medium", _h, _d, "credentials sent in cleartext: %s on %s (use HTTPS)" % (_realm, _u))
+    for _page, _tgt in sorted(_forms):
+        _add("http", "medium", _h, _d, "login form sends the password in cleartext: %s posts to %s (use HTTPS)"
+             % (_page, _tgt))
     _pl = sorted(_d["hflags"].get("PlainHttp", ()))
     if _pl:
         _add("http", "low", _h, _d, "served over plain HTTP without a redirect to HTTPS: %s%s"
@@ -906,6 +942,8 @@ for h in card_names:
             et = expiry_text(d) or ("expires " + d["cert_not_after"])
             tl += f' &middot; <span class="{"pill bad" if dl is not None and dl < 30 else ""}">{esc(et)}</span>'
         if "Wildcard" in d["tls_flags"]: tl += " &middot; wildcard"
+        if d.get("cert_key"): tl += " &middot; " + esc(d["cert_key"])
+        if d.get("tls_supported"): tl += " &middot; accepts " + esc(d["tls_supported"].replace(";", ", "))
         meta2.append(f'<span>TLS <b>{tl}</b></span>')
     if e.get("cname"):
         hops = " &rarr; ".join(esc(x) for x in [h] + [y for y in e["cname"].split(">") if y])

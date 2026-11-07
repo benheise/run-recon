@@ -35,7 +35,12 @@
 #                          origin-exposed at LAB_ORIGIN_IP; spa.test origin-protected at
 #                          LAB_PROTECTED_IP; wp.test not reported)
 #   http                   HTTP detail (1.19): security headers, HSTS, cookies, cleartext auth,
-#                          robots.txt / security.txt / 404 probe (--extras), favicon, PTR (--enrich)
+#                          robots.txt / security.txt / 404 probe (--extras), favicon, PTR (--enrich);
+#                          1.20: redirect chains (same-host hops followed, off-host listed) and
+#                          login forms (CleartextAuth for a form posting to http://)
+#   tls                    --tls-enum against the TLS fixtures (legacy: TLS 1.0-1.2, a NULL suite,
+#                          RSA 1024/SHA-1; future: not yet valid; default: OpenSSL's default subject;
+#                          modern: the control), cross-checked with tlsx per version and openssl
 #   posture                --dns-posture against posture.test (permissive SPF, DMARC p=none,
 #                          MTA-STS testing, dangling MX and NS, a lame NS) and the clean
 #                          good.posture.test; --cloudlist against a lab Terraform state
@@ -48,7 +53,7 @@
 #   resume                 SIGTERM after two seeds, then --resume: the CSV must equal an uninterrupted run
 #   history                --monitor's field-by-field delta and recon-db.sh history/changes across two runs
 #                          with the spa backend stopped in between (the store too, with RECON_DB_DSN)
-#   checks                 takeover + zone + origin + http + posture + discovery + scope + resume + history;
+#   checks                 takeover + zone + origin + http + tls + posture + discovery + scope + resume + history;
 #                          non-zero if any fails
 #   help
 #
@@ -74,6 +79,12 @@ LAB_PROTECTED_IP="${LAB_PROTECTED_IP:-127.0.0.6}"
 # BIND, authoritative for the NSEC3-signed nsec3.test (CoreDNS's file plugin cannot serve
 # NSEC3): ns.nsec3.test answers on this address, CoreDNS forwards the zone to it
 LAB_NSEC3_IP="${LAB_NSEC3_IP:-127.0.0.7}"
+# TLS-posture fixtures (lab/tls-nginx.conf): one loopback address per fixture
+LAB_TLS_LEGACY_IP="${LAB_TLS_LEGACY_IP:-127.0.0.9}"
+LAB_TLS_FUTURE_IP="${LAB_TLS_FUTURE_IP:-127.0.0.10}"
+LAB_TLS_DEFAULT_IP="${LAB_TLS_DEFAULT_IP:-127.0.0.11}"
+LAB_TLS_MODERN_IP="${LAB_TLS_MODERN_IP:-127.0.0.12}"
+LAB_IP_VARS="LAB_DNS_IP LAB_ORIGIN_IP LAB_PROTECTED_IP LAB_NSEC3_IP LAB_TLS_LEGACY_IP LAB_TLS_FUTURE_IP LAB_TLS_DEFAULT_IP LAB_TLS_MODERN_IP"
 LAB_HOSTS="nginx.test wp.test spa.test ci.test"
 FARM_N_DEFAULT=50
 FARM_BACKENDS=(nginx wordpress spa jenkins)
@@ -109,9 +120,12 @@ gen_lab(){ # <farm_n>
     printf '</script></body></html>\n'
   } > "$LAB/spa/index.html"
   local _v
-  for _v in LAB_DNS_IP LAB_ORIGIN_IP LAB_PROTECTED_IP LAB_NSEC3_IP; do
+  for _v in $LAB_IP_VARS; do
     case "${!_v}" in 127.*) ;; *) die "$_v must be a loopback (127.0.0.0/8) address: ${!_v}";; esac
   done
+  # TLS-posture fixture certificates (lab/gen-tls-certs.py -> lab/tls/)
+  python3 -I "$LAB/gen-tls-certs.py" "$LAB/tls" >/dev/null || die "could not make the TLS fixture certificates (python3-cryptography and openssl are needed)"
+  printf 'legacy.tls.test\nfuture.tls.test\ndefault.tls.test\nmodern.tls.test\n' > "$LAB/targets-tls.txt"
   printf '%s\n' "$LAB_DNS_IP" > "$RESOLVERS_FILE"
   : > "$LAB/farm.caddy"; : > "$LAB/targets-farm.txt"
   printf 'host,status,technologies,cpe,tls_flags,ipv6,min_urls\n' > "$LAB/expected-farm.csv"
@@ -161,6 +175,10 @@ gen_lab(){ # <farm_n>
     # discovery fixtures: a name only alterx's permutations guess (--permute) and one only
     # the lab wordlist holds (--brute)
     printf 'grafana.nginx.test. IN A 127.0.0.1\nbackup-db.nginx.test. IN A 127.0.0.1\n'
+    # redirect / login-form fixtures (Caddyfile) and the TLS-posture fixtures (tls-nginx.conf)
+    printf 'redir.test. IN A 127.0.0.1\nplainlogin.redir.test. IN A 127.0.0.1\n'
+    printf 'legacy.tls.test. IN A %s\nfuture.tls.test. IN A %s\ndefault.tls.test. IN A %s\nmodern.tls.test. IN A %s\n' \
+      "$LAB_TLS_LEGACY_IP" "$LAB_TLS_FUTURE_IP" "$LAB_TLS_DEFAULT_IP" "$LAB_TLS_MODERN_IP"
   } > "$LAB/db.test"
   printf 'www\nbackup-db\nnot-there-1\nnot-there-2\n' > "$LAB/brute-wordlist.txt"
   printf 'nginx.test\n' > "$LAB/targets-discovery.txt"
@@ -230,7 +248,7 @@ gen_lab(){ # <farm_n>
   } > "$LAB/db.127"
   # HTTP-detail check (bench-run-recon.sh http): the four sites, the cleartext-auth VPN and a
   # catch-all name from the walk.test zone
-  printf 'nginx.test\nspa.test\nwp.test\nci.test\nvpn-legacy.walk.test\nwww.walk.test\n' > "$LAB/targets-http.txt"
+  printf 'nginx.test\nspa.test\nwp.test\nci.test\nvpn-legacy.walk.test\nwww.walk.test\nredir.test\nplainlogin.redir.test\n' > "$LAB/targets-http.txt"
   log "generated: SPA (120 KB), farm of $n vhosts, zones db.test db.walk.test db.xfr.test db.nsec3.test db.posture.test db.127, targets and ground truth"
 }
 
@@ -295,9 +313,13 @@ cmd_up(){
   have docker || die "docker not found. Install Docker + compose, then re-run on your lab host."
   gen_lab "$farm"
   log "starting the range (lab DNS on $LAB_DNS_IP:53, exposed origin on $LAB_ORIGIN_IP:80, protected origin on $LAB_PROTECTED_IP:80, BIND on $LAB_NSEC3_IP:53)..."
-  export LAB_DNS_IP LAB_ORIGIN_IP LAB_PROTECTED_IP LAB_NSEC3_IP
+  # shellcheck disable=SC2086,SC2163  # the names in LAB_IP_VARS, one word each
+  export $LAB_IP_VARS
   compose -f "$COMPOSE_FILE" up -d \
     || die "compose up failed (if $LAB_DNS_IP:53 is in use, retry with LAB_DNS_IP=127.0.0.2)"
+  # nginx reads its certificates at start: serve the ones gen_lab just made (future.tls.test is
+  # "not yet valid" relative to them)
+  compose -f "$COMPOSE_FILE" restart tlslab >/dev/null 2>&1 || log "could not restart tlslab (the TLS fixtures may serve older certificates)"
   if ! grep -q 'nginx\.test' /etc/hosts 2>/dev/null; then
     log "add the lab names to /etc/hosts:   sudo sh -c '$0 hosts >> /etc/hosts'"
     log "(lab DNS on $LAB_DNS_IP serves them too; /etc/hosts covers tools that use the system resolver)"
@@ -306,9 +328,13 @@ cmd_up(){
   log "then:  $0 bench --runs 3            (lab accuracy)"
   log "       $0 bench --runs 3 --farm     (farm load)"
 }
-cmd_down(){ export LAB_DNS_IP LAB_ORIGIN_IP LAB_PROTECTED_IP LAB_NSEC3_IP; compose -f "$COMPOSE_FILE" down -v 2>/dev/null; log "range down."; }
+# shellcheck disable=SC2086,SC2163  # the names in LAB_IP_VARS, one word each
+cmd_down(){ export $LAB_IP_VARS; compose -f "$COMPOSE_FILE" down -v 2>/dev/null; log "range down."; }
 cmd_hosts(){
   printf '127.0.0.1 %s\n' "$LAB_HOSTS"
+  printf '127.0.0.1 redir.test plainlogin.redir.test\n'
+  printf '%s legacy.tls.test\n%s future.tls.test\n%s default.tls.test\n%s modern.tls.test\n' \
+    "$LAB_TLS_LEGACY_IP" "$LAB_TLS_FUTURE_IP" "$LAB_TLS_DEFAULT_IP" "$LAB_TLS_MODERN_IP"
   [ -f "$LAB/targets-farm.txt" ] && while IFS= read -r h; do [ -n "$h" ] && printf '127.0.0.1 %s\n' "$h"; done < "$LAB/targets-farm.txt"
 }
 
@@ -370,7 +396,7 @@ import sys, os, csv, re
 a_path, b_path = sys.argv[1], sys.argv[2]
 EXACT = os.environ.get("BENCH_EXACT", "0") == "1"
 # columns that legitimately differ run-to-run and are excluded from --exact
-VOLATILE = {"cert_not_after", "response_ms"}
+VOLATILE = {"cert_not_after", "cert_not_before", "response_ms"}
 
 def rows(path):
     with open(path, newline="", encoding="utf-8", errors="replace") as fh:
@@ -645,7 +671,8 @@ cmd_posture(){
   [ -s "$LAB/targets-posture.txt" ] || die "no lab/targets-posture.txt (run: $0 up)"
   local t; t="$(mktemp -d /tmp/bench-posture.XXXXXX)"
   # MTA-STS policies are fetched with certificate checks; the lab's are issued by Caddy's local CA
-  export LAB_DNS_IP LAB_ORIGIN_IP LAB_PROTECTED_IP LAB_NSEC3_IP
+  # shellcheck disable=SC2086,SC2163
+  export $LAB_IP_VARS
   compose -f "$COMPOSE_FILE" exec -T ingress cat /data/caddy/pki/authorities/local/root.crt > "$t/caddy-root.crt" 2>/dev/null
   [ -s "$t/caddy-root.crt" ] || die "could not read the ingress's local CA (is the lab up?)"
   local cl=(); if have cloudlist; then cl=(--cloudlist "$LAB/cloudlist.yaml"); else log "  skip cloudlist not installed: no cloud inventory check"; fi
@@ -777,6 +804,18 @@ ck(re.search(r"catch-all-200 \[info\] host=www\.walk\.test", extras) is not None
 ck(row("https://ci.test").get("favicon_mmh3") == "81586312", "ci.test: Jenkins favicon mmh3 81586312")
 ck(any("wordpress_test_cookie" in r.get("cookie_issues", "") for r in rows), "wp.test: wordpress_test_cookie flag gaps")
 ck(n.get("ptr") == "ingress.lab.test", "PTR of 127.0.0.1 from the lab's reverse zone (--enrich, your resolver)")
+# 1.20: redirect chains and login forms (Caddyfile: redir.test, plainlogin.redir.test)
+rr, ro, rs, pl = row("https://redir.test"), row("https://redir.test/old"), row("http://redir.test/session"), row("http://plainlogin.redir.test")
+ck(rr.get("final_url") == "https://redir.test/login" and rr.get("redirect_chain") == "302->https://redir.test/login",
+   "redir.test: 302 to /login followed (a hop --extras fetched): final_url and redirect_chain")
+ck(rr.get("login_form") == "http://redir.test/session" and "CleartextAuth" in rr.get("http_flags", "") and "Form" in rr.get("auth", ""),
+   "redir.test: the login page's form posts to http:// -> login_form, Form, CleartextAuth on an HTTPS row")
+ck(ro.get("redirect_chain") == "301->https://elsewhere.test/" and ro.get("final_url") == "https://redir.test/old",
+   "redir.test/old: the off-host hop is listed, not followed")
+ck(rs.get("redirect_chain") == "301->https://redir.test/session" and rs.get("final_url") == "https://redir.test/session",
+   "http://redir.test/session (found in the form's action by the crawl): http:// -> https:// followed")
+ck(pl.get("login_form") == "http://plainlogin.redir.test/login" and pl.get("http_flags") == "PlainHttp;CleartextAuth",
+   "plainlogin.redir.test: a password form on a plain-HTTP page -> CleartextAuth")
 sys.exit(1 if fails else 0)
 PYHTTP
   local rc=$?
@@ -917,18 +956,91 @@ cmd_history(){
   return "$fail"
 }
 
+# tls: --tls-enum against the TLS fixtures (run-recon 1.20, lab/tls-nginx.conf). Each fixture's
+# flags and columns, the version matrix cross-checked against tlsx's own per-version handshakes
+# (-min-version/-max-version), and the NULL-suite acceptance against the container's openssl.
+cmd_tls(){
+  lab_env
+  [ -f "$RUN_RECON" ] || die "run-recon not found at $RUN_RECON"
+  [ -s "$LAB/targets-tls.txt" ] || die "no lab/targets-tls.txt (run: $0 up)"
+  local t v fail=0; t="$(mktemp -d /tmp/bench-tls.XXXXXX)"
+  log "TLS posture check (--tls-enum) against lab/targets-tls.txt -> $t"
+  ( cd "$t" && bash "$RUN_RECON" -i "$LAB/targets-tls.txt" -o "$t/t.csv" \
+      --resolvers "$RESOLVERS_FILE" --tls-enum --no-report >"$t/run.out" 2>"$t/run.err" ) || true
+  # an independent reading of the matrix: one tlsx run per version with Go's TLS stack (-sm ctls:
+  # tlsx 1.4.0's default "auto" mode hung for minutes on the fixtures that refuse the version)
+  if command -v tlsx >/dev/null 2>&1; then
+    for v in tls10 tls11 tls12 tls13; do
+      timeout 120 tlsx -l "$LAB/targets-tls.txt" -json -silent -tls-version -sm ctls -min-version "$v" -max-version "$v" -timeout 10 \
+        2>/dev/null | python3 -I -c 'import sys, json; [print(json.loads(l)["host"] + "\t" + sys.argv[1]) for l in sys.stdin if l.strip()]' "$v" >> "$t/tlsx-versions.tsv"
+    done
+  fi
+  # the container's own OpenSSL: does legacy.tls.test accept NULL-SHA when it is all that is offered?
+  docker exec lab-tlslab-1 sh -c 'echo | openssl s_client -connect 127.0.0.1:4431 -servername legacy.tls.test -tls1_2 -cipher "NULL-SHA:@SECLEVEL=0" 2>/dev/null' \
+    > "$t/openssl-null.txt" 2>&1 || true
+  python3 -I - "$t/t.csv" "$t/tlsx-versions.tsv" "$t/openssl-null.txt" <<'PYTLS' || fail=1
+import sys, csv
+csv_f, tv_f, null_f = sys.argv[1:4]
+try:
+    rows = {r["host"]: r for r in csv.DictReader(open(csv_f, newline="", encoding="utf-8")) if r.get("tls_version")}
+except OSError:
+    rows = {}
+fails = 0
+def ck(ok, msg):
+    global fails
+    print("[bench]   %s %s" % ("ok  " if ok else "FAIL", msg))
+    fails += 0 if ok else 1
+def fl(h):
+    return set((rows.get(h, {}).get("tls_flags") or "").split(";")) - {""}
+L, F, D, M = (rows.get(h + ".tls.test", {}) for h in ("legacy", "future", "default", "modern"))
+ck(L.get("tls_supported") == "TLS 1.2;TLS 1.1;TLS 1.0" and M.get("tls_supported") == "TLS 1.3;TLS 1.2",
+   "version matrix: legacy TLS 1.2/1.1/1.0, modern TLS 1.3/1.2")
+ck(L.get("tls_weak_cipher") == "TLS 1.2:TLS_RSA_WITH_NULL_SHA" and not M.get("tls_weak_cipher"),
+   "weak-only hello: legacy accepts TLS_RSA_WITH_NULL_SHA, modern accepts none")
+ck({"WeakTLS", "WeakCipher", "WeakKey", "WeakSig", "SelfSigned", "CertUntrusted"} <= fl("legacy.tls.test"),
+   "legacy: WeakTLS, WeakCipher, WeakKey, WeakSig, SelfSigned, CertUntrusted (the chain check's level-0 retry)")
+ck(L.get("cert_key") == "RSA 1024" and L.get("cert_sig_alg") == "sha1WithRSAEncryption", "legacy: cert_key RSA 1024, cert_sig_alg sha1WithRSAEncryption")
+ck("CertNotYetValid" in fl("future.tls.test") and "CertExpired" not in fl("future.tls.test"), "future: CertNotYetValid (not CertExpired)")
+ck("DefaultCert" in fl("default.tls.test") and D.get("cert_key") == "RSA 2048", "default: DefaultCert (O=Internet Widgits Pty Ltd), RSA 2048")
+ck(not (fl("modern.tls.test") & {"WeakTLS", "WeakCipher", "WeakKey", "WeakSig", "DefaultCert", "CertNotYetValid", "CertExpired"})
+   and M.get("cert_key") == "EC P-256", "modern (the control): none of those flags, EC P-256")
+# tlsx's per-version handshakes agree with the matrix
+tv = {}
+try:
+    for line in open(tv_f, encoding="utf-8"):
+        h, v = line.rstrip("\n").split("\t")
+        tv.setdefault(h, set()).add({"tls10": "TLS 1.0", "tls11": "TLS 1.1", "tls12": "TLS 1.2", "tls13": "TLS 1.3"}[v])
+except (OSError, ValueError, KeyError):
+    tv = {}
+if tv:
+    same = all(tv.get(h, set()) == set((r.get("tls_supported") or "").split(";")) - {""} for h, r in rows.items())
+    ck(same, "tlsx -min-version/-max-version per version agrees with tls_supported on every fixture")
+else:
+    print("[bench]   skip tlsx cross-check (tlsx not found)")
+try:
+    null = open(null_f, encoding="utf-8", errors="replace").read()
+except OSError:
+    null = ""
+ck("Cipher is NULL-SHA" in null, "the container's openssl: legacy.tls.test negotiates NULL-SHA when only it is offered")
+sys.exit(1 if fails else 0)
+PYTLS
+  [ "$fail" = 0 ] && log "tls check: PASS" || log "tls check: FAIL (see $t/run.err)"
+  return "$fail"
+}
+
 cmd_checks(){
   local rc=0
   cmd_takeover || rc=1
   cmd_zone || rc=1
   cmd_origin || rc=1
   cmd_http || rc=1
+  cmd_tls || rc=1
   cmd_posture || rc=1
   cmd_discovery || rc=1
   cmd_scope || rc=1
   cmd_resume || rc=1
   cmd_history || rc=1
-  [ "$rc" = 0 ] && log "lab checks: PASS (takeover, zone, origin, http, posture, discovery, scope, resume, history)" || log "lab checks: FAIL"
+  [ "$rc" = 0 ] && log "lab checks: PASS (takeover, zone, origin, http, tls, posture, discovery, scope, resume, history)" || log "lab checks: FAIL"
   return "$rc"
 }
 
@@ -943,6 +1055,7 @@ case "${1:-help}" in
   zone)     cmd_zone;;
   origin)   cmd_origin;;
   http)     cmd_http;;
+  tls)      cmd_tls;;
   checks)   cmd_checks;;
   down)     cmd_down;;
   hosts)    cmd_hosts;;
@@ -950,5 +1063,5 @@ case "${1:-help}" in
   compare)  shift; cmd_compare "$@";;
   bench)    shift; cmd_bench "$@";;
   help|-h|--help) awk 'NR > 1 && !/^#/ { exit } NR > 1 && !/^# ?=+$/' "$0" | sed 's/^# \{0,1\}//';;
-  *) die "unknown command: ${1:-} (try: up|down|hosts|run|compare|bench|takeover|zone|origin|http|posture|discovery|scope|resume|history|checks)";;
+  *) die "unknown command: ${1:-} (try: up|down|hosts|run|compare|bench|takeover|zone|origin|http|tls|posture|discovery|scope|resume|history|checks)";;
 esac
