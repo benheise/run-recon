@@ -30,6 +30,10 @@ control; never point the scanner anywhere else.
 | `db.walk.test`, `db.walk.test.signed` | `walk.test.`, DNSSEC-signed with NSEC by `ldns-signzone` (throwaway keys in `dnssec/`) |
 | `db.xfr.test` | `xfr.test.`, unsigned, zone transfers allowed to anyone |
 | `db.nsec3.test`, `db.nsec3.test.signed` | `nsec3.test.`, signed with NSEC3 (1 0 5 1A2B3C4D) by `ldns-signzone -n`, served by BIND |
+| `db.posture.test` | `posture.test.` and `good.posture.test`: the email/DNS posture fixtures |
+| `cloud.tfstate`, `cloudlist.yaml` | a Terraform state and the cloudlist provider config that reads it (offline) |
+| `brute-wordlist.txt` | the `--brute` wordlist of the discovery check |
+| `targets-posture.txt`, `targets-discovery.txt` | seeds for the posture and discovery checks |
 | `db.127` | reverse zone for `127.0.0.0/8`: PTR fixtures for `--enrich` |
 | `targets-takeover.txt` | seeds for the takeover check: `nginx.test alias.test orphan.test` |
 | `targets-zone.txt` | seeds for the zone check: `walk.test xfr.test nsec3.test nginx.test` |
@@ -66,7 +70,9 @@ sudo sh -c './bench-run-recon.sh hosts >> /etc/hosts'   # once: names for tools 
 ./bench-run-recon.sh zone                                                      # AXFR / NSEC fixtures, real dig
 ./bench-run-recon.sh origin                                                    # forgotten-origin fixture
 ./bench-run-recon.sh http                                                      # headers, cookies, auth, robots/security.txt, favicon, PTR
-./bench-run-recon.sh checks                                                    # all four; non-zero if any fails
+./bench-run-recon.sh posture                                                   # SPF/DMARC/MTA-STS/CAA, dangling MX/NS, lame NS, cloudlist
+./bench-run-recon.sh discovery                                                 # naabu, alterx, shuffledns, cdncheck, uncover, notify
+./bench-run-recon.sh checks                                                    # all six; non-zero if any fails
 
 ./bench-run-recon.sh down                # tear down and remove volumes
 ```
@@ -147,6 +153,44 @@ that `<out>.edge.tsv` names the edge and the origin software.
 `403 direct access denied` (an origin locked to its CDN), and nothing listens on 443. The check
 expects `origin-protected [info] host=spa.test origin=127.0.0.6 via=origin.spa.test
 reason=443:refused,80:status-403-other-content`, and nothing at all for `wp.test`.
+
+## Email/DNS posture fixtures (run-recon 1.20)
+
+`posture.test` gets everything wrong and its subdomain `good.posture.test` everything right. Both are
+served by CoreDNS from `db.posture.test`; the MTA-STS policies come from the Caddy ingress, whose
+certificates are issued by Caddy's local CA, so `bench-run-recon.sh posture` reads that CA out of the
+ingress container and passes it with `--mta-sts-ca` (certificate verification stays on).
+
+| Record | posture.test | expected | good.posture.test |
+|---|---|---|---|
+| NS | `ns` (CoreDNS), `ns-gone.nowhere.test` (`nowhere.test` does not exist), `ns-lame` → `LAB_NSEC3_IP` (BIND refuses the zone) | `ns-dangling [high]`, `ns-lame [medium] reason=refused`; CoreDNS not lame | (the zone's) |
+| MX | `mx1` (exists), `mx-old.gone-mail.test` (`gone-mail.test` does not exist) | `mx-dangling [high]` | `mx1` |
+| SPF | `include:_spf.posture.test +all` | `spf-permissive [high]` | `mx -all` |
+| DMARC | `p=none`, no `rua` | `dmarc-none [low]`, `dmarc-no-rua [info]` | `p=reject; rua=...` |
+| MTA-STS | `testing`, lists `mx1` only | `mta-sts-testing [info]`, `mta-sts-mx-mismatch [medium]` | `enforce`, lists `mx1` |
+| TLS-RPT | none | `tlsrpt-missing [info]` | present |
+| CAA | `0 issue "letsencrypt.org"` | nothing | (the zone's) |
+
+`good.posture.test` must have no finding at all. The same check runs `--cloudlist` against `cloud.tfstate`
+(cloudlist's Terraform provider reads it offline): `127.0.0.1` is matched to the scan's inventory, and
+`127.0.0.8`, which nothing in the lab serves, is `cloud-asset-unseen [info]`.
+
+## Discovery fixtures (run-recon 1.20)
+
+`bench-run-recon.sh discovery` runs the discovery tools for real: a baseline run on `nginx.test`, then a
+second with `--ports --port-spec 80,443,8443 --permute --brute --origin --monitor --notify` against it.
+
+| Tool | Fixture | Expected |
+|---|---|---|
+| naabu | the ingress also serves `https://nginx.test:8443` (published on 127.0.0.1:8443) | a `https://nginx.test:8443` row |
+| alterx | `grafana.nginx.test` exists in `db.test`; alterx guesses it from `nginx.test` | a row with source `alterx` |
+| shuffledns + massdns | `backup-db.nginx.test` exists; `brute-wordlist.txt` holds `backup-db` | a row with source `bruteforce` |
+| cdncheck | the loopback edge; and `104.16.0.1` checked directly | no CDN tag; `104.16.0.1 [waf] [cloudflare]` in the format `--origin` parses |
+| notify | a webhook on a random loopback port, `NOTIFY_CONFIG` pointing at it | one message (`-bulk`) naming the new `:8443` asset |
+| uncover | run with an empty `HOME` (no keys) | the "requires keys" message that run-recon turns into a warning |
+
+The baseline run must not have the alterx or wordlist names. massdns has no package on most systems; the
+setup scripts build it from source (`github.com/blechschmidt/massdns`).
 
 ## HTTP-detail fixtures (run-recon 1.19)
 

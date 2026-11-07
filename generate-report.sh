@@ -25,7 +25,8 @@
 #
 # Reads (when present, derived from <csv>): <csv>.nuclei.txt, .activescan.txt,
 #   .secrets.txt, .takeover.txt, .zone.txt, .origin.txt, .extras.txt, .favicon.txt, .buckets.txt, .cms.txt,
-#   .params.txt, .osint.txt, .virustotal.txt, .urlscan.txt, .social.txt,
+#   .params.txt, .osint.txt, .virustotal.txt, .urlscan.txt, .social.txt, .dnsposture.txt, .dnsposture.tsv,
+#   .cloud.txt, .tld-variants.txt, .vulnx.txt,
 #   .new-assets.txt, .edge.tsv, .cname.tsv, .zone-names.txt, .screenshots.tsv,
 #   .run.json, and the vuln join <csv>.vulns.csv (recon-db.sh vulns).
 # Requires: python3.  Exit 0 on success, 2 on bad input.
@@ -134,6 +135,7 @@ SEV_TAG   = re.compile(r'\[(critical|high|medium|low|info)\]', re.I)
 KIND_SEV = {
     "takeover": "high", "secrets": "high", "buckets": "medium",
     "origin": "info", "zone": "info", "extras": "info", "favicon": "info", "params": "info", "cms": "info",
+    "dnsposture": "info", "vulnx": "info", "cloud": "info", "tld-variants": "info",
     "osint": "info", "virustotal": "info", "urlscan": "info", "social": "info",
 }
 KIND_LABEL = {
@@ -141,7 +143,8 @@ KIND_LABEL = {
     "takeover": "Subdomain takeover", "secrets": "Exposed secret",
     "buckets": "Exposed cloud bucket", "origin": "Exposed origin",
     "zone": "DNS zone exposure", "zonecheck": "DNS zone check", "edgehint": "Edge fingerprint",
-    "originprotected": "Protected origin",
+    "originprotected": "Protected origin", "dnsposture": "Email / DNS posture", "vulnx": "Product advisory (vulnx)",
+    "cloud": "Cloud inventory", "tld-variants": "TLD variant",
     "http": "HTTP", "extras": "security.txt", "extrasinfo": "Web server note", "favicon": "Favicon pivot",
     "tls": "TLS / certificate",
     "params": "Parameterized URL", "cms": "CMS / tech", "osint": "OSINT",
@@ -246,7 +249,8 @@ extra_names = {}   # names with findings but no CSV row (not live): host -> dict
 ORIGIN_FINDINGS = ("origin-exposed", "origin-alternate", "origin-candidate")
 
 for kind in ["nuclei", "activescan", "takeover", "secrets", "buckets", "zone", "origin", "extras", "favicon",
-             "params", "cms", "osint", "virustotal", "urlscan", "social"]:
+             "params", "cms", "osint", "virustotal", "urlscan", "social", "dnsposture", "vulnx", "cloud",
+             "tld-variants"]:
     path = f"{csv_path}.{kind}.txt"
     if not os.path.isfile(path):
         continue
@@ -299,7 +303,7 @@ for kind in ["nuclei", "activescan", "takeover", "secrets", "buckets", "zone", "
                 # use the URL's host; for OSINT/reference findings (social account
                 # links, VT/passive-DNS, etc.) tie to the seed domain/brand instead.
                 TARGET_URL_KINDS = {"nuclei", "activescan", "secrets", "takeover", "zone", "extras", "favicon",
-                                    "buckets", "origin", "params", "cms", "urlscan"}
+                                    "buckets", "origin", "params", "cms", "urlscan", "dnsposture", "cloud", "tld-variants"}
                 uh = host_of(line)
                 if not uh:   # DNS findings name the affected host as host=<name>
                     _hm = re.search(r'\bhost=([A-Za-z0-9_.-]+)', line)
@@ -316,7 +320,7 @@ for kind in ["nuclei", "activescan", "takeover", "secrets", "buckets", "zone", "
                 # attach to the host card; a name that is not live still gets a card
                 if h in hosts:
                     hosts[h]["findings"].append(f)
-                elif h and kind_eff not in EVIDENCE_KINDS and kind in ("takeover", "zone", "origin"):
+                elif h and kind_eff not in EVIDENCE_KINDS and kind in ("takeover", "zone", "origin", "dnsposture"):
                     extra_names.setdefault(h, {"seed": seed, "findings": []})["findings"].append(f)
     except Exception as e:
         sys.stderr.write(f"[report] warning: {path}: {e}\n")
@@ -546,7 +550,8 @@ elif shots_dir and os.path.isdir(shots_dir):
 now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 sev_color = {"critical": "#8b0000", "high": "#d7301f", "medium": "#ef8a00",
              "low": "#c9a400", "info": "#4a7fb5"}
-highlight_kinds = {"nuclei", "takeover", "secrets", "buckets", "origin", "zone", "http", "extras", "tls", "vuln"}
+highlight_kinds = {"nuclei", "takeover", "secrets", "buckets", "origin", "zone", "http", "extras", "tls", "vuln",
+                   "dnsposture", "cloud"}
 total_findings = sum(1 for f in findings if f["kind"] not in EVIDENCE_KINDS)
 top_asns = {}
 for h in hosts.values():
@@ -684,11 +689,41 @@ if zrows:
                    'listed, not scanned: ' + ", ".join(esc(n) for n, _, _ in zone_outside[:40]) +
                    (" ..." if len(zone_outside) > 40 else "") + '</div>')
 
+# Email and DNS posture (--dns-posture): one row per name checked, findings or not
+_dp = f"{csv_path}.dnsposture.tsv"
+if os.path.isfile(_dp):
+    try:
+        with open(_dp, newline="", encoding="utf-8", errors="replace") as fh:
+            dprows = list(csv.DictReader(fh, delimiter="\t"))
+    except Exception:
+        dprows = []
+    if dprows:
+        nfind = {}
+        for f in findings:
+            if f["kind"] == "dnsposture":
+                nfind.setdefault(f["host"], []).append(f)
+        out.append('<h3 style="font-size:15px;margin-top:22px">Email and DNS posture</h3><div class="tbl"><table><thead><tr>'
+                   '<th>Name</th><th>MX</th><th>SPF</th><th>DMARC</th><th>MTA-STS</th><th>TLS-RPT</th><th>CAA</th>'
+                   '<th>Name servers</th><th>Findings</th></tr></thead><tbody>')
+        for r in dprows:
+            n = (r.get("name") or "").lower()
+            fs = sorted(nfind.get(n, []), key=lambda f: SEV_RANK.get(f["sev"], 9))
+            worst = badge(fs[0]["sev"]) + " " if fs else ""
+            spf = r.get("spf_all") or ("-" if (r.get("spf") or "-") == "-" else (r.get("spf") or ""))
+            out.append(f'<tr><td>{esc(n)}{" <span class=mut>(zone)</span>" if r.get("role") == "apex" else ""}</td>'
+                       f'<td class="detail">{esc(r.get("mx") or "")}</td><td>{esc(spf)}</td>'
+                       f'<td>{esc(r.get("dmarc") or "")}</td><td>{esc(r.get("mta_sts") or "")}</td>'
+                       f'<td>{esc(r.get("tls_rpt") or "")}</td><td class="detail">{esc(r.get("caa") or "")}</td>'
+                       f'<td class="detail">{esc(r.get("ns") or "")}</td>'
+                       f'<td>{worst}{len(fs) if fs else "-"}</td></tr>')
+        out.append('</tbody></table></div>')
+
 # ---- Findings table (highlighted first: vulns/weaknesses/misconfigs) -------
 out.append('<h2 id="findings">Findings</h2>')
 hi = [f for f in findings if f["kind"] in highlight_kinds]
 # within a severity: exposure findings first, certificate hygiene last
-KIND_ORDER = {k: i for i, k in enumerate(["vuln", "nuclei", "secrets", "origin", "zone", "takeover", "http", "buckets", "extras", "tls"])}
+KIND_ORDER = {k: i for i, k in enumerate(["vuln", "nuclei", "secrets", "origin", "zone", "takeover", "dnsposture", "http",
+                                         "buckets", "extras", "tls"])}
 hi.sort(key=lambda f: (SEV_RANK.get(f["sev"], 9), KIND_ORDER.get(f["kind"], 99), f["host"]))
 if hi:
     out.append('<p class="mut">Vulnerabilities, weaknesses and misconfigurations, most severe first.</p>')

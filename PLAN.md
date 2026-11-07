@@ -7,8 +7,8 @@ default path is kept only if it is no slower and its output is identical (or the
 justified accuracy fix).
 
 **Status:** Done · In progress · Planned · Blocked (needs something from Ben) · Won't do
-**Last updated:** 2026-11-06, follow-ups F1–F10 done on `followups-v1.18` (not released: the next release
-follows Batch 3 and the rest of the open batch work)
+**Last updated:** 2026-11-06, follow-ups F1–F10 done on `followups-v1.18` (PR #3) and Batch 3 on
+`batch-3-email-dns` (stacked on it). Not released: the next release follows the rest of the open batch work
 
 ## 0. Source of truth
 
@@ -16,7 +16,7 @@ follows Batch 3 and the rest of the open batch work)
 |---|---|---|---|
 | R1 | Git repository, `main` = v1.18.0, generated lab files ignored | Done | `git log` |
 | R2 | Push to GitHub (private `benheise/run-recon`) | Done: `main` pushed; releases v1.18.0 and v1.19.0 published. Tags cannot be pushed from Claude's sessions (HTTP 403), so releases/tags are created in the GitHub UI | tags `v1.18.0`, `v1.19.0` on GitHub |
-| R3 | Each batch on its own branch, merged by pull request | Done for Batch 2 (#1, merged); follow-ups on `followups-v1.18` | PR per batch |
+| R3 | Each batch on its own branch, merged by pull request | Done for Batch 2 (#1, merged); follow-ups #3; Batch 3 on `batch-3-email-dns` | PR per batch |
 
 ## 1. Batch 2: HTTP detail (WebInventory A4, A5, A6, A11)
 
@@ -42,6 +42,7 @@ follows Batch 3 and the rest of the open batch work)
 | V5 | Screenshots with Kali's Chromium; Kali's httpx accepts `-esb`, `-ho`, `-system-chrome` | Planned | `.screenshots.tsv` all ok |
 | V6 | Higher `-t`, rate limits, and the `--db` cache on public seeds | Planned | no blanks; warm run faster |
 | V7 | `--favicon` pivot with real uncover keys | Planned | hits cert-scanned, names in scope |
+| V8 | `--dns-posture` on Ben's own domains; `--tld-variants` and `--cloudlist` with real accounts | Planned | no false positives on a correctly configured domain |
 
 ## 3. Follow-ups from v1.18
 
@@ -62,11 +63,11 @@ follows Batch 3 and the rest of the open batch work)
 
 | ID | Item | Status | Check |
 |---|---|---|---|
-| B3.1 | SPF, DMARC, MTA-STS, CAA records per seed | Planned | lab zone fixtures |
-| B3.2 | Dangling MX / NS (delegation to a name that does not exist) | Planned | lab fixtures |
-| B3.3 | cloudlist inventory diff (your cloud accounts vs what the scan found) | Planned | needs cloud credentials |
-| B3.4 | tldfinder seed expansion; vulnx | Planned | |
-| B3.5 | Lab coverage for naabu, alterx, shuffledns, cdncheck, uncover, notify | Planned | lab |
+| B3.1 | SPF, DMARC, MTA-STS, CAA records per seed | Done: `--dns-posture` (+ TLS-RPT; in `--all`) | lab: `bench-run-recon.sh posture` PASS (posture.test, good.posture.test); suite |
+| B3.2 | Dangling MX / NS (delegation to a name that does not exist) | Done (+ lame NS, MX without address) | lab: `mx-dangling`, `ns-dangling`, `ns-lame` (BIND refuses); suite |
+| B3.3 | cloudlist inventory diff (your cloud accounts vs what the scan found) | Done: `--cloudlist [CFG]` | lab: Terraform provider on `lab/cloud.tfstate`; real accounts on Kali |
+| B3.4 | tldfinder seed expansion; vulnx | Done: `--tld-variants` (listed only, never scanned) and `--vulnx` (product-level leads) | suite; vulnx against the real API on the lab's CPEs; tldfinder needs public DNS (Kali) |
+| B3.5 | Lab coverage for naabu, alterx, shuffledns, cdncheck, uncover, notify | Done | lab: `bench-run-recon.sh discovery` PASS |
 
 ## 5. Batch 4: evidence and history
 

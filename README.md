@@ -139,6 +139,14 @@ run-recon -i domains.txt --extras              # robots.txt (paths become URL ro
                                                #   favicon hashes -> robots/security_txt/favicon_* columns + results.csv.extras.txt
 run-recon -i domains.txt --zone-exposure       # each seed's DNS zone: AXFR on every name server, NSEC walk, NSEC3
                                                #   -> results.csv.zone.txt + results.csv.zone-names.txt (names feed the scan)
+run-recon -i domains.txt --dns-posture         # SPF, DMARC, MTA-STS, TLS-RPT, CAA, dangling MX/NS, lame NS per seed + zone
+                                               #   -> results.csv.dnsposture.txt + results.csv.dnsposture.tsv
+run-recon -i domains.txt --cloudlist cl.yaml   # your cloud accounts (cloudlist) vs what the scan found
+                                               #   -> results.csv.cloud.txt + results.csv.cloud-assets.tsv
+run-recon -i domains.txt --tld-variants        # the seed's name under other TLDs (tldfinder), listed only
+                                               #   -> results.csv.tld-variants.txt
+run-recon -i domains.txt --vulnx               # CVEs filed against each product seen (vulnx; any version)
+                                               #   -> results.csv.vulnx.txt + results.csv.vulnx.tsv
 run-recon -i domains.txt --screenshots         # httpx -ss / gowitness, each capture validated -> screenshots-<ts>/
                                                #   + results.csv.screenshots.tsv (ok / blank / failed / suspect)
 run-recon -i domains.txt --origin              # edge detection + origin search, verified directly
@@ -167,10 +175,11 @@ run-recon -i domains.txt --active --cms-wordlist plugins.txt   # custom plugin/t
 ```bash
 run-recon -i domains.txt --monitor                       # diff vs newest prior recon-*.csv -> results.csv.new-assets.txt
 run-recon -i domains.txt --monitor --monitor-prev old.csv --notify   # diff vs a specific CSV, push via 'notify'
+NOTIFY_CONFIG=notify.yaml run-recon -i d.txt --monitor --notify      # one message per run to the providers in notify.yaml
 run-recon -i domains.txt --all                           # full discovery + defensive set (see below)
 ```
 
-`--all` enables `--subs --resolve --certs --permute --brute --ports --js --crawlers-all --takeover --zone-exposure --screenshots --origin --extras --active --activescan --osint --tls --ipv6 --enrich`. The remaining scanning stages (`--nuclei`, `--params`, `--secrets`, `--buckets`) and `--favicon` / `--vhost` / `--virustotal` / `--urlscan` / `--social` / `--monitor` stay opt-in. `--enrich` fetches the cloud IP-range feeds and makes per-IP RDAP and reverse-DNS lookups (passive, no packets to targets; PTR lookups of non-public addresses go only to resolvers you pass with `--resolvers`); `geo` still needs `--geodb`.
+`--all` enables `--subs --resolve --certs --permute --brute --ports --js --crawlers-all --takeover --zone-exposure --dns-posture --screenshots --origin --extras --active --activescan --osint --tls --ipv6 --enrich`. The remaining scanning stages (`--nuclei`, `--params`, `--secrets`, `--buckets`) and `--favicon` / `--vhost` / `--virustotal` / `--urlscan` / `--social` / `--monitor` / `--cloudlist` / `--tld-variants` / `--vulnx` stay opt-in. `--enrich` fetches the cloud IP-range feeds and makes per-IP RDAP and reverse-DNS lookups (passive, no packets to targets; PTR lookups of non-public addresses go only to resolvers you pass with `--resolvers`); `geo` still needs `--geodb`.
 
 ### Pipeline (per seed domain)
 
@@ -210,6 +219,10 @@ Active stages (5–8) are skipped under `--passive-only`; enrichment (7) is skip
 | `--takeover` | dangling CNAME / takeover | dnsx (CNAMEs of every candidate) + subzy + nuclei `-tags takeover` | `.takeover.txt`, `.cname.tsv` |
 | `--extras` | robots.txt, security.txt, 404 probe, favicon hashes | httpx `-path -irrb` (one pass) | URL rows (`robots`), cols `robots`, `security_txt`, `favicon_*`, `.extras.txt` |
 | `--zone-exposure` | DNS zone exposure | dig: SOA/NS, AXFR per name server, NSEC walk, NSEC3PARAM | `.zone.txt`, `.zone-names.txt`; names join the candidates |
+| `--dns-posture` | email and DNS posture | dig (SPF/DMARC/MTA-STS/TLS-RPT/CAA/MX/NS, SOA to each name server), curl (MTA-STS policy, verified TLS) | `.dnsposture.txt`, `.dnsposture.tsv` |
+| `--cloudlist [CFG]` | cloud inventory diff | cloudlist (your provider config) | `.cloud.txt`, `.cloud-assets.tsv` |
+| `--tld-variants` | the name under other TLDs | tldfinder (public DNS), dig (NS) | `.tld-variants.txt` (never scanned) |
+| `--vulnx` | product advisories | vulnx (ProjectDiscovery's CVE API; `PDCP_API_KEY` optional) | `.vulnx.txt`, `.vulnx.tsv` |
 | `--screenshots` | visual triage | httpx -ss (browser routed like httpx) / gowitness | `screenshots-<ts>/`, `.screenshots.tsv` (status per host) |
 | `--origin` | edge detection + origin search | httpx (headers, body hash, favicon), tlsx -jarm, cdncheck, dnsx (A+AAAA), dig (SPF/MX), curl `--resolve` | `.origin.txt` (verified, and protected origins), `.edge.tsv` |
 | `--tls` | TLS posture | tlsx + chain validation (Python `ssl`, system trust store) | CSV cols `tls_version`..`tls_flags` (joined to https rows) |
@@ -227,7 +240,7 @@ Active stages (5–8) are skipped under `--passive-only`; enrichment (7) is skip
 | `--virustotal` | passive DNS / reputation | VirusTotal domain report (`VT_API_KEY`) | `.virustotal.txt` |
 | `--urlscan` | historical URLs/IPs | urlscan.io search | `.urlscan.txt` |
 | `--social` | social-media accounts | tookie-osint (org brand) | `.social.txt` |
-| `--monitor` | drift detection | (diff) + notify | `.new-assets.txt` |
+| `--monitor` | drift detection | (diff) + notify (`-bulk`; `NOTIFY_CONFIG` → `-pc`) | `.new-assets.txt` |
 
 ---
 
@@ -338,7 +351,9 @@ reported as failed (not "passed"), and an NXDOMAIN seed is called out. Each seed
 none of its candidate names resolves, or when no name answers the live probe.
 
 Side files next to the CSV, by flag: `.takeover.txt` + `.cname.tsv` (`--takeover`), `.zone.txt` +
-`.zone-names.txt` (`--zone-exposure`), `.origin.txt` + `.edge.tsv` (`--origin`), `.extras.txt` (`--extras`),
+`.zone-names.txt` (`--zone-exposure`), `.dnsposture.txt` + `.dnsposture.tsv` (`--dns-posture`), `.cloud.txt` +
+`.cloud-assets.tsv` (`--cloudlist`), `.tld-variants.txt` (`--tld-variants`), `.vulnx.txt` + `.vulnx.tsv`
+(`--vulnx`), `.origin.txt` + `.edge.tsv` (`--origin`), `.extras.txt` (`--extras`),
 `.favicon.txt` (`--favicon`), `.screenshots.tsv` +
 `screenshots-<ts>/` (`--screenshots`), `.nuclei.txt`, `.params.txt`, `.secrets.txt`, `.buckets.txt`,
 `.cms.txt`, `.activescan.txt`, `.osint.txt`, `.virustotal.txt`, `.urlscan.txt`, `.social.txt`,
@@ -356,6 +371,58 @@ Side files next to the CSV, by flag: `.takeover.txt` + `.cname.tsv` (`--takeover
 
 Every address of every name server is tried, IPv4 and IPv6, and the NSEC walk moves on to the next name
 server when one gives no chain (a lame or unreachable server no longer hides a walkable zone).
+
+**Email and DNS posture** (`.dnsposture.txt`, `--dns-posture`). Each seed and its zone apex (the SOA owner)
+is checked through your resolvers (the first of `--resolvers`, else the system's). Mail checks run for a
+name that has MX or SPF records, and always for the apex; MTA-STS and TLS-RPT only for names that receive
+mail. Lameness is asked of each delegated name server directly (`SOA +norec`, IPv4); if none of them answers
+from where the scan runs, one `ns-unreachable [info]` line says so instead of a lame finding per server.
+Names are "dangling" when they do not exist; the finding is `[high]` when the domain they live in (its last
+two labels) does not exist either, because whoever registers it takes over the mail, the delegation or the
+SPF authorization.
+
+| Finding | Meaning |
+|---|---|
+| `spf-permissive [high]` / `spf-neutral [medium]` / `spf-no-all [medium]` | SPF ends in `+all` (anyone may send), `?all`, or has no `all` |
+| `spf-missing [medium]` / `[low]` | no SPF on a name with MX / on a name that sends no mail (it should publish `v=spf1 -all`) |
+| `spf-multiple [medium]`, `spf-too-many-lookups [medium]`, `spf-include-missing [medium]` | permanent errors receivers apply (RFC 7208): two records, more than 10 DNS-querying terms (following `include:`/`redirect=`), an include with no SPF |
+| `spf-include-dangling [high]` / `[medium]` | an `include:` or `redirect=` names a domain that does not exist |
+| `spf-ptr [low]` | the deprecated `ptr` mechanism |
+| `dmarc-missing [medium]` / `[low]`, `dmarc-multiple [medium]`, `dmarc-invalid [medium]` | no DMARC (at the name or its organizational domain; `sp=` applies to subdomains), two records, no valid `p=` |
+| `dmarc-none [low]`, `dmarc-partial [low]`, `dmarc-no-rua [info]` | monitoring only, `pct` below 100, nobody receives the aggregate reports |
+| `mta-sts-missing [low]` | no `_mta-sts` record for a name that receives mail |
+| `mta-sts-policy-unreachable [medium]` | the record exists but the policy cannot be fetched (`reason=` untrusted-certificate, status-404, refused...). It is fetched as RFC 8461 requires: HTTPS only, certificate verified, no redirects; `--mta-sts-ca FILE` adds a CA (a lab's private one) without turning verification off; skipped under `--passive-only` |
+| `mta-sts-testing [info]`, `mta-sts-none [low]`, `mta-sts-invalid [medium]`, `mta-sts-mx-mismatch [medium]` | the policy only reports, is withdrawn, has no valid mode, or does not list every MX host (under `enforce`, senders refuse those) |
+| `tlsrpt-missing [info]` | no TLS-RPT record |
+| `caa-missing [low]` | no CAA at the zone apex: any CA may issue |
+| `mx-dangling [high]` / `[medium]`, `mx-no-address [medium]` | an MX host that does not exist, or exists without an address |
+| `ns-dangling [high]` / `[medium]` | a delegated name server that does not exist |
+| `ns-lame [medium]` | a delegated name server refuses the zone, fails, times out, or answers without authority (`reason=`) |
+
+`.dnsposture.tsv` has one row per name checked (MX hosts, SPF record and its `all`, DNS lookups, DMARC
+policy and where it came from, MTA-STS mode, TLS-RPT, CAA issuers, name servers); the report shows it as the
+"Email and DNS posture" table.
+
+**Cloud inventory** (`.cloud.txt`, `--cloudlist [CONFIG]`, default `~/.config/cloudlist/provider-config.yaml`).
+cloudlist lists the assets of the accounts in the provider config (`-pc CONFIG -json`), and run-recon compares
+them with the scan's inventory (the `host`, `ip` and `ipv6` columns): `cloud-asset-unseen [info]` for an
+asset's name or public address the scan did not find (`scope=in` when it is under a seed: add it as a seed if
+it should be covered, or it is not reachable from the internet), and `cloud-ip-unaccounted [low]` for an
+address the scan found in a cloud provider's ranges (the `cloud` column, `--enrich`) that no listed account
+owns: a CDN or SaaS front, a third party, or an account missing from the config. Internal addresses (RFC 1918,
+CGNAT, link-local) are listed in `.cloud-assets.tsv` but never reported.
+
+**TLD variants** (`.tld-variants.txt`, `--tld-variants`). tldfinder looks for the seed's name under other TLDs
+(`example` → `example.net`, `example.io`...). It queries public DNS itself, whatever `--resolvers` says. Each
+variant is listed with `same_ns=yes` when it shares a name server with the seed's zone (likely yours) or `no`
+(check who holds it: a look-alike, a parked domain, a former asset). Variants are never added to the scope or
+scanned.
+
+**Product advisories** (`.vulnx.txt`, `--vulnx`). For each product in the `cpe` column (up to
+`VULNX_MAX_PRODUCTS`, default 40), vulnx returns the CVEs filed against it, most likely exploited first
+(`VULNX_LIMIT`, default 10 per product): one line per product with the CVE and KEV counts and the top CVEs,
+and `.vulnx.tsv` with one row per CVE (CVSS, EPSS, KEV, public PoC, nuclei template). vulnx does not match
+versions, so these are leads (`[info]`), not findings: the version-matched join is `recon-db.sh vulns`.
 
 **Extras findings** (`.extras.txt`, `--extras`). One `httpx -path` pass per seed requests the root page,
 `/favicon.ico`, `/robots.txt`, `/.well-known/security.txt` (then `/security.txt`) and one random path on every
@@ -730,7 +797,7 @@ sudo sh -c './bench-run-recon.sh hosts >> /etc/hosts'    # once: names for tools
 ./bench-run-recon.sh bench --runs 3 --farm --flags "--tls --ipv6 -t 10"    # load
 ./bench-run-recon.sh bench --runs 3 --flags "--tls --ipv6" --baseline-script old/run-recon.sh   # A/B two versions
 ./bench-run-recon.sh compare run-a.csv run-b.csv --exact # field-by-field identity
-./bench-run-recon.sh checks                              # takeover, zone and origin fixtures, end to end
+./bench-run-recon.sh checks                              # takeover, zone, origin, http, posture, discovery fixtures
 ./bench-run-recon.sh down
 ```
 
@@ -758,6 +825,8 @@ the default path stays as fast as v1.18.0 and every existing column is identical
 **v1.20.0** (unreleased, the v1.18 follow-ups): the default path is unchanged in speed and output; `--extras`
 needs one httpx run per seed instead of two (farm: 1.14x wall, 24% less CPU, output identical). `bench` A/B
 comparisons now ignore fields that differ between runs of the same version (`compare --exact --noise`).
+Batch 3 leaves the default path identical; `--dns-posture` costs under a second on the 50-seed farm, and the
+lab now exercises naabu, alterx, shuffledns, cdncheck, uncover and notify for real (`checks`: six fixtures).
 
 The v1.16 speed-up is from not querying internet archives for special-use names such as `.test`,
 which cannot exist there. The lab also exposed nine accuracy bugs, all fixed in v1.16 (listed in

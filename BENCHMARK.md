@@ -459,3 +459,52 @@ were recorded).
 - **An awk `NR == FNR` idiom misfires when the first file is empty**: every line of the second file is taken as
   part of the first. It suppressed every `origin-protected` line until the test with no exposed origin caught it.
 - **dnsx `-a -aaaa`** answers both families in one record; the mock answered only the last flag it saw.
+
+## v1.20.0 (unreleased): Batch 3, email and DNS posture and discovery coverage
+
+Same lab and method. The baseline is the follow-ups branch (`followups-v1.18`, frozen with `git archive`), so
+the A/B isolates Batch 3. The lab gained the `posture.test` zone, two MTA-STS policies, a Terraform state, port
+8443 on the ingress and two discovery names in `db.test`; both versions ran against the same lab.
+
+### A/B and cost
+
+| Scenario | baseline wall s | Batch 3 wall s | baseline CPU s | Batch 3 CPU s | accuracy | `--exact` |
+|---|---:|---:|---:|---:|---|---|
+| lab, `--tls --ipv6` (vs follow-ups) | 24.08 | 23.55 | 12.39 | 12.44 | 3/3 / 3/3 | identical (87 rows) |
+| farm, `--tls --ipv6 -t 10`, without → with `--dns-posture` (same version) | 92.73 | 93.52 | 81.12 | 83.57 | 3/3 / 3/3 | identical (50 rows) |
+
+The default path did not change. `--dns-posture` costs under a second of wall time and 2.5 s of CPU on 50
+seeds: it runs once in the main process, mostly dig calls, and only names with MX or SPF records (and each
+zone apex) get the mail checks.
+
+### Lab fixture checks (real tools)
+
+`bench-run-recon.sh checks` → **PASS** on all six (takeover, zone, origin, http, posture, discovery).
+
+| Check | Fixture | Result |
+|---|---|---|
+| posture | posture.test | `spf-permissive [high]`, `mx-dangling [high]`, `ns-dangling [high]`, `ns-lame [medium] reason=refused` (BIND), `mta-sts-mx-mismatch [medium]`, `dmarc-none [low]`, `dmarc-no-rua`, `mta-sts-testing`, `tlsrpt-missing` (info); no CAA or lame finding for what is correct |
+| posture | good.posture.test | no finding; the MTA-STS `enforce` policy fetched with Caddy's CA passed through `--mta-sts-ca` |
+| posture | without `--mta-sts-ca` | `mta-sts-policy-unreachable [medium] reason=untrusted-certificate`: verification is on |
+| posture | cloudlist, Terraform state | `127.0.0.1` matched to the inventory; `127.0.0.8` → `cloud-asset-unseen [info]` |
+| discovery | naabu, ports 80,443,8443 | `https://nginx.test:8443` probed and inventoried |
+| discovery | alterx | `grafana.nginx.test` (source `alterx`); absent from the baseline run |
+| discovery | shuffledns + massdns (built from source) | `backup-db.nginx.test` (source `bruteforce`) |
+| discovery | cdncheck | loopback edge untagged; `104.16.0.1 [waf] [cloudflare]` |
+| discovery | `--monitor --notify` | the `:8443` URL is a new asset; one message reached the loopback webhook |
+| discovery | uncover, no keys | "requires keys but no keys were found", now one run-recon warning |
+
+vulnx 2.0.2 against its real API (no key) on the lab's CPEs listed 8 products, e.g. `f5:nginx` 41 CVEs (3 in
+KEV), `apache:http_server` 352 (23 in KEV), `jenkins:jenkins` 294 (9 in KEV). These counts cover every version
+of the product, which is why `--vulnx` reports leads, not findings. tldfinder could not be run inside the lab:
+in `-dm tld` mode it resolves through public DNS whatever `-r` says.
+
+### Found while building this
+
+- **`--origin` with `--ports` compared against the wrong service.** The reference response of a host was its
+  first https record, which on the discovery fixture was the `:8443` service (another page, another Server
+  header): `edge.tsv` then said "no edge" for nginx.test. The reference is now the default port's response.
+- **The suite's dig mock answered the resolver preflight's header before any fixture**, so every posture
+  answer read as NOERROR and NXDOMAIN-based checks could not fire. The posture fixtures now answer first.
+- **`cloudlist` writes a default provider config on first run**, so "no config" could not be tested against
+  `$HOME`; the test runs with an empty `HOME`.

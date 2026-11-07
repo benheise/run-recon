@@ -81,6 +81,14 @@ RECON_DIR="$(dirname "$RECON_SELF")"
 : "${ORIGIN_MAX_CHECKS:=200}" # cap on (host, candidate IP) pairs verified per seed
 : "${CERT_WARN_DAYS:=30}"   # --tls: CertExpiring when the certificate expires within this many days (WebInventory's default)
 : "${TLS_CHAIN_CHECK:=1}"   # --tls: validate each chain against the system trust store (CertUntrusted)
+: "${DNS_POSTURE:=0}"      # 1 = email/DNS posture per seed: SPF, DMARC, MTA-STS, TLS-RPT, CAA, dangling MX/NS, lame NS
+: "${MTA_STS_CA:=}"        # extra CA file for MTA-STS policy fetches (a lab's private CA); verification stays on
+: "${CLOUDLIST:=0}"        # 1 = diff your cloud accounts (cloudlist) against what the scan found
+: "${CLOUDLIST_CONFIG:=}"  # cloudlist provider config (default: ~/.config/cloudlist/provider-config.yaml)
+: "${TLD_VARIANTS:=0}"     # 1 = list the seed's name registered under other TLDs (tldfinder); never scanned
+: "${VULNX:=0}"            # 1 = product advisories for the CPEs seen (vulnx, ProjectDiscovery's CVE API)
+: "${VULNX_LIMIT:=10}"     # CVEs listed per product (most likely exploited first)
+: "${VULNX_MAX_PRODUCTS:=40}" # products looked up per run
 : "${ZONE_EXPOSURE:=0}"    # 1 = per seed zone: open AXFR, walkable NSEC chain, NSEC3 params -> side artifact
 : "${ZONE_WALK_MAX:=5000}" # stop an NSEC walk after this many names
 : "${TLS_POSTURE:=0}"      # 1 = TLS posture via tlsx (neg. version/cipher, cert expiry, self-signed, name mismatch)
@@ -113,6 +121,7 @@ RECON_DIR="$(dirname "$RECON_SELF")"
 : "${MONITOR:=0}"          # 1 = diff discovered assets against a prior CSV (--monitor)
 : "${MONITOR_PREV:=}"      # prior CSV to diff against (default: newest recon-*.csv in out-dir)
 : "${NOTIFY:=0}"           # 1 = pipe the new-asset diff through 'notify' if configured
+: "${NOTIFY_CONFIG:=}"     # notify provider config (default: ~/.config/notify/provider-config.yaml)
 : "${GITHUB:=0}"           # 1 = mine GitHub for subdomains + endpoints (needs a token)
 : "${GITHUB_TOKEN_FILE:=}" # file with GitHub token(s), 1/line; else env GITHUB_TOKEN is used
 : "${BUCKETS:=0}"          # 1 = cloud bucket enumeration (cloud_enum: S3/Azure/GCP) -> side artifact
@@ -1015,6 +1024,14 @@ for line in open(ref, encoding="utf-8", errors="replace"):
         "sha": (h.get("body_sha256") or "") if isinstance(h, dict) else "", "len": j.get("content_length"),
         "ip": j.get("host_ip") or "", "edge": clean(edge), "osw": clean(osw), "ev": ",".join(dict.fromkeys(ev)),
         "fav": clean(j.get("favicon") or "")})
+def pick(rs):
+    # the host's reference response: its default port first (with --ports a host also has
+    # e.g. :8443, a different service), then https
+    def k(x):
+        hp = x["url"].split("://", 1)[-1].split("/", 1)[0]
+        port = hp.rsplit(":", 1)[1] if re.search(r":\d+$", hp) else ""
+        return (0 if port in ("", "443" if x["scheme"] == "https" else "80") else 1, 0 if x["scheme"] == "https" else 1)
+    return sorted(rs, key=k)[0]
 jarm = {}
 for l in open(jarm_f, encoding="utf-8", errors="replace"):
     m = re.match(r"^\s*([^\s:]+):\d+\s+\[?([0-9a-f]{62})\]?", l)
@@ -1025,7 +1042,7 @@ for l in open(cdn_f, encoding="utf-8", errors="replace"):
     if f: cdn[f[0].lower()] = " ".join(x.strip("[]") for x in f[1:])
 with open(etsv, "a") as o:
     for host, rs in sorted(refs.items()):
-        r = next((x for x in rs if x["scheme"] == "https"), rs[0])
+        r = pick(rs)
         o.write("\t".join([seed, host, r["edge"], r["osw"], r["ev"], jarm.get(host, ""), clean(cdn.get(host, "")),
                            r["fav"], r["title"], r["ip"]]) + "\n")
 # candidate IPs with the source that named them
@@ -1116,7 +1133,7 @@ for hf in hist_files:
 pairs, n = [], 0
 for host, rs in sorted(refs.items()):
     edge_ips = {x["ip"] for x in rs if x["ip"]}
-    r = next((x for x in rs if x["scheme"] == "https"), rs[0])
+    r = pick(rs)
     for ip, src in sorted(cands.items()):
         if ip in edge_ips: continue
         if n >= int(maxc or 200): break
@@ -1256,8 +1273,11 @@ favicon_pivot() {
     uq=(-shodan "http.favicon.hash:$mm" -fofa "icon_hash=\"$mm\"")
     [ -n "$md5" ] && uq+=(-censys "services.http.response.favicons.md5_hash: \"$md5\"")
     f="$raw/fav_hits.$n.txt"
-    _to "$STAGE_TIMEOUT" uncover "${uq[@]}" -silent -duc -l "$FAVICON_LIMIT" "${ucp[@]}" 2>/dev/null \
+    _to "$STAGE_TIMEOUT" uncover "${uq[@]}" -silent -duc -l "$FAVICON_LIMIT" "${ucp[@]}" 2>"$raw/uncover.err" \
       | grep -oE '^([0-9]{1,3}\.){3}[0-9]{1,3}(:[0-9]{1,5})?' | sort -u > "$f" || : > "$f"
+    if grep -q 'requires keys but no keys' "$raw/uncover.err" 2>/dev/null && seen_once uncover nokeys; then
+      warn "--favicon: uncover has no API keys for its engines (SHODAN_API_KEY, CENSYS_API_ID + CENSYS_API_SECRET, FOFA_KEY, or ~/.config/uncover/provider-config.yaml): the internet-scan pivot finds nothing"
+    fi
     hosts="$(awk -F'\t' -v m="$mm" '$2 == m { print $1 }' "$fav" | sort -u | paste -sd, -)"
     printf '[%s] favicon-pivot host=%s mmh3=%s md5=%s hits=%s\n' "$domain" "$hosts" "$mm" "${md5:--}" \
       "$(grep -c . "$f" || true)" >> "$out"
@@ -2319,8 +2339,11 @@ process_one() {
   if [ "$FAVICON" = "1" ] && have uncover; then
     local favips="$raw/favicon_ips.txt"; : > "$favips"
     local _ucp=(); [ -n "$PROXY" ] && _ucp=(-proxy "$PROXY")
-    _to "$STAGE_TIMEOUT" uncover -q "ssl:\"$domain\"" -silent -duc "${_ucp[@]}" 2>/dev/null \
+    _to "$STAGE_TIMEOUT" uncover -q "ssl:\"$domain\"" -silent -duc "${_ucp[@]}" 2>"$raw/uncover.err" \
       | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u > "$favips" || : > "$favips"
+    if grep -q 'requires keys but no keys' "$raw/uncover.err" 2>/dev/null && seen_once uncover nokeys; then
+      warn "--favicon: uncover has no API keys for its engines (SHODAN_API_KEY, CENSYS_API_ID + CENSYS_API_SECRET, FOFA_KEY, or ~/.config/uncover/provider-config.yaml): the internet-scan pivot finds nothing"
+    fi
     if [ -s "$favips" ] && have tlsx; then
       local ftl=(-l "$favips" -san -cn -resp-only -silent -timeout 10)
       { [ -n "$RESOLVERS" ] && [ -s "$RESOLVERS" ]; } && ftl+=(-r "$RESOLVERS")
@@ -2871,6 +2894,19 @@ ANALYSIS / TRIAGE (side artifacts written next to the CSV; not URL rows):
                           authoritative name server and walk the DNSSEC NSEC chain; flag NSEC3.
                           Names found feed the seeds they fall under   -> <out>.zone.txt,
                           <out>.zone-names.txt. Queries only the zones' own name servers.
+      --dns-posture       Email and DNS posture of each seed and its zone apex: SPF (permissive, no all,
+                          too many lookups, dangling include), DMARC, MTA-STS (policy fetched with
+                          certificate checks; --mta-sts-ca FILE adds a CA), TLS-RPT, CAA, dangling MX and
+                          NS hosts, lame delegations -> <out>.dnsposture.txt, <out>.dnsposture.tsv
+      --cloudlist [CFG]   Diff your cloud accounts (cloudlist, provider config CFG) against what the scan
+                          found: cloud assets it did not see, cloud addresses it saw that no listed
+                          account owns -> <out>.cloud.txt, <out>.cloud-assets.tsv
+      --tld-variants      List the seed's name registered under other TLDs (tldfinder; uses public DNS),
+                          with an ownership hint (same name servers). Listed only, never scanned
+                          -> <out>.tld-variants.txt
+      --vulnx             Product advisories for the CPEs found (vulnx: CVEs filed against each product,
+                          most likely exploited first; any version, so verify yours) -> <out>.vulnx.txt,
+                          <out>.vulnx.tsv. PDCP_API_KEY raises the API's rate limit.
       --takeover          Subdomain-takeover check: CNAMEs of EVERY candidate name (live or not,
                           dnsx), dangling targets (NXDOMAIN), takeover-prone services; subzy and
                           nuclei -tags takeover fingerprint them -> <out>.takeover.txt, <out>.cname.tsv
@@ -2958,9 +2994,10 @@ REPORT & CACHE:
 UMBRELLA:
       --all               Enable the full discovery + defensive set: --subs --resolve --certs
                           --permute --brute --ports --js --crawlers-all --takeover
-                          --zone-exposure --screenshots --origin --extras --active --activescan
-                          --osint --tls --ipv6 --enrich. (Scanning stages nuclei/params/secrets and
-                          favicon/vhost/monitor stay opt-in.)
+                          --zone-exposure --dns-posture --screenshots --origin --extras --active
+                          --activescan --osint --tls --ipv6 --enrich. (Scanning stages
+                          nuclei/params/secrets and favicon/vhost/monitor/cloudlist/tld-variants/vulnx
+                          stay opt-in.)
 
 INPUT MODES:
       Seeds may be domains, or ASN ("AS13335") / CIDR ("192.0.2.0/24") lines. Ranges are
@@ -3002,7 +3039,9 @@ CSV columns:
   security_txt   (the HTTP columns come from the enrichment request itself: no extra traffic)
 
 Side-artifact files (when the matching flag is set): <out>.takeover.txt, <out>.cname.tsv, <out>.zone.txt,
-<out>.zone-names.txt, <out>.origin.txt, <out>.edge.tsv, <out>.extras.txt, <out>.favicon.txt,
+<out>.zone-names.txt, <out>.dnsposture.txt, <out>.dnsposture.tsv, <out>.cloud.txt, <out>.cloud-assets.tsv,
+<out>.tld-variants.txt, <out>.vulnx.txt, <out>.vulnx.tsv,
+<out>.origin.txt, <out>.edge.tsv, <out>.extras.txt, <out>.favicon.txt,
 <out>.screenshots.tsv, screenshots-<ts>/,
 <out>.nuclei.txt, <out>.params.txt, <out>.secrets.txt, <out>.buckets.txt, <out>.cms.txt,
 <out>.activescan.txt, <out>.osint.txt, <out>.virustotal.txt, <out>.urlscan.txt, <out>.social.txt,
@@ -3054,6 +3093,13 @@ while [ $# -gt 0 ]; do
     --screenshots)     SCREENSHOTS=1; shift;;
     --origin)          ORIGIN=1; shift;;
     --zone-exposure)   ZONE_EXPOSURE=1; shift;;
+    --dns-posture)     DNS_POSTURE=1; shift;;
+    --mta-sts-ca)      MTA_STS_CA="${2:?}"; shift 2;;
+    --cloudlist)       CLOUDLIST=1
+                       # optional CONFIG argument (a provider config file)
+                       if [ -n "${2:-}" ] && [ "${2#-}" = "$2" ] && [ -f "$2" ]; then CLOUDLIST_CONFIG="$2"; shift 2; else shift; fi;;
+    --tld-variants)    TLD_VARIANTS=1; shift;;
+    --vulnx)           VULNX=1; shift;;
     --favicon)         FAVICON=1; shift;;
     --extras)          EXTRAS=1; shift;;
     --rounds)          ROUNDS="${2:?}"; shift 2;;
@@ -3080,7 +3126,7 @@ while [ $# -gt 0 ]; do
     --social-user)     SOCIAL_USER="${2:?}"; SOCIAL=1; shift 2;;
     --all)             DO_SUBS=1; RESOLVE=1; CERTS=1; PERMUTE=1; BRUTE=1; PORTS=1; \
                        JS=1; CRAWLERS_ALL=1; TAKEOVER=1; SCREENSHOTS=1; ORIGIN=1; ACTIVE=1; \
-                       ACTIVESCAN=1; OSINT=1; TLS_POSTURE=1; IPV6=1; ENRICH=1; ZONE_EXPOSURE=1; EXTRAS=1; shift;;
+                       ACTIVESCAN=1; OSINT=1; TLS_POSTURE=1; IPV6=1; ENRICH=1; ZONE_EXPOSURE=1; EXTRAS=1; DNS_POSTURE=1; shift;;
     --fuzz)            FUZZ=1; shift;;
     --wordlist)        WORDLIST="${2:?}"; shift 2;;
     --fuzz-threads)    FUZZ_THREADS="${2:?}"; shift 2;;
@@ -3285,6 +3331,26 @@ case "$NUCLEI_OAST" in
         case "$NUCLEI_ISERVER" in *[[:space:]]*|-*) err "Invalid --interactsh-server value."; exit 2;; esac ;;
   *) err "NUCLEI_OAST must be off, self or public (got: $NUCLEI_OAST)"; exit 2;;
 esac
+if [ "$DNS_POSTURE$ZONE_EXPOSURE" != "00" ] && ! have dig; then
+  [ "$DNS_POSTURE" = "1" ] && warn "--dns-posture needs dig (dnsutils/bind-utils); skipping."
+  DNS_POSTURE=0
+fi
+if [ -n "$MTA_STS_CA" ] && [ ! -f "$MTA_STS_CA" ]; then err "--mta-sts-ca: not found: $MTA_STS_CA"; exit 2; fi
+if [ "$CLOUDLIST" = "1" ]; then
+  [ -n "$CLOUDLIST_CONFIG" ] || CLOUDLIST_CONFIG="${HOME:-/root}/.config/cloudlist/provider-config.yaml"
+  if ! have cloudlist; then
+    warn "--cloudlist needs cloudlist (go install github.com/projectdiscovery/cloudlist/cmd/cloudlist@latest); skipping."; CLOUDLIST=0
+  elif [ ! -s "$CLOUDLIST_CONFIG" ]; then
+    warn "--cloudlist: no provider config at $CLOUDLIST_CONFIG (pass --cloudlist FILE); skipping."; CLOUDLIST=0
+  fi
+fi
+if [ "$TLD_VARIANTS" = "1" ] && ! have tldfinder; then
+  warn "--tld-variants needs tldfinder (go install github.com/projectdiscovery/tldfinder/cmd/tldfinder@latest); skipping."; TLD_VARIANTS=0
+fi
+if [ "$VULNX" = "1" ] && ! have vulnx; then
+  warn "--vulnx needs vulnx (go install github.com/projectdiscovery/vulnx/v2/cmd/vulnx@latest); skipping."; VULNX=0
+fi
+case "$VULNX_LIMIT$VULNX_MAX_PRODUCTS" in *[!0-9]*|'') err "VULNX_LIMIT and VULNX_MAX_PRODUCTS must be numbers"; exit 2;; esac
 case "$SCREENSHOT_TOOL" in auto|httpx|gowitness) ;; *) err "SCREENSHOT_TOOL must be auto, httpx or gowitness (got: $SCREENSHOT_TOOL)"; exit 2;; esac
 printf '%s' "$ORIGIN_PORTS" | grep -qE '^ *[0-9]{1,5}( +[0-9]{1,5})* *$' \
   || { err "ORIGIN_PORTS must be a space-separated port list, e.g. \"443 80 8443\" (got: $ORIGIN_PORTS)"; exit 2; }
@@ -3567,7 +3633,8 @@ log " Mode          : $([ "$PASSIVE_ONLY" = 1 ] && echo passive-only || { [ "$NO
 log " Subdomains    : $(onoff $DO_SUBS)    Deep(waymore): $(onoff $DEEP)    Rounds: $ROUNDS"
 log " Discovery     : resolve=$(onoff $RESOLVE)  certs=$(onoff $CERTS)  permute=$(onoff $PERMUTE)  brute=$(onoff $BRUTE)  ports=$(onoff $PORTS)  favicon=$(onoff $FAVICON)$([ -n "$RESOLVERS" ] && echo "  (dedicated resolvers)" || echo "")"
 log " Sources+      : crawlers-all=$(onoff $CRAWLERS_ALL)  js=$(onoff $JS)"
-log " DNS zones     : zone-exposure=$(onoff $ZONE_EXPOSURE)"
+log " DNS zones     : zone-exposure=$(onoff $ZONE_EXPOSURE)  dns-posture=$(onoff $DNS_POSTURE)"
+log " Inventory     : cloudlist=$(onoff $CLOUDLIST)  tld-variants=$(onoff $TLD_VARIANTS)  vulnx=$(onoff $VULNX)"
 log " Analysis      : takeover=$(onoff $TAKEOVER)  screenshots=$(onoff $SCREENSHOTS)  origin=$(onoff $ORIGIN)  extras=$(onoff $EXTRAS)  vhost=$(onoff $VHOST)  nuclei=$(onoff $NUCLEI)  params=$(onoff $PARAMS)  secrets=$(onoff $SECRETS)  active-cms=$(onoff $ACTIVE)  activescan=$(onoff $ACTIVESCAN)"
 if [ "$NUCLEI$ACTIVE$ACTIVESCAN" != "000" ] && have nuclei; then
   case "$NUCLEI_OAST" in
@@ -3694,7 +3761,7 @@ export OSINT VIRUSTOTAL VT_API_KEY URLSCAN URLSCAN_API_KEY OSINT_MAX
 export SOCIAL SOCIAL_USER
 export RDAP_TIMEOUT RDAP_DELAY INTERNETDB_TIMEOUT INTERNETDB_DELAY VT_TIMEOUT VT_DELAY URLSCAN_TIMEOUT URLSCAN_DELAY
 export USE_DB CACHE_TTL RECON_DB_NAME RECON_DB_DSN PGDATABASE PGUSER PGHOST PGPORT PGPASSWORD
-export NEG_TTL CB_THRESHOLD CB_SERIALIZE PROXY HTTP_RETRIES LATE_RETRY SKIP_SPECIAL_USE NUCLEI_OAST NUCLEI_ISERVER ZONE_EXPOSURE
+export NEG_TTL CB_THRESHOLD CB_SERIALIZE PROXY HTTP_RETRIES LATE_RETRY SKIP_SPECIAL_USE NUCLEI_OAST NUCLEI_ISERVER ZONE_EXPOSURE DNS_POSTURE
 export CERT_WARN_DAYS TLS_CHAIN_CHECK EXTRAS FAVICON_LIMIT FAVICON_MAX_HASHES ORIGIN_PORTS RANGE_CERTS_FILE
 # route GET-heavy stages (curl/whatweb/gau/wget/python) through the proxy if set;
 # ProjectDiscovery tools additionally get an explicit -proxy flag at their call sites.
@@ -3851,6 +3918,426 @@ PYZONE
       log "DNS zone exposure: $(cut -f2 "$WORKDIR/zone_names.txt" | sort -u | wc -l | tr -d ' ') name(s) harvested; those under a seed join its candidates"
     fi
   fi
+fi
+
+# --- email and DNS posture (main process: per seed and zone apex, before the workers) ---
+# DNS queries through your resolvers (the first of --resolvers, else the system's), SOA
+# queries to each delegated name server for lameness, and one HTTPS GET of each published
+# MTA-STS policy (skipped under --passive-only). Findings -> parts/dnsposture.all.txt.
+if [ "$DNS_POSTURE" = "1" ]; then
+  mkdir -p "$WORKDIR/parts"
+  POSTURE_RES=""; [ -n "$RESOLVERS" ] && [ -s "$RESOLVERS" ] && POSTURE_RES="$(grep -vE '^\s*(#|$)' "$RESOLVERS" | head -n 1 | sed -E 's/:[0-9]+$//')"
+  log "Email/DNS posture: $(grep -c . "$DOMAINS_FILE") seed(s) and their zones${POSTURE_RES:+ (resolver $POSTURE_RES)}"
+  python3 - "$DOMAINS_FILE" "$WORKDIR/parts/dnsposture.all.txt" "$WORKDIR/dnsposture.tsv" "$POSTURE_RES" "$MTA_STS_CA" "$PASSIVE_ONLY" <<'PYPOSTURE' 2>>"$WORKDIR/dnsposture.err" || warn "email/DNS posture check failed (see $WORKDIR/dnsposture.err)"
+import subprocess, sys, re, os
+from concurrent.futures import ThreadPoolExecutor
+seeds_f, out_f, tsv_f, resolver, cafile, passive = sys.argv[1:7]
+res = ["@" + resolver] if resolver else []
+FIND, ROWS = [], []
+def dig(name, typ, server=None, norec=False, t=3):
+    """(status, answers, aa): status is NOERROR/NXDOMAIN/SERVFAIL/REFUSED/... or TIMEOUT;
+    answers are (owner, type, rdata text)."""
+    args = ["dig", "+time=%d" % t, "+tries=1", "+noall", "+answer", "+comments"]
+    if norec:
+        args.append("+norec")
+    args += (["@" + server] if server else res) + [typ, name]
+    try:
+        out = subprocess.run(args, capture_output=True, text=True, timeout=t * 3 + 5).stdout
+    except Exception:
+        out = ""
+    m = re.search(r"status: ([A-Z]+)", out)
+    status = m.group(1) if m else "TIMEOUT"
+    fl = re.search(r";; flags: ([^;]*);", out)
+    aa = bool(fl and " aa" in " " + fl.group(1))
+    ans = []
+    for line in out.splitlines():
+        if not line.strip() or line.startswith(";"):
+            continue
+        f = line.split(None, 4)
+        if len(f) >= 5 and f[2] == "IN":
+            ans.append((f[0].rstrip(".").lower(), f[3].upper(), f[4].strip()))
+    return status, ans, aa
+def txt(name):
+    st, ans, _ = dig(name, "TXT")
+    out = []
+    for o, t, r in ans:
+        if t == "TXT":
+            parts = re.findall(r'"((?:[^"\\]|\\.)*)"', r)
+            out.append("".join(parts) if parts else r)
+    return st, out
+def exists(name):
+    """'yes' (has A/AAAA), 'noaddr' (the name exists, no address) or 'nx' (NXDOMAIN)."""
+    sa, aa_, _ = dig(name, "A")
+    if any(t == "A" for o, t, r in aa_):
+        return "yes"
+    s6, a6, _ = dig(name, "AAAA")
+    if any(t == "AAAA" for o, t, r in a6):
+        return "yes"
+    return "nx" if sa == "NXDOMAIN" and s6 == "NXDOMAIN" else ("noaddr" if sa != "TIMEOUT" else "timeout")
+def parent_gone(name):
+    """the domain the name lives in (its last two labels) does not exist: whoever registers it
+    controls the name. Conservative under multi-label suffixes (co.uk exists): then False."""
+    p = ".".join(name.split(".")[-2:])
+    if "." not in p:
+        return False
+    st, _, _ = dig(p, "SOA")
+    return st == "NXDOMAIN"
+def add(bracket, kind, sev, host, note, **kv):
+    extra = "".join(" %s=%s" % (k, str(v).replace(" ", "_")) for k, v in kv.items() if v not in ("", None))
+    FIND.append("[%s] %s [%s] host=%s%s note=%s" % (bracket, kind, sev, host, extra, note))
+SPF_LOOKUP = re.compile(r"^[+?~-]?(include:|a$|a:|a/|mx$|mx:|mx/|ptr|exists:)|^redirect=", re.I)
+def spf_record(name):
+    st, recs = txt(name)
+    return st, [r for r in recs if re.match(r"(?i)^v=spf1(\s|$)", r)]
+def spf_walk(name, depth=0, seen=None, acc=None):
+    """count DNS-querying terms (RFC 7208 4.6.4: at most 10), follow include:/redirect=;
+    records missing or dangling includes"""
+    seen = seen if seen is not None else set()
+    acc = acc if acc is not None else {"lookups": 0, "missing": [], "dangling": [], "ptr": False}
+    if name in seen or depth > 5:
+        return acc
+    seen.add(name)
+    st, recs = spf_record(name)
+    if len(recs) != 1:
+        if depth > 0:
+            (acc["dangling"] if st == "NXDOMAIN" else acc["missing"]).append(name)
+        return acc
+    for term in recs[0].split()[1:]:
+        if SPF_LOOKUP.match(term):
+            acc["lookups"] += 1
+            if term.lower().lstrip("+?~-").startswith("ptr"):
+                acc["ptr"] = True
+            m = re.match(r"(?i)^[+?~-]?include:(\S+)$", term) or re.match(r"(?i)^redirect=(\S+)$", term)
+            if m and "%" not in m.group(1):
+                spf_walk(m.group(1).rstrip(".").lower(), depth + 1, seen, acc)
+    return acc
+def spf_all(name, depth=0):
+    st, recs = spf_record(name)
+    if len(recs) != 1 or depth > 3:
+        return ""
+    terms = recs[0].split()[1:]
+    for t in terms:
+        m = re.match(r"(?i)^([+?~-]?)all$", t)
+        if m:
+            return (m.group(1) or "+") + "all"
+    for t in terms:
+        m = re.match(r"(?i)^redirect=(\S+)$", t)
+        if m:
+            return spf_all(m.group(1).rstrip(".").lower(), depth + 1)
+    return "none"
+def tags(rec):
+    d = {}
+    for part in rec.split(";"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            d[k.strip().lower()] = v.strip()
+    return d
+def mx_hosts(name):
+    st, ans, _ = dig(name, "MX")
+    hs = []
+    for o, t, r in ans:
+        if t == "MX":
+            f = r.split()
+            if len(f) >= 2:
+                hs.append((int(f[0]) if f[0].isdigit() else 0, f[1].rstrip(".").lower()))
+    return st, sorted(hs)
+def mta_sts_policy(name):
+    """fetch https://mta-sts.<name>/.well-known/mta-sts.txt with certificate verification (RFC
+    8461 requires a valid certificate; MTA_STS_CA adds a CA, e.g. a lab's) and no redirects"""
+    host = "mta-sts." + name
+    args = ["curl", "-sS", "--max-time", "10", "-o", "-", "-w", "\n%{http_code}", "--proto", "=https"]
+    if cafile:
+        args += ["--cacert", cafile]
+    st, ans, _ = dig(host, "A")
+    ip = next((r for o, t, r in ans if t == "A"), "")
+    if ip:
+        args += ["--resolve", "%s:443:%s" % (host, ip)]
+    args.append("https://%s/.well-known/mta-sts.txt" % host)
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=20)
+    except Exception:
+        return None, "timeout"
+    body, _, code = p.stdout.rpartition("\n")
+    if p.returncode != 0:
+        why = {6: "no-address", 7: "refused", 28: "timeout", 35: "tls-error", 60: "untrusted-certificate"}.get(p.returncode, "curl-%d" % p.returncode)
+        return None, why
+    if code != "200":
+        return None, "status-" + code
+    pol = {"mx": []}
+    for line in body.splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            k, v = k.strip().lower(), v.strip()
+            if k == "mx":
+                pol["mx"].append(v.lower().rstrip("."))
+            else:
+                pol[k] = v
+    return pol, ""
+def mx_match(pattern, host):
+    if pattern.startswith("*."):
+        return host.count(".") >= 1 and host.split(".", 1)[1] == pattern[2:]
+    return host == pattern
+def mail_checks(bracket, name, apex, row):
+    st, mx = mx_hosts(name)
+    nullmx = len(mx) == 1 and mx[0][1] in ("", ".")
+    real_mx = [h for p, h in mx if h not in ("", ".")]
+    row["mx"] = "null" if nullmx else ";".join(real_mx) or "-"
+    sst, spf = spf_record(name)
+    if not (real_mx or spf or nullmx or name == apex):
+        return            # neither sends nor receives mail, and not a zone apex: nothing to judge
+    # SPF
+    if not spf:
+        if real_mx:
+            add(bracket, "spf-missing", "medium", name, "receives mail (MX) but publishes no SPF record: anyone can send as it")
+        else:
+            add(bracket, "spf-missing", "low", name, "no SPF record; a name that sends no mail should publish v=spf1 -all")
+        row["spf"] = "-"
+    elif len(spf) > 1:
+        add(bracket, "spf-multiple", "medium", name, "more than one SPF record: receivers treat that as a permanent error (RFC 7208 4.5)", records=len(spf))
+        row["spf"] = "multiple"
+    else:
+        row["spf"] = spf[0]
+        al = spf_all(name)
+        row["spf_all"] = al
+        if al == "+all":
+            add(bracket, "spf-permissive", "high", name, "the SPF record ends in +all: every server on the internet may send as this name", all=al)
+        elif al == "?all":
+            add(bracket, "spf-neutral", "medium", name, "the SPF record ends in ?all (neutral): it authorizes no one and protects nothing", all=al)
+        elif al == "none":
+            add(bracket, "spf-no-all", "medium", name, "the SPF record has no all mechanism, so mail from other servers is neutral")
+        w = spf_walk(name)
+        row["spf_lookups"] = str(w["lookups"])
+        if w["lookups"] > 10:
+            add(bracket, "spf-too-many-lookups", "medium", name, "more than 10 DNS-querying terms: receivers stop with a permanent error (RFC 7208 4.6.4)", lookups=w["lookups"])
+        for d in w["dangling"]:
+            add(bracket, "spf-include-dangling", "high" if parent_gone(d) else "medium", name,
+                "an include:/redirect= names a domain that does not exist: whoever registers it may send as this name", include=d)
+        for d in w["missing"]:
+            add(bracket, "spf-include-missing", "medium", name, "an include:/redirect= target publishes no single SPF record (permanent error)", include=d)
+        if w["ptr"]:
+            add(bracket, "spf-ptr", "low", name, "the ptr mechanism is deprecated (RFC 7208 5.5): slow and unreliable")
+    # DMARC: the name's own record, else the organizational domain's (sp= for subdomains)
+    src = name
+    _, dm = txt("_dmarc." + name)
+    dm = [r for r in dm if re.match(r"(?i)^v=DMARC1(\s|;|$)", r)]
+    if not dm and name != apex:
+        _, dm = txt("_dmarc." + apex)
+        dm = [r for r in dm if re.match(r"(?i)^v=DMARC1(\s|;|$)", r)]
+        src = apex
+    if not dm:
+        if real_mx or spf:
+            add(bracket, "dmarc-missing", "medium", name, "no DMARC record: receivers get no policy for mail that fails SPF/DKIM")
+        else:
+            add(bracket, "dmarc-missing", "low", name, "no DMARC record; a name that sends no mail should still publish v=DMARC1; p=reject")
+        row["dmarc"] = "-"
+    elif len(dm) > 1:
+        add(bracket, "dmarc-multiple", "medium", name, "more than one DMARC record: receivers ignore them all (RFC 7489 6.6.3)")
+        row["dmarc"] = "multiple"
+    else:
+        tg = tags(dm[0])
+        p = (tg.get("sp") if src != name and tg.get("sp") else tg.get("p", "")).lower()
+        row["dmarc"] = "p=%s%s" % (p or "?", "" if src == name else " (from %s)" % src)
+        if p not in ("none", "quarantine", "reject"):
+            add(bracket, "dmarc-invalid", "medium", name, "the DMARC record has no valid p= policy", record_at="_dmarc." + src)
+        elif p == "none":
+            add(bracket, "dmarc-none", "low", name, "DMARC p=none only monitors: spoofed mail is still delivered", record_at="_dmarc." + src)
+        try:
+            pct = int(tg.get("pct", "100"))
+        except ValueError:
+            pct = 100
+        if p in ("quarantine", "reject") and pct < 100:
+            add(bracket, "dmarc-partial", "low", name, "the DMARC policy applies to only part of the failing mail", pct=pct)
+        if not tg.get("rua"):
+            add(bracket, "dmarc-no-rua", "info", name, "no rua= address: nobody receives the aggregate reports", record_at="_dmarc." + src)
+    if not real_mx:
+        return
+    # MTA-STS and TLS-RPT: only for names that receive mail
+    _, sts = txt("_mta-sts." + name)
+    sts = [r for r in sts if re.match(r"(?i)^v=STSv1(\s|;|$)", r)]
+    if not sts:
+        add(bracket, "mta-sts-missing", "low", name, "no MTA-STS: mail to this name can be downgraded to plaintext or redirected by an attacker on the path")
+        row["mta_sts"] = "-"
+    elif passive == "1":
+        row["mta_sts"] = "record (policy not fetched: --passive-only)"
+    else:
+        pol, why = mta_sts_policy(name)
+        if pol is None:
+            add(bracket, "mta-sts-policy-unreachable", "medium", name, "the _mta-sts record exists but the policy cannot be fetched, so senders cannot apply it", reason=why)
+            row["mta_sts"] = "unreachable"
+        else:
+            mode = pol.get("mode", "").lower()
+            row["mta_sts"] = mode or "?"
+            if mode == "testing":
+                add(bracket, "mta-sts-testing", "info", name, "MTA-STS in testing mode: failures are reported, not enforced")
+            elif mode == "none":
+                add(bracket, "mta-sts-none", "low", name, "MTA-STS mode none: the policy is withdrawn")
+            elif mode != "enforce":
+                add(bracket, "mta-sts-invalid", "medium", name, "the MTA-STS policy has no valid mode", mode=mode or "-")
+            bad = [h for h in real_mx if not any(mx_match(p, h) for p in pol["mx"])]
+            if bad:
+                add(bracket, "mta-sts-mx-mismatch", "medium", name, "MX hosts the policy does not list: under enforce, senders refuse to deliver to them", mx=",".join(bad))
+    _, rpt = txt("_smtp._tls." + name)
+    if not [r for r in rpt if re.match(r"(?i)^v=TLSRPTv1(\s|;|$)", r)]:
+        add(bracket, "tlsrpt-missing", "info", name, "no TLS-RPT record: you are not told when senders fail to reach you over TLS")
+        row["tls_rpt"] = "no"
+    else:
+        row["tls_rpt"] = "yes"
+    # dangling MX: a mail exchanger name that does not exist
+    for h in real_mx:
+        e = exists(h)
+        if e == "nx":
+            hi = parent_gone(h)
+            add(bracket, "mx-dangling", "high" if hi else "medium", name,
+                ("the MX host's domain does not exist: whoever registers it receives this name's mail" if hi
+                 else "the MX host does not exist: mail to it fails (and its domain's owner could create it)"), mx=h)
+        elif e == "noaddr":
+            add(bracket, "mx-no-address", "medium", name, "the MX host exists but has no address: mail to it fails", mx=h)
+def caa_check(apex, row):
+    st, ans, _ = dig(apex, "CAA")
+    iss = sorted(set(re.sub(r'"', "", r.split(None, 2)[2]) for o, t, r in ans if t == "CAA" and len(r.split(None, 2)) == 3 and r.split()[1].lower() in ("issue", "issuewild")))
+    row["caa"] = ";".join(iss) or "-"
+    if not any(t == "CAA" for o, t, r in ans):
+        add(apex, "caa-missing", "low", apex, "no CAA record: any certificate authority may issue certificates for this zone")
+def ns_check(apex, row):
+    st, ans, _ = dig(apex, "NS")
+    nss = sorted(set(r.split()[0].rstrip(".").lower() for o, t, r in ans if t == "NS" and r.split()))
+    row["ns"] = ";".join(nss) or "-"
+    tested, timeouts, lame = 0, 0, []
+    for n in nss:
+        e = exists(n)
+        if e == "nx":
+            hi = parent_gone(n)
+            add(apex, "ns-dangling", "high" if hi else "medium", apex,
+                ("a delegated name server's domain does not exist: whoever registers it can answer for the whole zone" if hi
+                 else "a delegated name server does not exist: resolvers that pick it fail"), ns=n)
+            continue
+        _, a4, _ = dig(n, "A")
+        for ip in [r for o, t, r in a4 if t == "A"][:2]:
+            tested += 1
+            s, ans2, aa = dig(apex, "SOA", server=ip, norec=True)
+            if s == "TIMEOUT":
+                timeouts += 1; lame.append((n, ip, "timeout"))
+            elif s != "NOERROR" or not aa or not any(t == "SOA" for o, t, r in ans2):
+                lame.append((n, ip, s.lower() if s != "NOERROR" else "not-authoritative"))
+    if tested and timeouts == tested:
+        add(apex, "ns-unreachable", "info", apex, "no name server answered from here (outbound DNS to them may be blocked): not judged", tested=tested)
+        return
+    for n, ip, why in lame:
+        add(apex, "ns-lame", "medium", apex, "a delegated name server does not answer authoritatively for the zone (lame delegation)", ns="%s(%s)" % (n, ip), reason=why)
+seeds = sorted(set(l.strip().lower().rstrip(".") for l in open(seeds_f) if l.strip()))
+def soa_of(seed):
+    st, ans, _ = dig(seed, "SOA")
+    for o, t, r in ans:
+        if t == "SOA":
+            return seed, o
+    # the SOA arrives in the authority section for names below the apex
+    try:
+        out = subprocess.run(["dig", "+time=3", "+tries=1", "+noall", "+authority"] + res + ["SOA", seed],
+                             capture_output=True, text=True, timeout=14).stdout
+    except Exception:
+        out = ""
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) >= 4 and f[2] == "IN" and f[3] == "SOA":
+            return seed, f[0].rstrip(".").lower()
+    return seed, ""
+with ThreadPoolExecutor(max_workers=8) as ex:
+    apex_of = dict(ex.map(soa_of, seeds))
+names = {}
+for s_, a in apex_of.items():
+    if a:
+        names.setdefault(a, ("apex", a))
+    names.setdefault(s_, ("seed", a or s_))
+def one(item):
+    name, (role, apex) = item
+    row = {"name": name, "role": role, "apex": apex}
+    bracket = name if role == "apex" else name
+    mail_checks(bracket, name, apex, row)
+    if role == "apex":
+        caa_check(apex, row); ns_check(apex, row)
+    return row
+with ThreadPoolExecutor(max_workers=8) as ex:
+    ROWS = list(ex.map(one, sorted(names.items(), key=lambda x: (x[1][1], x[1][0] != "apex", x[0]))))
+COLS = ["name", "role", "apex", "mx", "spf", "spf_all", "spf_lookups", "dmarc", "mta_sts", "tls_rpt", "caa", "ns"]
+with open(tsv_f, "w") as o:
+    o.write("\t".join(COLS) + "\n")
+    for r in ROWS:
+        o.write("\t".join(str(r.get(c, "")).replace("\t", " ") for c in COLS) + "\n")
+SEV = {"high": 0, "medium": 1, "low": 2, "info": 3}
+def order(l):
+    m = re.match(r"^\[([^\]]*)\] (\S+) \[(\w+)\] host=(\S+)", l)
+    return (m.group(1), SEV.get(m.group(3), 9), m.group(2), m.group(4), l) if m else ("", 9, "", "", l)
+with open(out_f, "a") as o:
+    o.write("".join(l + "\n" for l in sorted(FIND, key=order)))
+PYPOSTURE
+fi
+
+# --- TLD variants (main process): the seed's name under other TLDs, listed only -------
+if [ "$TLD_VARIANTS" = "1" ]; then
+  mkdir -p "$WORKDIR/parts"
+  log "TLD variants: tldfinder on the seeds' names (public DNS; listed, never scanned)"
+  python3 - "$DOMAINS_FILE" "$WORKDIR/parts/tld-variants.all.txt" "${RESOLVERS:-}" "$PROXY" "$SCAN_TIMEOUT" <<'PYTLD' 2>>"$WORKDIR/tld.err" || warn "TLD variant listing failed (see $WORKDIR/tld.err)"
+import subprocess, sys, re
+seeds_f, out_f, resolvers, proxy, tmo = sys.argv[1:6]
+res = []
+if resolvers:
+    try:
+        res = [l.strip() for l in open(resolvers) if l.strip() and not l.startswith("#")][:1]
+    except OSError:
+        res = []
+def dig(name, typ):
+    try:
+        out = subprocess.run(["dig", "+short", "+time=2", "+tries=1"] + ["@" + r.rsplit(":", 1)[0] for r in res] + [typ, name],
+                             capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        out = ""
+    return sorted(set(l.strip().rstrip(".").lower() for l in out.splitlines() if l.strip() and not l.startswith(";")))
+def apex_of(name):
+    try:
+        out = subprocess.run(["dig", "+time=2", "+tries=1", "+noall", "+answer", "+authority"] + ["@" + r.rsplit(":", 1)[0] for r in res] + ["SOA", name],
+                             capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        out = ""
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) >= 4 and f[2] == "IN" and f[3] == "SOA":
+            return f[0].rstrip(".").lower()
+    p = name.split(".")
+    return ".".join(p[-2:]) if len(p) >= 2 else name
+seeds = sorted(set(l.strip().lower().rstrip(".") for l in open(seeds_f) if l.strip()))
+apexes = {}
+for sd in seeds:
+    a = apex_of(sd)
+    if "." in a:
+        apexes.setdefault(a, []).append(sd)
+labels = {}
+for a in apexes:
+    labels.setdefault(a.split(".")[0], []).append(a)
+if not labels:
+    sys.exit(0)
+args = ["tldfinder", "-d", ",".join(sorted(labels)), "-dm", "tld", "-silent", "-duc", "-nc", "-max-time", str(max(1, int(tmo or 600) // 60))]
+if res:
+    args += ["-r", ",".join(res)]
+if proxy:
+    args += ["-proxy", proxy]
+try:
+    out = subprocess.run(args, capture_output=True, text=True, timeout=int(tmo or 600) + 30, stdin=subprocess.DEVNULL).stdout
+except Exception:
+    out = ""
+own = set(apexes)
+lines = []
+for d in sorted(set(l.strip().lower().rstrip(".") for l in out.splitlines())):
+    if not re.fullmatch(r"[a-z0-9][a-z0-9.-]*\.[a-z0-9-]{2,}", d) or d in own:
+        continue
+    lab = d.split(".")[0]
+    for a in labels.get(lab, []):
+        ns_a, ns_d = dig(a, "NS"), dig(d, "NS")
+        same = "yes" if ns_a and ns_d and set(ns_a) & set(ns_d) else "no"
+        lines.append("[%s] tld-variant [info] host=%s of=%s same_ns=%s ns=%s note=the name is registered under another "
+                     "TLD; same_ns=yes suggests it is yours, otherwise check who holds it (look-alike or parked); not scanned"
+                     % (apexes[a][0], d, a, same, ",".join(ns_d[:3]) or "-"))
+open(out_f, "a").write("".join(l + "\n" for l in lines))
+PYTLD
 fi
 
 export -f _ss_norm 2>/dev/null || true
@@ -4857,6 +5344,25 @@ if [ "$ZONE_EXPOSURE" = "1" ]; then
     ok " zone names      : $OUTPUT.zone-names.txt ($(grep -c . "$WORKDIR/zone_names.txt") name(s))"
   fi
 fi
+# email/DNS posture and TLD variants (main-process stages)
+if [ "$DNS_POSTURE" = "1" ]; then
+  if [ -s "$WORKDIR/parts/dnsposture.all.txt" ]; then
+    cp "$WORKDIR/parts/dnsposture.all.txt" "$OUTPUT.dnsposture.txt"
+    ok " email/DNS       : $OUTPUT.dnsposture.txt ($(grep -c . "$OUTPUT.dnsposture.txt") finding(s))"
+  fi
+  if [ -s "$WORKDIR/dnsposture.tsv" ]; then
+    cp "$WORKDIR/dnsposture.tsv" "$OUTPUT.dnsposture.tsv"
+    ok " email/DNS names : $OUTPUT.dnsposture.tsv ($(( $(wc -l < "$OUTPUT.dnsposture.tsv") - 1 )) name(s) checked)"
+  fi
+fi
+if [ "$TLD_VARIANTS" = "1" ]; then
+  if [ -s "$WORKDIR/parts/tld-variants.all.txt" ]; then
+    cp "$WORKDIR/parts/tld-variants.all.txt" "$OUTPUT.tld-variants.txt"
+    ok " TLD variants    : $OUTPUT.tld-variants.txt ($(grep -c . "$OUTPUT.tld-variants.txt") name(s), listed only)"
+  else
+    ok " TLD variants    : none found"
+  fi
+fi
 # CNAME inventory from --takeover (every candidate with a CNAME, dangling or not)
 if ls "$WORKDIR"/parts/cname.*.tsv >/dev/null 2>&1; then
   { printf 'seed_domain\thost\tcname_chain\tdns\tprovider\n'; cat "$WORKDIR"/parts/cname.*.tsv | sort -u; } > "$OUTPUT.cname.tsv"
@@ -4941,6 +5447,147 @@ PYSSM
   fi
 fi
 
+# --- cloud inventory diff (cloudlist): your accounts vs what the scan found ----------
+if [ "$CLOUDLIST" = "1" ]; then
+  log "cloudlist: listing the assets of the accounts in $CLOUDLIST_CONFIG"
+  _to "$SCAN_TIMEOUT" cloudlist -pc "$CLOUDLIST_CONFIG" -json -silent -duc < /dev/null > "$WORKDIR/cloudlist.jsonl" 2>>"$WORKDIR/cloudlist.err" || true
+  if [ ! -s "$WORKDIR/cloudlist.jsonl" ]; then
+    warn " cloudlist listed no assets (check the provider config and credentials; see $WORKDIR/cloudlist.err)."
+  else
+    python3 - "$WORKDIR/cloudlist.jsonl" "$OUTPUT" "$DOMAINS_FILE" "$OUTPUT.cloud.txt" "$OUTPUT.cloud-assets.tsv" <<'PYCLOUD' 2>>"$WORKDIR/cloudlist.err" || warn " cloud inventory diff failed (see $WORKDIR/cloudlist.err)"
+import sys, json, csv, ipaddress, re
+cl_f, csv_f, seeds_f, out_f, tsv_f = sys.argv[1:6]
+seeds = sorted(set(l.strip().lower().rstrip(".") for l in open(seeds_f) if l.strip()))
+def in_scope(n):
+    return any(n == s or n.endswith("." + s) for s in seeds)
+def addr(v):
+    try:
+        return ipaddress.ip_address(str(v).strip())
+    except ValueError:
+        return None
+INTERNAL = [ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10",
+                                              "169.254.0.0/16", "fc00::/7", "fe80::/10")]
+def internal(ip):
+    return any(ip in n for n in INTERNAL if ip.version == n.version)
+# the scan's inventory: hosts and their addresses (ip and ipv6 columns), the cloud column
+hosts, ips, cloud_of = set(), {}, {}
+with open(csv_f, newline="", encoding="utf-8", errors="replace") as fh:
+    for r in csv.DictReader(fh):
+        h = (r.get("host") or "").lower()
+        if not h:
+            continue
+        hosts.add(h)
+        for col in ("ip", "ipv6"):
+            for v in re.split(r"[;, ]+", r.get(col) or ""):
+                a = addr(v)
+                if a:
+                    ips.setdefault(a, set()).add(h)
+                    if r.get("cloud"):
+                        cloud_of[a] = r["cloud"]
+assets, cl_ips, cl_names = [], set(), set()
+for line in open(cl_f, encoding="utf-8", errors="replace"):
+    try:
+        j = json.loads(line)
+    except Exception:
+        continue
+    if not isinstance(j, dict):
+        continue
+    names = [str(j[k]).lower().rstrip(".") for k in ("dns_name", "hostname", "host") if j.get(k)]
+    addrs = [a for a in (addr(v) for k, v in j.items() if "ip" in k.lower() and isinstance(v, str)) if a]
+    for n in names:
+        cl_names.add(n)
+    for a in addrs:
+        cl_ips.add(a)
+    assets.append((str(j.get("provider", "")), str(j.get("id", "")), str(j.get("service", "")), names, addrs))
+lines, rows = [], []
+for prov, acct, svc, names, addrs in assets:
+    seen_n = [n for n in names if n in hosts]
+    seen_a = [a for a in addrs if a in ips]
+    seen = bool(seen_n or seen_a)
+    pub = [a for a in addrs if not internal(a)]
+    rows.append("\t".join([prov, acct, svc, ";".join(names), ";".join(map(str, addrs)), "yes" if seen else "no"]))
+    if seen or (not names and not pub):
+        continue            # found by the scan, or internal-only (not expected on the internet)
+    for n in names:
+        lines.append("[cloud] cloud-asset-unseen [info] host=%s provider=%s account=%s service=%s scope=%s note=an asset of "
+                     "your cloud account that the scan did not find: not reachable from the internet, or a gap in "
+                     "discovery (add it as a seed if it should be covered)" % (n, prov, acct or "-", svc or "-",
+                                                                               "in" if in_scope(n) else "outside-seeds"))
+    if not names:
+        for a in pub:
+            lines.append("[cloud] cloud-asset-unseen [info] host=%s provider=%s account=%s service=%s note=an address of your "
+                         "cloud account that the scan did not find" % (a, prov, acct or "-", svc or "-"))
+# the other way: addresses the scan found in a cloud provider's ranges that no listed account owns
+for a, c in sorted(cloud_of.items(), key=lambda x: str(x[0])):
+    if a not in cl_ips:
+        hs = sorted(ips.get(a, ()))
+        lines.append("[cloud] cloud-ip-unaccounted [low] host=%s ip=%s cloud=%s note=serves your names from %s, but no account "
+                     "in the cloudlist config owns it: a CDN or SaaS front, a third party, or an account missing from the "
+                     "inventory" % (hs[0] if hs else a, a, c.replace(" ", "_"), c))
+open(out_f, "w").write("".join(l + "\n" for l in lines))
+open(tsv_f, "w").write("provider\taccount\tservice\tnames\taddresses\tseen_in_scan\n" + "".join(r + "\n" for r in rows))
+PYCLOUD
+    [ -s "$OUTPUT.cloud.txt" ] || rm -f "$OUTPUT.cloud.txt"
+    ok " cloud inventory : $OUTPUT.cloud-assets.tsv ($(( $(wc -l < "$OUTPUT.cloud-assets.tsv") - 1 )) asset(s))$([ -s "$OUTPUT.cloud.txt" ] && echo "; $(grep -c . "$OUTPUT.cloud.txt") finding(s) in $OUTPUT.cloud.txt")"
+  fi
+fi
+
+# --- product advisories (vulnx): CVEs filed against each product seen --------------
+if [ "$VULNX" = "1" ]; then
+  log "vulnx: product advisories for the CPEs in the inventory"
+  python3 - "$OUTPUT" "$OUTPUT.vulnx.txt" "$OUTPUT.vulnx.tsv" "$VULNX_LIMIT" "$VULNX_MAX_PRODUCTS" "$PROXY" <<'PYVULNX' 2>>"$WORKDIR/vulnx.err" || warn " vulnx lookups failed (see $WORKDIR/vulnx.err)"
+import sys, csv, json, subprocess, re
+csv_f, out_f, tsv_f, limit, maxp, proxy = sys.argv[1:7]
+prods = {}
+with open(csv_f, newline="", encoding="utf-8", errors="replace") as fh:
+    for r in csv.DictReader(fh):
+        for c in (r.get("cpe") or "").split(";"):
+            f = c.strip().split(":")
+            if len(f) > 5 and f[0] == "cpe" and re.fullmatch(r"[A-Za-z0-9_.+-]+", f[3] + f[4]):
+                d = prods.setdefault((f[3].lower(), f[4].lower()), {"versions": set(), "hosts": set()})
+                if f[5] not in ("", "*", "-"):
+                    d["versions"].add(f[5])
+                if r.get("host"):
+                    d["hosts"].add(r["host"].lower())
+lines, rows = [], []
+for (vendor, product), d in sorted(prods.items(), key=lambda x: (-len(x[1]["hosts"]), x[0]))[:int(maxp)]:
+    q = "affected_products.vendor:%s && affected_products.product:%s" % (vendor, product)
+    args = ["vulnx", "search", "--json", "--silent", "--disable-update-check", "--no-color", "-n", str(limit),
+            "--sort-desc", "epss_score", "--fields", "cve_id,cvss_score,epss_score,is_kev,is_poc,is_template,severity", q]
+    if proxy:
+        args[2:2] = ["--proxy", proxy]
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=90, stdin=subprocess.DEVNULL)
+        j = json.loads(p.stdout or "{}")
+    except Exception as e:
+        sys.stderr.write("vulnx %s:%s: %s\n" % (vendor, product, e))
+        continue
+    res = j.get("results") or []
+    total = j.get("total") or j.get("count") or len(res)
+    kev = ((((j.get("facets") or {}).get("is_kev") or {}).get("buckets") or {}).get("true")) or sum(1 for x in res if x.get("is_kev"))
+    vers = ",".join(sorted(d["versions"])) or "unknown"
+    hs = sorted(d["hosts"])
+    for x in res:
+        rows.append("\t".join([vendor, product, vers, str(len(hs)), str(x.get("cve_id", "")), str(x.get("cvss_score", "")),
+                               str(x.get("epss_score", "")), "yes" if x.get("is_kev") else "no",
+                               "yes" if x.get("is_poc") else "no", "yes" if x.get("is_template") else "no"]))
+    if not total:
+        continue
+    top = ",".join("%s(%s)" % (x.get("cve_id"), ";".join(filter(None, ["kev" if x.get("is_kev") else "",
+                   "epss=%.2f" % x["epss_score"] if isinstance(x.get("epss_score"), (int, float)) else ""])))
+                   for x in res[:5])
+    lines.append("[vulnx] product-advisories [info] host=%s product=%s:%s versions=%s hosts=%d cves=%s kev=%s top=%s "
+                 "note=CVEs filed against the product, any version: check which apply to the version you run"
+                 % (hs[0] if hs else "-", vendor, product, vers, len(hs), total, kev, top or "-"))
+open(out_f, "w").write("".join(l + "\n" for l in lines))
+open(tsv_f, "w").write("vendor\tproduct\tversions_seen\thosts\tcve\tcvss\tepss\tkev\tpoc\tnuclei_template\n" + "".join(r + "\n" for r in rows))
+PYVULNX
+  [ -s "$OUTPUT.vulnx.txt" ] || rm -f "$OUTPUT.vulnx.txt"
+  [ "$(wc -l < "$OUTPUT.vulnx.tsv" 2>/dev/null || echo 0)" -gt 1 ] || rm -f "$OUTPUT.vulnx.tsv"
+  if [ -s "$OUTPUT.vulnx.txt" ]; then ok " vulnx           : $OUTPUT.vulnx.txt ($(grep -c . "$OUTPUT.vulnx.txt") product(s) with CVEs)"
+  else ok " vulnx           : no product with filed CVEs (or no CPEs: run with --enrich/--tls for versions)"; fi
+fi
+
 # --- monitoring: diff discovered URLs against a prior CSV -------------------
 if [ "$MONITOR" = "1" ]; then
   PREV="$MONITOR_PREV"
@@ -4960,7 +5607,12 @@ if [ "$MONITOR" = "1" ]; then
     NN="$(wc -l < "$NEWASSETS" | tr -d ' ')"
     if [ "$NN" -gt 0 ]; then
       ok " Monitoring      : $NN new asset(s) vs $(basename "$PREV") -> $NEWASSETS"
-      if [ "$NOTIFY" = "1" ] && have notify; then notify -silent < "$NEWASSETS" 2>/dev/null || true; fi
+      if [ "$NOTIFY" = "1" ] && have notify; then
+        # one message per run (-bulk), to the providers in NOTIFY_CONFIG when set
+        _nf=(-silent -bulk); [ -n "$NOTIFY_CONFIG" ] && _nf+=(-pc "$NOTIFY_CONFIG"); [ -n "$PROXY" ] && _nf+=(-proxy "$PROXY")
+        { printf 'run-recon: %s new asset(s) vs %s\n' "$NN" "$(basename "$PREV")"; cat "$NEWASSETS"; } \
+          | _to 60 notify "${_nf[@]}" >/dev/null 2>>"$WORKDIR/notify.err" || warn " --notify: notify failed (see $WORKDIR/notify.err)"
+      fi
     else
       rm -f "$NEWASSETS"; ok " Monitoring      : no new assets vs $(basename "$PREV")."
     fi
@@ -5006,13 +5658,15 @@ for line in open(os.path.join(wd, "seedstat.tsv"), encoding="utf-8", errors="rep
     if len(f) >= 4:
         seeds.append({"seed": f[0], "candidates": num(f[1]), "resolved": num(f[2]), "live_hosts": num(f[3])})
 arts = {}
-for k in ("takeover", "origin", "zone", "extras", "favicon", "nuclei", "params", "secrets", "buckets", "cms", "activescan",
-          "osint", "virustotal", "urlscan", "social"):
+for k in ("takeover", "origin", "zone", "dnsposture", "cloud", "tld-variants", "vulnx", "extras", "favicon", "nuclei",
+          "params", "secrets", "buckets", "cms", "activescan", "osint", "virustotal", "urlscan", "social"):
     p = "%s.%s.txt" % (out, k)
     if os.path.isfile(p):
         arts[k] = sum(1 for l in open(p, encoding="utf-8", errors="replace") if l.strip())
 for k, p in (("edge_hosts", out + ".edge.tsv"), ("cname_names", out + ".cname.tsv"),
-             ("zone_names", out + ".zone-names.txt"), ("screenshots", out + ".screenshots.tsv")):
+             ("zone_names", out + ".zone-names.txt"), ("screenshots", out + ".screenshots.tsv"),
+             ("dnsposture_names", out + ".dnsposture.tsv"), ("cloud_assets", out + ".cloud-assets.tsv"),
+             ("vulnx_cves", out + ".vulnx.tsv")):
     if os.path.isfile(p):
         arts[k] = max(0, sum(1 for l in open(p, encoding="utf-8", errors="replace") if l.strip()) - 1)
 warns = []

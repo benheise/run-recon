@@ -26,18 +26,18 @@ container lab in this release and its output was checked.
 | subzy (not PD) | — | `--takeover` fingerprints | 1.2.1 | yes | |
 | subfinder | 2.17.0 | `--subs` | 2.17.0 | binary only | its sources are internet APIs; `.test` seeds skip them |
 | urlfinder | 0.0.3 | passive URLs | 0.0.3 | no | internet archives |
-| naabu | 2.7.0 | `--ports` | 2.7.0 | no | next: a non-standard-port service in the lab |
-| alterx | 0.1.0 | `--permute` | 0.1.0 | no | next: guessable names in the lab zone |
-| shuffledns | 1.2.1 | `--brute` (needs massdns) | 1.2.1 | no | next: same |
-| cdncheck | 1.4.0 | `--origin` | 1.4.0 | no | |
-| uncover | 1.2.1 | `--favicon` | 1.2.1 | no | `--favicon` actually queries `ssl:"<domain>"`; a real favicon-hash pivot is planned (§3) |
-| notify | 1.0.7 | `--monitor --notify` | 1.0.7 | no | |
+| naabu | 2.7.0 | `--ports` | 2.7.0 | yes (v1.20) | lab: `https://nginx.test:8443` found and probed (`bench-run-recon.sh discovery`) |
+| alterx | 0.1.0 | `--permute` | 0.1.0 | yes (v1.20) | lab: `grafana.nginx.test`, which only a permutation guesses |
+| shuffledns | 1.2.1 | `--brute` (needs massdns, built from source) | 1.2.1 | yes (v1.20) | lab: `backup-db.nginx.test` from the lab wordlist |
+| cdncheck | 1.4.0 | `--origin` | 1.4.0 | yes (v1.20) | lab edge untagged; `104.16.0.1 [waf] [cloudflare]` in the format `--origin` parses |
+| uncover | 1.2.1 | `--favicon` (cert-name search and, since v1.19, the favicon-hash pivot) | 1.2.1 | yes, without keys (v1.20) | no keys: one warning instead of silence; searches with keys stay V7 (Kali) |
+| notify | 1.0.7 | `--monitor --notify` (`-bulk`, `NOTIFY_CONFIG` → `-pc`) | 1.0.7 | yes (v1.20) | lab: one message to a loopback webhook naming the new asset |
 | chaos-client | 0.5.2 | via subfinder's `chaos` source (key in its provider config) | — | — | |
 | nuclei-templates | 10.5.1 | `nuclei -update-templates` (setup `--include-heavy`) | not pinned | — | templates update on their own schedule |
 | interactsh-client / -server | 1.4.1 | not called directly; `--interactsh-server URL` points nuclei at your own server | — | — | |
-| **cloudlist** | 1.5.1 | **not wired** | — | — | planned: owned-asset list from cloud APIs (§3) |
-| **tldfinder** | 0.0.2 | **not wired** | — | — | planned: the same brand under other TLDs |
-| **vulnx** | 2.0.2 | **not wired** | — | — | optional online complement to the offline NVD/KEV/EPSS join (adds PoC / template availability); successor of cvemap, whose API was retired on 2025-08-01 |
+| cloudlist | 1.5.1 | `--cloudlist [CFG]` (v1.20) | 1.5.1 | yes (v1.20) | lab: the Terraform provider reads `lab/cloud.tfstate` offline; real cloud accounts stay a Kali check |
+| tldfinder | 0.0.2 | `--tld-variants` (v1.20), `-dm tld` | 0.0.2 | suite only | it queries public DNS whatever `-r` says, so it cannot run inside the lab |
+| vulnx | 2.0.2 | `--vulnx` (v1.20) | 2.0.2 | yes (v1.20) | real API (no key) on the lab's CPEs; no version matching, so product-level leads; the module is `github.com/projectdiscovery/vulnx/v2` |
 | depx | 0.1.1 | not wired | — | — | supply-chain intelligence for lockfiles, SBOMs and GitHub orgs. Useful for DevSecOps pipelines, not for an external attack-surface scan |
 | pdtm | 0.1.5 | not used | — | — | it installs the latest release and offers no version selection, while run-recon parses tool output and needs pinned versions |
 | proxify, simplehttpserver, aix | — | not needed | — | — | `--proxy` covers proxying |
@@ -100,6 +100,6 @@ arrive behind a switch, as WebInventory's opt-in probes do.
 |---|---|---|
 | 1 | nuclei callbacks off by default; asnmap key check and visible errors; CNAME/dangling takeover check; katana honours `--resolvers`/`--proxy`; stdin closed for all tools; late HTTPS retry in the live probe; CSV formula guard; pinned tool versions with a lab-verified warning | **done in v1.17.0** |
 | 2 | httpx fields (final URL, redirect target, security headers, cookie flags, HSTS, Alt-Svc, body hash, response time, favicon mmh3) as appended CSV columns; real favicon pivot; reverse DNS; opt-in robots/security.txt | **done in v1.19.0** (see `PLAN.md`) |
-| 3 | Email and DNS posture (SPF, DMARC, MTA-STS, DNSSEC, CAA, dangling MX/NS); cloudlist inventory diff; tldfinder seed expansion; lab fixtures for naabu, alterx, shuffledns, cdncheck, uncover, notify | |
+| 3 | Email and DNS posture (SPF, DMARC, MTA-STS, DNSSEC, CAA, dangling MX/NS); cloudlist inventory diff; tldfinder seed expansion; lab fixtures for naabu, alterx, shuffledns, cdncheck, uncover, notify | **done on `batch-3-email-dns`** (v1.20, unreleased): `--dns-posture`, `--cloudlist`, `--tld-variants` (listed only), `--vulnx`; `bench-run-recon.sh posture` and `discovery` |
 | 4 | Evidence and history: scope file + dry run, run manifest and run.json, field-level delta, first/last seen in recon-db | run.json done in v1.18.0 |
 | report review | `REPORT-REVIEW.md`: `--zone-exposure`, verified `--origin`, screenshot routing and validation, run integrity (seed-resolving preflight, per-seed warnings, exit 3, run.json), report rebuild (names, cards, graded TLS), TLS chain validation, crawl-junk filter | **done in v1.18.0** |

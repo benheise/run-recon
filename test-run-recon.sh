@@ -299,6 +299,40 @@ for a in "$@"; do
 done
 # reverse DNS (-x IP): public addresses and the 10.0.0.0/8 test address have a PTR
 _px=0; for a in "$@"; do if [ "$_px" = 1 ]; then case "$a" in 93.184.216.34) echo "edge-93-184-216-34.example.net.";; 10.0.0.9) echo "db01.corp.example.";; esac; exit 0; fi; [ "$a" = "-x" ] && _px=1; done
+# --dns-posture fixtures for example.com (MOCK_POSTURE=bad|lookups|multi), answered in dig's
+# full format with a status header:
+#   NS ns1 (authoritative), ns-gone.gone-dns.net (domain gone: dangling), ns-lame (REFUSED)
+#   MX mx1 (exists), mx-old.gone-mail.net (domain gone); SPF include: an existing record and a
+#   domain that does not exist, ending ?all; DMARC quarantine pct=50 without rua; MTA-STS
+#   enforce listing mx1 only (curl mock); no TLS-RPT; no CAA
+if [ -n "${MOCK_POSTURE:-}" ] && [ "$comments" = 1 ]; then
+  st=NOERROR; aa=""; out=()
+  a(){ out+=("$1. 60 IN $2 $3"); }
+  case "$typ:$q" in
+    SOA:example.com) if [ "$srv" = 192.0.2.54 ]; then st=REFUSED; else aa=" aa"; a example.com SOA "ns1.example.com. hostmaster.example.com. 1 7200 3600 1209600 60"; fi;;
+    SOA:gone-dns.net|SOA:gone-mail.net|SOA:gone-spf.net) st=NXDOMAIN;;
+    NS:example.com) a example.com NS ns1.example.com.; a example.com NS ns-gone.gone-dns.net.; a example.com NS ns-lame.example.com.;;
+    A:ns1.example.com) a "$q" A 192.0.2.53;;    A:ns-lame.example.com) a "$q" A 192.0.2.54;;
+    A:mx1.example.com) a "$q" A 192.0.2.25;;    A:mta-sts.example.com) a "$q" A 192.0.2.80;;
+    A:ns-gone.gone-dns.net|AAAA:ns-gone.gone-dns.net|A:mx-old.gone-mail.net|AAAA:mx-old.gone-mail.net) st=NXDOMAIN;;
+    MX:example.com) a example.com MX "10 mx1.example.com."; a example.com MX "20 mx-old.gone-mail.net.";;
+    TXT:example.com)
+      case "$MOCK_POSTURE" in
+        lookups) a example.com TXT '"v=spf1 include:i1.example.com include:i2.example.com include:i3.example.com include:i4.example.com include:i5.example.com include:i6.example.com" " include:i7.example.com include:i8.example.com include:i9.example.com include:i10.example.com include:i11.example.com -all"';;
+        multi)   a example.com TXT '"v=spf1 -all"'; a example.com TXT '"v=spf1 mx -all"';;
+        *)       a example.com TXT '"v=spf1 include:_spf.example.com include:gone-spf.net ?all"';;
+      esac;;
+    TXT:_spf.example.com) a "$q" TXT '"v=spf1 ip4:192.0.2.0/24 -all"';;
+    TXT:i*.example.com) a "$q" TXT '"v=spf1 -all"';;
+    TXT:gone-spf.net) st=NXDOMAIN;;
+    TXT:_dmarc.example.com) a "$q" TXT '"v=DMARC1; p=quarantine; pct=50"';;
+    TXT:_mta-sts.example.com) a "$q" TXT '"v=STSv1; id=20261101"';;
+  esac
+  echo ";; ->>HEADER<<- opcode: QUERY, status: $st, id: 4242"
+  echo ";; flags: qr rd$aa; QUERY: 1, ANSWER: ${#out[@]}, AUTHORITY: 0, ADDITIONAL: 1"
+  [ "${#out[@]}" -gt 0 ] && printf '%s\n' "${out[@]}"
+  exit 0
+fi
 # resolver preflight (+noall +comments): MOCK_DIG_STATUS sets the reply status
 [ "$comments" = 1 ] && echo ";; ->>HEADER<<- opcode: QUERY, status: ${MOCK_DIG_STATUS:-NOERROR}, id: 4242"
 # a seed that is a CNAME to a name that does not exist (the resolve-gate warning)
@@ -608,7 +642,7 @@ EOF
 mk notify <<'EOF'
 #!/usr/bin/env bash
 printf '%s ' "$@" >> "$MOCKLOG/notify.args"; echo >> "$MOCKLOG/notify.args"
-cat >/dev/null
+cat > "$MOCKLOG/notify.stdin"
 EOF
 
 # --- passive subs (findomain) + GitHub mining + cloud buckets + resolvers ---
@@ -1190,7 +1224,11 @@ run_case monitor --monitor --monitor-prev "$PREVCSV" --notify
 assert_grep  "$CSV.new-assets.txt" 'gau-path'                         "new URL flagged as a new asset vs prior CSV"
 refute_grep  "$CSV.new-assets.txt" 'OLD-ONLY'                         "prior-only URL not reported as new"
 assert_grep  "$ERRLOG" 'new asset'                                    "monitoring summary reports new assets"
-assert_grep  "$MOCKLOG/notify.args" -- ''                            "notify invoked on the new-asset list"
+assert_grep  "$MOCKLOG/notify.args" -- '^-silent -bulk $'               "notify sends one message per run (-bulk)"
+assert_grep  "$MOCKLOG/notify.stdin" '^run-recon: [0-9]+ new asset\(s\) vs prev\.csv$' "the message opens with a summary line"
+assert_grep  "$MOCKLOG/notify.stdin" 'gau-path'                       "...and lists the new assets"
+NOTIFY_CONFIG="$TMP/notify.yaml" run_case monitor_cfg --monitor --monitor-prev "$PREVCSV" --notify
+assert_grep  "$MOCKLOG/notify.args" -- "-pc $TMP/notify\.yaml"          "NOTIFY_CONFIG picks the providers (-pc)"
 
 # --- 32) --all: umbrella enables the full discovery + defensive set ---------
 section "--all (umbrella flag)"
@@ -2134,6 +2172,17 @@ refute_grep  "$MOCKLOG/httpx.args" -- '-favicon'                            "--e
 assert_grep  "$MOCKLOG/uncover.args" -- 'http\.favicon\.hash:-732438843'     "the locally computed mmh3 drives the favicon pivot"
 
 section "Batch 2: --favicon pivots on the favicon hash (uncover), hits feed --origin"
+mv "$MOCKBIN/uncover" "$MOCKBIN/uncover.keys"
+mk uncover <<'EOF'
+#!/usr/bin/env bash
+printf '%s ' "$@" >> "$MOCKLOG/uncover.args"; echo >> "$MOCKLOG/uncover.args"
+echo '[FTL] Could not run enumeration: [uncover:RUNTIME] agents [shodan] requires keys but no keys were found' >&2
+exit 1
+EOF
+run_case favnokeys --favicon
+assert_grep  "$ERRLOG" '--favicon: uncover has no API keys for its engines'  "uncover without keys: one clear warning (was silent)"
+if [ "$(grep -c 'uncover has no API keys' "$ERRLOG")" = 1 ]; then _pass "...said once, not per call"; else _fail "...said once, not per call"; fi
+mv "$MOCKBIN/uncover.keys" "$MOCKBIN/uncover"
 run_case favpivot --favicon --origin
 assert_grep  "$MOCKLOG/uncover.args" -- '-shodan http\.favicon\.hash:-123456 -fofa icon_hash="-123456" -censys services\.http\.response\.favicons\.md5_hash: "0123456789abcdef0123456789abcdef" -silent -duc -l 100' "favicon hash searched on Shodan/Fofa (mmh3) and Censys (MD5), no update check, capped"
 assert_grep  "$MOCKLOG/uncover.args" -- '-q ssl:"example\.com" -silent -duc' "certificate-name search kept, without uncover's update check"
@@ -2464,6 +2513,108 @@ printf '%s ' "$@" >> "$MOCKLOG/curl.args"; echo >> "$MOCKLOG/curl.args"
 exit 0
 EOF
 
+
+# --- v1.20 Batch 3: email/DNS posture, cloud inventory, TLD variants, vulnx -------------
+section "Batch 3: --dns-posture, --cloudlist, --tld-variants, --vulnx"
+mk curl <<'EOF'
+#!/usr/bin/env bash
+printf '%s ' "$@" >> "$MOCKLOG/curl.args"; echo >> "$MOCKLOG/curl.args"
+case " $* " in
+  *"https://mta-sts.example.com/.well-known/mta-sts.txt"*)
+    printf 'version: STSv1\nmode: enforce\nmx: mx1.example.com\nmax_age: 604800\n\n200'; exit 0;;
+esac
+printf '000'; exit 7
+EOF
+MOCK_POSTURE=bad run_case posture --dns-posture
+P="$CSV.dnsposture.txt"
+assert_grep  "$ERRLOG" 'Email/DNS posture: 1 seed'                         "the posture stage runs in the main process, once"
+assert_grep  "$P" '^\[example\.com\] spf-neutral \[medium\] host=example\.com all=\?all '                      "SPF ?all -> spf-neutral [medium]"
+assert_grep  "$P" '^\[example\.com\] spf-include-dangling \[high\] host=example\.com include=gone-spf\.net '      "an include: of a domain that does not exist -> spf-include-dangling [high]"
+assert_grep  "$P" '^\[example\.com\] dmarc-partial \[low\] host=example\.com pct=50 '                           "DMARC pct=50 -> dmarc-partial [low]"
+assert_grep  "$P" '^\[example\.com\] dmarc-no-rua \[info\] host=example\.com '                                 "no rua= -> dmarc-no-rua [info]"
+assert_grep  "$P" '^\[example\.com\] mta-sts-mx-mismatch \[medium\] host=example\.com mx=mx-old\.gone-mail\.net ' "an MX host the enforced policy does not list -> mta-sts-mx-mismatch"
+refute_grep  "$P" 'mta-sts-(testing|none|invalid|missing|policy)'          "an enforced, fetched policy is not itself a finding"
+assert_fgrep "$MOCKLOG/curl.args" '--proto =https --resolve mta-sts.example.com:443:192.0.2.80 https://mta-sts.example.com/.well-known/mta-sts.txt' "the policy is fetched over HTTPS only, from the address DNS gave"
+refute_grep  "$MOCKLOG/curl.args" -- ' -k | --insecure '                    "the policy fetch verifies the certificate (RFC 8461)"
+assert_grep  "$P" '^\[example\.com\] tlsrpt-missing \[info\] host=example\.com '                               "no TLS-RPT -> tlsrpt-missing [info]"
+assert_grep  "$P" '^\[example\.com\] mx-dangling \[high\] host=example\.com mx=mx-old\.gone-mail\.net '          "an MX host whose domain does not exist -> mx-dangling [high]"
+assert_grep  "$P" '^\[example\.com\] ns-dangling \[high\] host=example\.com ns=ns-gone\.gone-dns\.net '          "a name server whose domain does not exist -> ns-dangling [high]"
+assert_grep  "$P" '^\[example\.com\] ns-lame \[medium\] host=example\.com ns=ns-lame\.example\.com\(192\.0\.2\.54\) reason=refused ' "a name server that refuses the zone -> ns-lame [medium]"
+refute_grep  "$P" 'ns-lame .*ns=ns1\.'                                    "the authoritative name server is not lame"
+assert_grep  "$P" '^\[example\.com\] caa-missing \[low\] host=example\.com '                                   "no CAA -> caa-missing [low]"
+assert_grep  "$MOCKLOG/dig.args" '\+norec @192\.0\.2\.54 SOA example\.com'    "lameness asked of the name server itself, without recursion"
+assert_grep  "$CSV.dnsposture.tsv" '^example\.com	apex	example\.com	mx1\.example\.com;mx-old\.gone-mail\.net	v=spf1 include:_spf\.example\.com include:gone-spf\.net \?all	\?all	2	p=quarantine	enforce	no	-	' "dnsposture.tsv: one row per name"
+assert_grep  "$CSV.run.json" '"dnsposture": 1[0-9]'                         "run.json counts the posture findings"
+bash "$(dirname "$RUN_RECON")/generate-report.sh" "$CSV" -o "$OUTDIR/p.html" >/dev/null 2>&1 || true
+if python3 -c 'import sys,re; s=open(sys.argv[1],encoding="utf-8").read(); t=re.sub(r"<[^>]+>"," ",s); sys.exit(0 if re.search(r"HIGH\s+Email / DNS posture\s+example\.com", t) and "Email and DNS posture" in s else 1)' "$OUTDIR/p.html" 2>/dev/null
+then _pass "report: posture findings in the findings table, and the posture table"; else _fail "report: posture findings in the findings table, and the posture table"; fi
+MOCK_POSTURE=bad run_case posture_passive --dns-posture --passive-only
+refute_grep  "$MOCKLOG/curl.args" 'mta-sts'                               "--passive-only: the MTA-STS policy is not fetched (DNS checks still run)"
+assert_grep  "$CSV.dnsposture.tsv" 'record \(policy not fetched: --passive-only\)' "...and the table says so"
+MOCK_POSTURE=lookups run_case posture_lookups --dns-posture
+assert_grep  "$CSV.dnsposture.txt" 'spf-too-many-lookups \[medium\] host=example\.com lookups=11 '               "11 DNS-querying terms -> spf-too-many-lookups (record split across strings)"
+MOCK_POSTURE=multi run_case posture_multi --dns-posture
+assert_grep  "$CSV.dnsposture.txt" 'spf-multiple \[medium\] host=example\.com records=2 '                       "two SPF records -> spf-multiple [medium]"
+run_case posture_off
+refute_grep  "$ERRLOG" 'Email/DNS posture'                                 "off by default"
+
+# --cloudlist: the accounts' assets vs the scan's inventory
+CLC="$TMP/cloudlist.yaml"; printf -- '- provider: aws\n  id: prod\n' > "$CLC"
+mk cloudlist <<'EOF'
+#!/usr/bin/env bash
+printf '%s ' "$@" >> "$MOCKLOG/cloudlist.args"; echo >> "$MOCKLOG/cloudlist.args"
+printf '{"public":true,"provider":"aws","service":"ec2","id":"prod","public_ipv4":"10.0.0.1","dns_name":"example.com"}\n'
+printf '{"public":true,"provider":"aws","service":"ec2","id":"prod","public_ipv4":"203.0.113.50","dns_name":"legacy-api.example.com"}\n'
+printf '{"public":true,"provider":"aws","service":"elb","id":"prod","public_ipv4":"203.0.113.51"}\n'
+printf '{"public":false,"provider":"aws","service":"ec2","id":"prod","private_ipv4":"10.9.9.9"}\n'
+EOF
+run_case cloud --cloudlist "$CLC"
+assert_grep  "$MOCKLOG/cloudlist.args" -- "-pc $CLC -json -silent -duc"      "cloudlist runs on the provider config given"
+assert_grep  "$CSV.cloud.txt" '^\[cloud\] cloud-asset-unseen \[info\] host=legacy-api\.example\.com provider=aws account=prod service=ec2 scope=in ' "a cloud asset the scan did not find (in scope) -> cloud-asset-unseen"
+assert_grep  "$CSV.cloud.txt" 'cloud-asset-unseen \[info\] host=203\.0\.113\.51 provider=aws'                     "an address-only asset the scan did not find"
+refute_grep  "$CSV.cloud.txt" 'host=example\.com |10\.9\.9\.9'              "assets the scan found, and internal-only addresses, are not reported"
+assert_grep  "$CSV.cloud-assets.tsv" '^aws	prod	ec2	example\.com	10\.0\.0\.1	yes$' "cloud-assets.tsv marks what the scan saw"
+bash "$(dirname "$RUN_RECON")/generate-report.sh" "$CSV" -o "$OUTDIR/c.html" >/dev/null 2>&1 || true
+assert_grep  "$OUTDIR/c.html" 'Cloud inventory'                           "report: cloud inventory findings listed"
+mkdir -p "$TMP/clhome"; HOME="$TMP/clhome" run_case cloud_nocfg --cloudlist
+assert_grep  "$ERRLOG" '--cloudlist: no provider config at'                 "no provider config: a clear warning, no run"
+rm -f "$MOCKBIN/cloudlist"
+
+# --tld-variants: listed only, with an ownership hint
+mk tldfinder <<'EOF'
+#!/usr/bin/env bash
+printf '%s ' "$@" >> "$MOCKLOG/tldfinder.args"; echo >> "$MOCKLOG/tldfinder.args"
+printf 'example.com\nexample.net\nexample.org\n'
+EOF
+run_case tld --tld-variants
+assert_grep  "$MOCKLOG/tldfinder.args" -- '-d example -dm tld -silent -duc -nc'  "tldfinder looks for the seed's name under other TLDs"
+assert_grep  "$CSV.tld-variants.txt" '^\[example\.com\] tld-variant \[info\] host=example\.net of=example\.com same_ns=' "variants listed with the domain they mirror"
+refute_grep  "$CSV.tld-variants.txt" 'host=example\.com '                   "the seed's own domain is not a variant"
+refute_grep  "$CSV" 'example\.net|example\.org'                             "variants are never scanned or added to the inventory"
+rm -f "$MOCKBIN/tldfinder"
+
+# --vulnx: product advisories for the CPEs the inventory holds
+mk vulnx <<'EOF'
+#!/usr/bin/env bash
+printf '%s ' "$@" >> "$MOCKLOG/vulnx.args"; echo >> "$MOCKLOG/vulnx.args"
+case " $* " in
+  *"product:nginx"*) printf '{"count":2,"facets":{"is_kev":{"buckets":{"true":1,"false":36}}},"results":[{"cve_id":"CVE-2023-44487","cvss_score":7.5,"epss_score":0.94,"is_kev":true,"is_poc":true,"severity":"high"},{"cve_id":"CVE-2021-23017","cvss_score":7.7,"epss_score":0.53,"severity":"high"}],"total":37}';;
+  *) printf '{"count":0,"results":[],"total":0}';;
+esac
+EOF
+run_case vulnx --vulnx
+assert_grep  "$MOCKLOG/vulnx.args" -- 'search --json --silent --disable-update-check --no-color -n 10 --sort-desc epss_score .*affected_products\.vendor:f5 && affected_products\.product:nginx' "vulnx asked for the product's CVEs, most likely exploited first"
+assert_grep  "$CSV.vulnx.txt" '^\[vulnx\] product-advisories \[info\] host=[^ ]+ product=f5:nginx versions=unknown hosts=[0-9]+ cves=37 kev=1 top=CVE-2023-44487\(kev;epss=0\.94\),CVE-2021-23017\(epss=0\.53\) ' "one advisory line per product: CVE and KEV counts, the top CVEs (versionless CPE: versions=unknown)"
+assert_grep  "$CSV.vulnx.tsv" '^f5	nginx	unknown	[0-9]+	CVE-2023-44487	7\.5	0\.94	yes	yes	no$' "vulnx.tsv: one row per CVE"
+refute_grep  "$CSV.vulnx.txt" 'product=php:php'                          "a product with no filed CVEs gets no line"
+bash "$(dirname "$RUN_RECON")/generate-report.sh" "$CSV" -o "$OUTDIR/v.html" >/dev/null 2>&1 || true
+assert_grep  "$OUTDIR/v.html" 'Product advisory \(vulnx\)'                   "report: vulnx advisories counted as context"
+rm -f "$MOCKBIN/vulnx"
+mk curl <<'EOF'
+#!/usr/bin/env bash
+printf '%s ' "$@" >> "$MOCKLOG/curl.args"; echo >> "$MOCKLOG/curl.args"
+exit 0
+EOF
 
 # --- 53) service health check: --resolvers catches dead resolvers ----------
 # (placed last: swaps the dig mock for one that reports no reply)
