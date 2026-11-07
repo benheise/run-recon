@@ -627,8 +627,8 @@ date | as_root tee "$INSTALL_ROOT/.provisioned" >/dev/null
 
 # ===========================================================================
 # 8) install the companion operational scripts
-#    run-recon.sh needs generate-report.sh and recon-db.sh to live NEXT TO IT
-#    (it resolves them relative to its own path), so install all three together.
+#    run-recon.sh needs generate-report.sh, recon-db.sh and ship-recon.sh to live NEXT
+#    TO IT (it resolves them relative to its own path), so install them together.
 # ===========================================================================
 if [ "$RUNNER_FOUND" = "yes" ]; then
   log "Installing toolkit scripts from $SCRIPT_DIR ..."
@@ -639,7 +639,7 @@ if [ "$RUNNER_FOUND" = "yes" ]; then
   else
     warn "Could not install run-recon.sh automatically."
   fi
-  for _companion in generate-report.sh recon-db.sh; do
+  for _companion in generate-report.sh recon-db.sh ship-recon.sh; do
     _cmd="${_companion%.sh}"
     if [ -f "$SCRIPT_DIR/$_companion" ]; then
       if as_root install -m 0755 "$SCRIPT_DIR/$_companion" "$INSTALL_ROOT/bin/$_companion" \
@@ -658,6 +658,15 @@ if [ "$RUNNER_FOUND" = "yes" ]; then
       ok "Installed: $INSTALL_ROOT/bin/cpe-aliases.json  (CPE alias groups for recon-db vulns)"
     else
       warn "Could not install cpe-aliases.json; recon-db vulns will join exact CPE names only."
+    fi
+  fi
+  # the JSON Schemas of --json's records and of the Tideline envelope (1.20), for consumers
+  if [ -d "$SCRIPT_DIR/schemas" ]; then
+    if as_root install -d -m 0755 "$INSTALL_ROOT/bin/schemas" \
+       && as_root install -m 0644 "$SCRIPT_DIR"/schemas/*.json "$INSTALL_ROOT/bin/schemas/"; then
+      ok "Installed: $INSTALL_ROOT/bin/schemas/  (JSON Schemas of the --json records and the Tideline envelope)"
+    else
+      warn "Could not install schemas/."
     fi
   fi
 else

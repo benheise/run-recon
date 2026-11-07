@@ -9,9 +9,9 @@ justified accuracy fix).
 **Status:** Done · In progress · Planned · Blocked (needs something from Ben) · Won't do
 **Last updated:** 2026-11-06, follow-ups F1–F10 done on `followups-v1.18` (PR #3), Batch 3 on
 `batch-3-email-dns` (PR #4), Batch 4 on `batch-4-evidence` (PR #5) and Batch 5 on `batch-5-redirects-tls`
-(PR #6, stacked on #5). That was the last open batch work (B2.8, T1–T2, plus X1): v1.20.0 can be released once the
-pull requests are merged. The V-list (section 2) still needs Ben's Kali VM; section 8 is planned for after
-the release.
+(PR #6, stacked on #5). Section 8 (JSON output and shipping to Tideline, P1–P3) was brought forward at
+Ben's request and is done as Batch 6 on `batch-6-json-ship` (PR #7, stacked on #6). v1.20.0 can be released
+once the pull requests are merged. The V-list (section 2) still needs Ben's Kali VM.
 
 ## 0. Source of truth
 
@@ -19,7 +19,7 @@ the release.
 |---|---|---|---|
 | R1 | Git repository, `main` = v1.18.0, generated lab files ignored | Done | `git log` |
 | R2 | Push to GitHub (private `benheise/run-recon`) | Done: `main` pushed; releases v1.18.0 and v1.19.0 published. Tags cannot be pushed from Claude's sessions (HTTP 403), so releases/tags are created in the GitHub UI | tags `v1.18.0`, `v1.19.0` on GitHub |
-| R3 | Each batch on its own branch, merged by pull request | Done for Batch 2 (#1, merged); follow-ups #3; Batch 3 #4; Batch 4 #5; Batch 5 #6 (stacked on #5) | PR per batch |
+| R3 | Each batch on its own branch, merged by pull request | Done for Batch 2 (#1, merged); follow-ups #3; Batch 3 #4; Batch 4 #5; Batch 5 #6 (stacked on #5); Batch 6 #7 (stacked on #6) | PR per batch |
 
 ## 1. Batch 2: HTTP detail (WebInventory A4, A5, A6, A11)
 
@@ -96,19 +96,23 @@ the release.
 |---|---|---|---|
 | X1 | CPE alias groups in the vulns join (the WebInventory 2.4.0 cross-check: run-recon missed Jira Server/Data Center and Varnish's other vendor strings) | Done (`batch-5-redirects-tls`): `cpe-aliases.json` (WebInventory's 184 groups, commit a8383ec) next to `recon-db.sh`; provenance records it | suite (a CVE filed under `jira_server` joins `atlassian:jira`; `CPE_ALIASES_FILE=` off; found through the installed symlink) |
 
-## 8. After the 1.20.0 release: result shipping (recon-platform-plan §11)
+## 8. Batch 6: JSON output and result shipping to Tideline (recon-platform-plan §11)
 
-The run-recon side of the platform plan (`claude/recon-platform-plan-v0.4.md` in the project). Not started.
+The run-recon side of the platform plan (`claude/recon-platform-plan-v0.5.md` in the project). Tideline is
+the platform's name (`claude/naming-research.md`); the protocol identifiers use it (`tideline-envelope/1`,
+`Tideline-Signature`, `urn:tideline:sensor:<id>`). Planned for after the release, brought forward at Ben's
+request. Details: SHIPPING.md.
 
 | ID | Item | Status | Check |
 |---|---|---|---|
-| P1 | JSONL per record kind (services and hosts, URLs, findings, DNS posture, edge and origin, screenshot classes, warnings), from the code that writes the CSV, same field names | Planned | suite; schema contract test |
-| P2 | `run_id` (UUID v4) and `--engagement ID` in run.json and the manifest | Planned | suite |
-| P3 | `--ship URL` with `--ship-cert`/`--ship-key`/`--ship-ca` (mTLS, signed manifest, `ship-state.json`), its own exit code; `ship-recon.sh` to re-ship, resume and export | Planned | suite against a mock ingest; `bench-run-recon.sh ship` (the shipped run equals the local CSV) |
+| P1 | `--json`: JSON lines per record kind with the CSV's and TSVs' field names: urls and services (from the CSV builder itself, unguarded), findings, DNS posture, edges, CNAMEs, zone names, screenshot classes, cloud assets, vulnx, delta, warnings, seeds; JSON Schemas (2020-12) in `schemas/` | Done (`batch-6-json-ship`) | suite: parity with the CSV, the findings parser, the schema contract (field lists read from the source); lab A/B |
+| P2 | `run_id` (UUID v4, kept across `--resume`), `--engagement`, `--job-id` in run.json and the manifest | Done | suite (incl. `--resume`) |
+| P3 | `--ship URL` with `--ship-cert`/`--ship-key`/`--ship-ca`/`--ship-proxy`: mTLS pinned to the Tideline CA (an empty `--capath`: `--cacert` alone still trusts the system store), signed `tideline-envelope/1` (ES256), gzip parts hashed as in the run's manifest, `ship-state.json`, exit 4; preflight before the scan; `ship-recon.sh` ship/status/export/envelope/check | Done | suite against `lab/mock-tideline.py` (delivery, re-ship, resume, refusals, pinning, export); `bench-run-recon.sh ship` (the shipped records equal the local CSV row for row) |
+| P4 | WebInventory's side (`-ShipTo`, `Send-WebInventoryRun.ps1`, `Register-WebInventorySensor.ps1`) against the same envelope, and moving `schemas/` to a `tideline-schemas` repository | Planned (WebInventory, Tideline) | contract test of both tools' lab output |
 
 ## Done (for reference)
 
-- **1.20.0 (unreleased, Batches 3–5 and the follow-ups):** see sections 3–7.
+- **1.20.0 (unreleased, Batches 3–6 and the follow-ups):** see sections 3–8.
 
 - **1.19.0 (Batch 2):** 17 HTTP columns from the enrichment request (no extra traffic); favicon hashes;
   real favicon-hash pivot feeding `--origin`; `ptr` under `--enrich`; `--extras` (robots.txt, security.txt,

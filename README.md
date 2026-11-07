@@ -230,6 +230,31 @@ NOTIFY_CONFIG=notify.yaml run-recon -i d.txt --monitor --notify      # one messa
 run-recon -i domains.txt --all                           # full discovery + defensive set (see below)
 ```
 
+### JSON output & Tideline
+
+```bash
+run-recon -i domains.txt --json                          # also every record kind as JSON lines: results.csv.<kind>.jsonl
+run-recon -i domains.txt --engagement eng-2026-014 \
+  --ship https://tideline.internal:8443 --ship-cert rr-kali01.crt --ship-key rr-kali01.key --ship-ca root_ca.crt
+                                                         # send the finished run to Tideline (mTLS, signed, resumable)
+ship-recon.sh ship results.csv                           # retry a delivery that failed (exit 4): sends only what is missing
+ship-recon.sh export results.csv --cert C --key K        # bundle for a hand-carried upload
+```
+
+`--json` writes `urls`, `services`, `findings`, `warnings` and `seeds`. It also writes each TSV
+inventory that ran: `dnsposture`, `edges`, `cnames`, `zone-names`, `screenshots`, `cloud-assets`,
+`vulnx` and `delta`. The field names are the CSV's and the TSVs' own, and each kind has a JSON Schema
+in `schemas/`.
+
+`--ship URL` sends the run to Tideline, the recon results platform, and implies `--json`. The
+certificate and key come from Tideline's step-ca: ECDSA P-256, with the sensor ID as the URI SAN
+`urn:tideline:sensor:<id>`. The server is checked against `--ship-ca` only, never the system trust
+store. The settings are checked before the scan starts.
+
+Every run records a `run_id` (UUID v4, kept across `--resume`) in run.json. `--engagement` and
+`--job-id` are recorded there as well. Protocol, exit codes, record schemas and enrollment are in
+[SHIPPING.md](SHIPPING.md).
+
 `--all` enables `--subs --resolve --certs --permute --brute --ports --js --crawlers-all --takeover --zone-exposure --dns-posture --screenshots --origin --extras --active --activescan --osint --tls-enum --ipv6 --enrich`. The remaining scanning stages (`--nuclei`, `--params`, `--secrets`, `--buckets`) and `--favicon` / `--vhost` / `--virustotal` / `--urlscan` / `--social` / `--monitor` / `--cloudlist` / `--tld-variants` / `--vulnx` stay opt-in. `--enrich` fetches the cloud IP-range feeds and makes per-IP RDAP and reverse-DNS lookups (passive, no packets to targets; PTR lookups of non-public addresses go only to resolvers you pass with `--resolvers`); `geo` still needs `--geodb`.
 
 ### Pipeline (per seed domain)
@@ -395,7 +420,7 @@ The CSV is written inside the distro. Open it from Windows via
 
 ### Run record, exit status and side files
 
-Every run writes `<out>.run.json`: run-recon version, the command line (proxy credentials replaced by
+Every run writes `<out>.run.json`: run-recon version, `run_id` (with `engagement` and `job_id`), the command line (proxy credentials replaced by
 `***`), start time and duration, seed count and per-seed counts (candidates, resolved, live hosts), the
 versions of httpx/katana/tlsx/dnsx, the resolvers and the result of their check, line counts of every side
 artifact, all warnings, and the exit status. The HTML report's run header is built from it.
@@ -403,8 +428,9 @@ artifact, all warnings, and the exit status. The HTML report's run header is bui
 | Exit status | Meaning |
 |---|---|
 | `0` | the run finished with at least one URL row |
-| `2` | bad arguments or input, or refused by `--scope` (nothing was sent) |
+| `2` | bad arguments or input, refused by `--scope`, or unusable `--ship` settings (nothing was sent) |
 | `3` | the run finished with **no results** (0 URL rows). The log ends with "Finished with NO results" instead of "Complete.", and the report shows a banner |
+| `4` | the run finished with results, but `--ship` could not deliver them. The run is complete locally; `ship-recon.sh ship <csv>` retries |
 | `130` / `143` | interrupted by SIGINT (Ctrl-C) / SIGTERM: every stage the run started is stopped, the work dir is kept, and the same command with `--resume` continues it |
 
 **Evidence: `<out>.manifest.sha256`.** The last thing a run writes is the SHA-256 of every file it wrote:
@@ -437,8 +463,9 @@ Side files next to the CSV, by flag: `.takeover.txt` + `.cname.tsv` (`--takeover
 `.favicon.txt` (`--favicon`), `.screenshots.tsv` +
 `screenshots-<ts>/` (`--screenshots`), `.nuclei.txt`, `.params.txt`, `.secrets.txt`, `.buckets.txt`,
 `.cms.txt`, `.activescan.txt`, `.osint.txt`, `.virustotal.txt`, `.urlscan.txt`, `.social.txt`,
-`.new-assets.txt` + `.delta.tsv` (`--monitor`), `.scope.txt` (`--scope`), `.run.json` (always), `.report.html`
-and `.manifest.sha256` (always, written last).
+`.new-assets.txt` + `.delta.tsv` (`--monitor`), `.scope.txt` (`--scope`), `.<kind>.jsonl` (`--json`), `.run.json`
+(always), `.report.html` and `.manifest.sha256` (always, written last). `.ship-state.json` (`--ship`) is written
+after the manifest and is not listed in it.
 
 **Zone exposure findings** (`.zone.txt`, one line per zone):
 
@@ -925,8 +952,8 @@ sudo sh -c './bench-run-recon.sh hosts >> /etc/hosts'    # once: names for tools
 ./bench-run-recon.sh bench --runs 3 --farm --flags "--tls --ipv6 -t 10"    # load
 ./bench-run-recon.sh bench --runs 3 --flags "--tls --ipv6" --baseline-script old/run-recon.sh   # A/B two versions
 ./bench-run-recon.sh compare run-a.csv run-b.csv --exact # field-by-field identity
-./bench-run-recon.sh checks                              # takeover, zone, origin, http, posture, discovery, scope,
-                                                         #   resume, history (RECON_DB_DSN=... adds the store)
+./bench-run-recon.sh checks                              # takeover, zone, origin, http, tls, posture, discovery, scope,
+                                                         #   resume, history (RECON_DB_DSN=... adds the store), ship
 ./bench-run-recon.sh down
 ```
 

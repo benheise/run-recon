@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tideline:schema:run-recon.edge/1",
+  "title": "run-recon edge",
+  "description": "One live host's edge and origin attributes from --origin (a row of <out>.edge.tsv). Values are strings, as in the TSV.",
+  "x-tideline-schema": "run-recon.edge/1",
+  "x-minor": 0,
+  "type": "object",
+  "properties": {
+    "seed_domain": {
+      "type": "string"
+    },
+    "host": {
+      "type": "string"
+    },
+    "edge": {
+      "type": "string"
+    },
+    "origin_software": {
+      "type": "string"
+    },
+    "edge_evidence": {
+      "type": "string"
+    },
+    "jarm": {
+      "type": "string"
+    },
+    "cdn": {
+      "type": "string"
+    },
+    "favicon_mmh3": {
+      "type": "string"
+    },
+    "title": {
+      "type": "string"
+    },
+    "edge_ip": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "seed_domain",
+    "host",
+    "edge",
+    "origin_software",
+    "edge_evidence",
+    "jarm",
+    "cdn",
+    "favicon_mmh3",
+    "title",
+    "edge_ip"
+  ],
+  "additionalProperties": {
+    "type": "string"
+  }
+}

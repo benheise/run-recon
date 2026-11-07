@@ -2920,6 +2920,7 @@ assert_grep  "$RS/err0.txt" 'is still running \(its lock is held\)'         "--r
 kill -TERM "$RP" 2>/dev/null; _rc=0; wait "$RP" || _rc=$?
 _rc_is "$_rc" 143                                                           "SIGTERM: the run stops with exit 143"
 W="$(ls -d "$RS/out"/_work-* 2>/dev/null | head -n 1)"
+_rsid="$(sed -n 's/^run_id=//p' "$W/state" 2>/dev/null)"
 assert_grep  "$W/state" '^status=interrupted$'                               "SIGTERM: the work dir is kept and marked interrupted"
 assert_grep  "$W/state" '^args_sha256=[0-9a-f]{64}$'                         "state: a hash of the command line (no values)"
 if [ -e "$W/done/example.com" ] && [ -s "$W/parts/map.example.com.tsv" ]; then _pass "SIGTERM: the finished seed's work is there"; else _fail "SIGTERM: the finished seed's work is there"; fi
@@ -2941,6 +2942,7 @@ assert_grep  "$MOCKLOG/gau.seeds" '^slow\.example\.org$'                     "--
 if diff <(sort "$RS/full/r.csv") <(sort "$RS/out/r.csv") >/dev/null 2>&1; then _pass "--resume: the CSV equals the uninterrupted run's"; else _fail "--resume: the CSV equals the uninterrupted run's"; fi
 assert_grep  "$RS/out/r.csv.run.json" '"sessions": 2'                        "run.json: two sessions"
 assert_grep  "$RS/out/r.csv.run.json" '"seeds_resumed": 1'                   "run.json: one seed carried over"
+if [ -n "$_rsid" ] && grep -q "\"run_id\": \"$_rsid\"" "$RS/out/r.csv.run.json"; then _pass "--resume keeps the run_id (Tideline sees one run)"; else _fail "--resume keeps the run_id  [state: ${_rsid:-none}]"; fi
 _rc=0; _rr "$RS/out" "$RS/err4.txt" --resume || _rc=$?
 _rc_is "$_rc" 2                                                             "--resume after the run finished: nothing to resume (exit 2)"
 # SIGINT (Ctrl-C) works the same way (here with SIGINT restored to its default: a script's
@@ -3259,6 +3261,434 @@ if [ "$(wc -l < "$X1D/v0.csv")" = 1 ]; then _pass "CPE_ALIASES_FILE= turns the a
 mkdir -p "$X1D/bin"; ln -sf "$RDB" "$X1D/bin/recon-db"
 env PATH="$TESTPATH" bash "$X1D/bin/recon-db" vulns "$X1D/r.csv" --nvd-feed "$X1D/nvd" -o "$X1D/v2.csv" >/dev/null 2>&1
 assert_grep  "$X1D/v2.csv" 'CVE-2026-0001'                    "run through a symlink (the installed command), the alias file is still found"
+
+# --- Batch 6: JSON lines (--json), run_id/--engagement, shipping to Tideline (--ship) ----
+section "Batch 6: the CSV builder writes urls.jsonl and services.jsonl (RR_JSON=1), unguarded"
+B6="$TMP/b6"; rm -rf "$B6"; mkdir -p "$B6/agg"
+LABDIR6="$(dirname "$RUN_RECON")/lab"; SCHEMAS6="$(dirname "$RUN_RECON")/schemas"; SHIP6="$(dirname "$RUN_RECON")/ship-recon.sh"
+awk "/^python3 - .*<<'PY'/{f=1;next} f&&/^PY\$/{f=0} f" "$RUN_RECON" > "$B6/agg/agg.py"
+printf 'ex.com\thttps://a.ex.com/\tgau\nex.com\thttps://a.ex.com/login?x=1\tkatana\nex.com\thttps://a.ex.com:8443/admin\tkatana\nex.com\thttp://b.ex.com/p\tgau\nother.org\thttps://a.ex.com/\tgau\n' > "$B6/agg/map.tsv"
+cat > "$B6/agg/httpx.jsonl" <<'JX'
+{"input":"https://a.ex.com/","url":"https://a.ex.com/","status_code":200,"title":"=HYPERLINK(\"http://x\")","webserver":"nginx","host":"1.1.1.1","a":["1.1.1.1"]}
+{"input":"https://a.ex.com/login?x=1","url":"https://a.ex.com/login?x=1","status_code":200,"title":"+1 login","host":"1.1.1.1","a":["1.1.1.1"]}
+{"input":"https://a.ex.com:8443/admin","url":"https://a.ex.com:8443/admin","status_code":401,"title":"Admin","host":"1.1.1.1","a":["1.1.1.1"]}
+{"input":"http://b.ex.com/p","url":"http://b.ex.com/p","status_code":404,"title":"Not found","host":"2.2.2.2","a":["2.2.2.2"]}
+JX
+( cd "$B6/agg" && env PATH="$TESTPATH" python3 agg.py map.tsv httpx.jsonl off.csv 0 100 >/dev/null 2>&1 )
+if [ -f "$B6/agg/off.csv" ] && ! ls "$B6/agg"/off.csv.*.jsonl >/dev/null 2>&1; then _pass "without --json the CSV builder writes no JSON lines"; else _fail "without --json the CSV builder writes no JSON lines"; fi
+( cd "$B6/agg" && env PATH="$TESTPATH" RR_JSON=1 python3 agg.py map.tsv httpx.jsonl out.csv 0 100 >/dev/null 2>&1 )
+python3 - "$B6/agg/out.csv" > "$B6/agg/check.txt" 2>&1 <<'PYB6A'
+import csv, json, sys
+out = sys.argv[1]
+rows = list(csv.reader(open(out, newline="", encoding="utf-8")))
+hdr, body = rows[0], rows[1:]
+def ung(v):
+    return v[1:] if v[:1] == "'" and v[1:2] in ("=", "+", "-", "@", "\t", "\r") else v
+js = [json.loads(l) for l in open(out + ".urls.jsonl", encoding="utf-8")]
+print("count", len(js) == len(body))
+print("order", all(list(j) == hdr for j in js))
+print("equal", all([ung(c) for c in r] == [j[k] for k in hdr] for r, j in zip(body, js)))
+t = {j["url"]: j["title"] for j in js}
+c = {r[1]: r[7] for r in body}
+print("unguarded", t["https://a.ex.com/"] == '=HYPERLINK("http://x")' and c["https://a.ex.com/"].startswith("'="))
+print("strings", all(isinstance(v, str) for j in js for v in j.values()))
+sv = [json.loads(l) for l in open(out + ".services.jsonl", encoding="utf-8")]
+key = {(s["seed_domain"], s["service"]): s for s in sv}
+a = key.get(("ex.com", "https://a.ex.com"), {})
+print("services", sorted(key) == [("ex.com", "http://b.ex.com"), ("ex.com", "https://a.ex.com"), ("ex.com", "https://a.ex.com:8443"), ("other.org", "https://a.ex.com")])
+print("svc_root", a.get("url") == "https://a.ex.com/" and a.get("url_count") == 2 and a.get("port") == 443 and a.get("scheme") == "https")
+print("svc_port", key.get(("ex.com", "https://a.ex.com:8443"), {}).get("port") == 8443 and key.get(("ex.com", "http://b.ex.com"), {}).get("port") == 80)
+print("svc_fields", list(a)[:6] == ["seed_domain", "service", "scheme", "host", "port", "url_count"] and set(a) == set(hdr) | {"service", "scheme", "port", "url_count"})
+PYB6A
+assert_grep  "$B6/agg/check.txt" '^count True$'      "urls.jsonl: one record per CSV row"
+assert_grep  "$B6/agg/check.txt" '^order True$'      "urls.jsonl: the CSV's field names, in its column order"
+assert_grep  "$B6/agg/check.txt" '^equal True$'      "urls.jsonl: every value equals the CSV cell (after the formula guard is undone)"
+assert_grep  "$B6/agg/check.txt" '^unguarded True$'  "urls.jsonl: a title starting with = is the site's text (the CSV keeps its apostrophe)"
+assert_grep  "$B6/agg/check.txt" '^strings True$'    "urls.jsonl: values are strings, as in the CSV"
+assert_grep  "$B6/agg/check.txt" '^services True$'   "services.jsonl: one record per seed and scheme://host[:port] (default ports omitted)"
+assert_grep  "$B6/agg/check.txt" '^svc_root True$'   "services.jsonl: the root URL's values, url_count over the service's URLs"
+assert_grep  "$B6/agg/check.txt" '^svc_port True$'   "services.jsonl: port explicit (8443, 80)"
+assert_grep  "$B6/agg/check.txt" '^svc_fields True$' "services.jsonl: service/scheme/port/url_count, then the URL fields"
+
+section "Batch 6: the side files as JSON lines (findings, TSV inventories, warnings, seeds)"
+mkdir -p "$B6/exp/wd"
+awk "/<<'PYJSONL'/{f=1;next} f&&/^PYJSONL\$/{f=0} f" "$RUN_RECON" > "$B6/exp/jsonl.py"
+X="$B6/exp/r.csv"
+printf '[ex.com] dangling-cname [high] host=old.ex.com cname=gone.herokudns.com dns=NXDOMAIN provider=heroku note=claim it: the name points at an app that no longer exists (a=b, "q")\n[ex.com] nuclei-takeover [aws-bucket-takeover] [dns] [critical] old2.ex.com\n[ex.com] plain line without any tag http://old3.ex.com/x\n' > "$X.takeover.txt"
+printf '[ex.com] nuclei [git-config] [http] [medium] https://a.ex.com:8443/.git/config\n' > "$X.nuclei.txt"
+printf '[ex.com] security-txt-invalid [low] host=a.ex.com path=/.well-known/security.txt contact="mailto:x y" note=RFC 9116 requires Expires=\n\n' > "$X.extras.txt"
+printf 'seed_domain\thost\tedge\torigin_software\tedge_evidence\tjarm\tcdn\tfavicon_mmh3\ttitle\tedge_ip\nex.com\ta.ex.com\tcloudflare\tnginx\tcf-ray\t\tcloudflare\t123\tA\t104.16.0.1\n' > "$X.edge.tsv"
+printf 'host\tfile\tstatus\treason\tbytes\na.ex.com\ta.png\tok\t\t100\nb.ex.com\t\tfailed\tno image\n' > "$X.screenshots.tsv"
+printf 'change\tseed\tservice\tfield\told\tnew\nchanged\tex.com\thttps://a.ex.com\ttitle\tOld\tNew\twith\ttabs\n' > "$X.delta.tsv"
+{ for i in $(seq 1 250); do printf '\033[1;33mwarning %d\033[0m\n' "$i"; done; printf 'warning 1\n'; } > "$B6/exp/wd/warnings.txt"
+printf 'ex.com\t12\t10\t3\nother.org\t-\t-\t0\n' > "$B6/exp/wd/seedstat.tsv"
+( cd "$B6/exp" && python3 jsonl.py "$X" "$B6/exp/wd" > sum.txt 2> err.txt )
+python3 - "$X" > "$B6/exp/check.txt" 2>&1 <<'PYB6B'
+import json, sys
+x = sys.argv[1]
+def jl(k):
+    return [json.loads(l) for l in open("%s.%s.jsonl" % (x, k), encoding="utf-8")]
+f = jl("findings")
+d = {(r["source"], r["check"]): r for r in f}
+s = d.get(("takeover", "dangling-cname"), {})
+print("structured", s.get("severity") == "high" and s.get("seed") == "ex.com" and s.get("host") == "old.ex.com"
+      and s.get("fields") == {"host": "old.ex.com", "cname": "gone.herokudns.com", "dns": "NXDOMAIN", "provider": "heroku"})
+print("note", s.get("note") == 'claim it: the name points at an app that no longer exists (a=b, "q")')
+t = d.get(("takeover", "nuclei-takeover"), {})
+print("toolline", t.get("severity") == "critical" and t.get("fields") == {} and t.get("text", "").startswith("nuclei-takeover [aws"))
+p = d.get(("takeover", "plain"), {})
+print("default", p.get("severity") == "high" and p.get("host") == "old3.ex.com")
+n = d.get(("nuclei", "nuclei"), {})
+print("nuclei", n.get("severity") == "medium" and n.get("host") == "a.ex.com")
+e = d.get(("extras", "security-txt-invalid"), {})
+print("quoted", e.get("fields", {}).get("contact") == "mailto:x y" and e.get("note") == "RFC 9116 requires Expires=")
+print("nfind", len(f) == 5)
+ed = jl("edges")
+print("edges", ed == [{"seed_domain": "ex.com", "host": "a.ex.com", "edge": "cloudflare", "origin_software": "nginx",
+                       "edge_evidence": "cf-ray", "jarm": "", "cdn": "cloudflare", "favicon_mmh3": "123", "title": "A",
+                       "edge_ip": "104.16.0.1"}])
+sh = jl("screenshots")
+print("short", sh[1] == {"host": "b.ex.com", "file": "", "status": "failed", "reason": "no image", "bytes": ""})
+de = jl("delta")
+print("long", de[0]["new"] == "New\twith\ttabs")
+w = jl("warnings")
+print("warnings", len(w) == 250 and w[0] == {"message": "warning 1"} and w[-1] == {"message": "warning 250"})
+se = jl("seeds")
+print("seeds", se == [{"seed": "ex.com", "candidates": 12, "resolved": 10, "live_hosts": 3},
+                      {"seed": "other.org", "candidates": None, "resolved": None, "live_hosts": 0}])
+PYB6B
+for _k in structured note toolline default nuclei quoted nfind edges short long warnings seeds; do
+  case "$_k" in
+    structured) _m="findings: '[seed] check [severity] key=value ... note=' -> seed, check, severity, host, fields";;
+    note)       _m="findings: the note is the free text to the end of the line (= signs and quotes kept)";;
+    toolline)   _m="findings: a tool's output line keeps its text, its first [severity] tag, no fields";;
+    default)    _m="findings: an untagged line gets the report's default severity for its kind; host from its URL";;
+    nuclei)     _m="findings: nuclei lines: severity from the tag, host from the URL (port dropped)";;
+    quoted)     _m="findings: a quoted value is one field";;
+    nfind)      _m="findings: every non-empty line, one record each";;
+    edges)      _m="edges.jsonl: the TSV header's field names";;
+    short)      _m="a short TSV row is padded with empty strings";;
+    long)       _m="a TSV row with extra tabs keeps them in its last field";;
+    warnings)   _m="warnings.jsonl: every warning (not capped at 200), ANSI codes stripped, duplicates once";;
+    seeds)      _m="seeds.jsonl: counts as integers, null where a stage did not count";;
+  esac
+  assert_grep "$B6/exp/check.txt" "^$_k True\$" "$_m"
+done
+assert_grep  "$B6/exp/err.txt" '2 TSV row\(s\) had the wrong number of fields' "the exporter reports the TSV rows it had to fix up (one short, one long)"
+assert_absent "$X.dnsposture.jsonl" "a stage that did not run gets no JSON lines file"
+
+section "Batch 6: schema contract (schemas/: JSON Schema 2020-12, field lists match what run-recon writes)"
+python3 - "$SCHEMAS6" "$RUN_RECON" "$(dirname "$RUN_RECON")/recon-db.sh" > "$B6/contract.txt" 2>&1 <<'PYB6C'
+import json, os, re, sys
+sd, rr, rdb = sys.argv[1:4]
+S = {}
+for n in sorted(os.listdir(sd)):
+    s = json.load(open(os.path.join(sd, n)))
+    S[s["x-tideline-schema"]] = s
+src = open(rr, encoding="utf-8").read()
+db = open(rdb, encoding="utf-8").read()
+m = re.search(r"CSV_HEADER = \[(.*?)\]", src, re.S)
+csvh = re.findall(r'"([a-z0-9_]+)"', m.group(1)) if m else []
+print("url", list(S["run-recon.url/1"]["properties"]) == csvh and S["run-recon.url/1"]["required"] == csvh and len(csvh) == 48)
+def tsv(pat, text=src):
+    m = re.search(pat, text)
+    return m.group(1).split("\\t") if m else None
+heads = {
+    "run-recon.edge/1": tsv(r"printf '(seed_domain\\thost\\tedge\\t[^']*?)\\n"),
+    "run-recon.cname/1": tsv(r"printf '(seed_domain\\thost\\tcname_chain[^']*?)\\n"),
+    "run-recon.zone-name/1": tsv(r"printf '(zone\\tname\\tsource)\\n"),
+    "run-recon.screenshot/1": tsv(r'o\.write\("(host\\tfile\\tstatus[^"]*?)\\n"\)'),
+    "run-recon.cloud-asset/1": tsv(r'"(provider\\taccount\\tservice[^"]*?)\\n"'),
+    "run-recon.vulnx/1": tsv(r'"(vendor\\tproduct\\tversions_seen[^"]*?)\\n"'),
+    "run-recon.delta/1": tsv(r'o\.write\("(change\\tseed\\tservice[^"]*?)\\n"\)', db),
+}
+m = re.search(r'COLS = \[("name", "role".*?)\]', src)
+heads["run-recon.dnsposture/1"] = re.findall(r'"([a-z_]+)"', m.group(1)) if m else None
+bad = [k for k, h in heads.items() if not h or list(S[k]["properties"]) != h or S[k]["required"] != h]
+print("tsv", not bad, bad)
+try:
+    import jsonschema
+    for s in S.values():
+        jsonschema.Draft202012Validator.check_schema(s)
+    print("metaschema True")
+except ImportError:
+    print("metaschema True (jsonschema not installed: skipped)")
+PYB6C
+assert_grep  "$B6/contract.txt" '^url True$'        "run-recon.url/1 lists exactly the CSV's 48 columns, in order"
+assert_grep  "$B6/contract.txt" '^tsv True'         "each TSV schema lists exactly the header run-recon (recon-db.sh) writes"
+assert_grep  "$B6/contract.txt" '^metaschema True'  "every schema is valid JSON Schema 2020-12"
+
+# a schema validator for the checks below: jsonschema when installed, else the subset the schemas use
+cat > "$B6/validate.py" <<'PYB6V'
+import json, os, re, sys
+sd = sys.argv[1]
+S = {}
+for n in os.listdir(sd):
+    s = json.load(open(os.path.join(sd, n)))
+    S[s["x-tideline-schema"]] = s
+try:
+    import jsonschema
+    def errors(s, o):
+        return [e.message for e in jsonschema.Draft202012Validator(s).iter_errors(o)]
+except ImportError:
+    T = {"string": str, "integer": int, "object": dict, "array": list, "null": type(None)}
+    def errors(s, o, p="$"):
+        e = []
+        if s is True:
+            return e
+        if s is False:
+            return [p + ": not allowed"]
+        if "type" in s:
+            ts = s["type"] if isinstance(s["type"], list) else [s["type"]]
+            if not any(isinstance(o, T[t]) and not (t == "integer" and isinstance(o, bool)) for t in ts):
+                return [p + ": type"]
+        if "const" in s and o != s["const"]:
+            e.append(p + ": const")
+        if "enum" in s and o not in s["enum"]:
+            e.append(p + ": enum")
+        if isinstance(o, str):
+            if "pattern" in s and not re.search(s["pattern"], o):
+                e.append(p + ": pattern")
+            if len(o) < s.get("minLength", 0) or len(o) > s.get("maxLength", 1 << 30):
+                e.append(p + ": length")
+        if isinstance(o, int) and (o < s.get("minimum", -(1 << 62)) or o > s.get("maximum", 1 << 62)):
+            e.append(p + ": range")
+        if "oneOf" in s and sum(1 for x in s["oneOf"] if not errors(x, o, p)) != 1:
+            e.append(p + ": oneOf")
+        if isinstance(o, dict):
+            for r in s.get("required", []):
+                if r not in o:
+                    e.append(p + ": missing " + r)
+            props = s.get("properties", {})
+            for k, v in o.items():
+                e += errors(props[k], v, p + "." + k) if k in props else errors(s.get("additionalProperties", True), v, p + "." + k)
+            if "if" in s:
+                e += errors(s.get("then", True) if not errors(s["if"], o, p) else s.get("else", True), o, p)
+        if isinstance(o, list):
+            if len(o) < s.get("minItems", 0) or len(o) > s.get("maxItems", 1 << 30):
+                e.append(p + ": items")
+            for i, x in enumerate(o):
+                e += errors(s.get("items", True), x, "%s[%d]" % (p, i))
+        return e
+bad = 0
+for arg in sys.argv[2:]:
+    sid, path = arg.split("=", 1)
+    lines = [open(path, encoding="utf-8").read()] if sid == "tideline-envelope/1" else open(path, encoding="utf-8")
+    for i, l in enumerate(lines, 1):
+        if l.strip():
+            er = errors(S[sid], json.loads(l))
+            if er:
+                bad += 1
+                print("%s line %d: %s" % (os.path.basename(path), i, er[:3]))
+print("valid" if not bad else "INVALID %d" % bad)
+PYB6V
+
+section "Batch 6: run-recon --json, run_id, --engagement / --job-id"
+run_case b6plain --tls
+if ls "$OUTDIR"/r.csv.*.jsonl >/dev/null 2>&1; then _fail "without --json: no .jsonl files"; else _pass "without --json: no .jsonl files"; fi
+assert_grep  "$CSV.run.json" '"run_id": "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"' "run.json: a run_id (UUID v4) on every run"
+assert_grep  "$CSV.run.json" '"engagement": null'                         "run.json: engagement null when not given"
+_rid1="$(sed -n 's/.*"run_id": "\([^"]*\)".*/\1/p' "$CSV.run.json")"
+assert_grep  "$(ls -d "$OUTDIR"/_work-* | head -n 1)/state" "^run_id=$_rid1\$" "the run_id is kept in the work dir's state (for --resume)"
+run_case b6json --json --tls --takeover --screenshots --engagement eng-2026.014 --job-id job:7
+B6RUN="$OUTDIR"
+for _k in urls services findings warnings seeds; do
+  if [ -f "$CSV.$_k.jsonl" ]; then _pass "--json writes <out>.$_k.jsonl (empty when there is nothing of the kind)"; else _fail "--json writes <out>.$_k.jsonl"; fi
+done
+assert_exists "$CSV.urls.jsonl"                                           "--json: urls.jsonl has the URL rows"
+assert_exists "$CSV.screenshots.jsonl"                                    "--json: screenshots.jsonl when screenshots ran"
+assert_grep  "$CSV.run.json" '"engagement": "eng-2026\.014"'              "--engagement is written to run.json"
+assert_grep  "$CSV.run.json" '"job_id": "job:7"'                          "--job-id is written to run.json"
+assert_grep  "$CSV.manifest.sha256" '^[0-9a-f]{64}  r\.csv\.urls\.jsonl$'  "the JSON lines are in the run's manifest"
+assert_grep  "$ERRLOG" 'JSON lines      : .*urls=[1-9][0-9]* services=[1-9]'  "the summary counts the JSON records"
+if ( cd "$OUTDIR" && sha256sum --quiet -c r.csv.manifest.sha256 ) >/dev/null 2>&1; then _pass "--json: sha256sum -c still verifies the manifest"; else _fail "--json: sha256sum -c still verifies the manifest"; fi
+_v=(); for _k in url:urls service:services finding:findings warning:warnings seed:seeds screenshot:screenshots cname:cnames; do
+  [ -f "$CSV.${_k#*:}.jsonl" ] && _v+=("run-recon.${_k%%:*}/1=$CSV.${_k#*:}.jsonl")
+done
+python3 "$B6/validate.py" "$SCHEMAS6" "${_v[@]}" > "$B6/valid1.txt" 2>&1
+assert_grep  "$B6/valid1.txt" '^valid$'                                   "every record of the run validates against its schema"
+python3 -S "$B6/validate.py" "$SCHEMAS6" "${_v[@]}" > "$B6/valid1s.txt" 2>&1
+assert_grep  "$B6/valid1s.txt" '^valid$'                                  "...and so does the suite's own validator (python3 -S: no jsonschema)"
+printf '{"seed":"x.test","candidates":"3","resolved":null,"live_hosts":0}\n' > "$B6/badseed.jsonl"
+python3 "$B6/validate.py" "$SCHEMAS6" "run-recon.seed/1=$B6/badseed.jsonl" > "$B6/bad1.txt" 2>&1
+python3 -S "$B6/validate.py" "$SCHEMAS6" "run-recon.seed/1=$B6/badseed.jsonl" > "$B6/bad2.txt" 2>&1
+if grep -q '^INVALID 1$' "$B6/bad1.txt" && grep -q '^INVALID 1$' "$B6/bad2.txt"; then _pass "a count given as a string fails run-recon.seed/1 (both validators)"; else _fail "a count given as a string fails run-recon.seed/1"; fi
+if [ "$(grep -c '' "$CSV.urls.jsonl")" = "$(( $(grep -c '' "$CSV") - 1 ))" ]; then _pass "urls.jsonl has as many records as the CSV has rows"; else _fail "urls.jsonl has as many records as the CSV has rows"; fi
+_rc=0; timeout 25 env PATH="$TESTPATH" HTTPX_BIN=httpx bash "$RUN_RECON" -i "$DOMAINS" -D "$B6/bad" -o "$B6/bad/r.csv" --engagement 'bad id!' >/dev/null 2>"$B6/bad.err" || _rc=$?
+_rc_is "$_rc" 2                                                           "an invalid --engagement is refused (exit 2)"
+assert_grep  "$B6/bad.err" -- '--engagement must be 1-128 characters'     "...and why"
+
+section "Batch 6: ship-recon.sh against a mock Tideline ingest (mutual TLS on loopback)"
+bash "$LABDIR6/gen-ship-certs.sh" "$B6/pki" >/dev/null 2>&1
+P6="$B6/pki"; mkdir -p "$B6/store"
+python3 -I "$LABDIR6/mock-tideline.py" --cert "$P6/server.pem" --key "$P6/server.key" --client-ca "$P6/root.pem" \
+  --store "$B6/store" --schemas "$SCHEMAS6" --port 0 > "$B6/mock.log" 2>&1 &
+B6PID=$!
+for _i in $(seq 1 100); do [ -s "$B6/store/port" ] && break; sleep 0.1; done
+U6="https://127.0.0.1:$(cat "$B6/store/port" 2>/dev/null)"
+OK6=(--url "$U6" --cert "$P6/rr-test01.pem" --key "$P6/rr-test01.key" --ca "$P6/root.pem")
+_ship(){ local _r=0; SHIP_RETRIES="${SHIP_RETRIES:-0}" bash "$SHIP6" "$@" > "$B6/ship.out" 2> "$B6/ship.err" || _r=$?; return "$_r"; }
+_reqs(){ python3 -c 'import json,sys; print(" ".join("%s:%s:%s" % (j["method"], j["path"].rsplit("/", 1)[-1], j["status"]) for j in map(json.loads, open(sys.argv[1]))))' "$B6/store/requests.jsonl" 2>/dev/null; }
+_newrun(){ # <src dir> <dst dir>: the same run under a new run_id (manifest updated), no ship state
+  rm -rf "$2"; cp -r "$1" "$2"; rm -f "$2"/r.csv.ship-state.json "$2"/r.csv.tideline.tar
+  python3 - "$2" <<'PYNEW'
+import json, hashlib, uuid, sys, os
+d = sys.argv[1]; p = os.path.join(d, "r.csv.run.json")
+j = json.load(open(p)); j["run_id"] = str(uuid.uuid4()); json.dump(j, open(p, "w"), indent=2)
+h = hashlib.sha256(open(p, "rb").read()).hexdigest()
+m = os.path.join(d, "r.csv.manifest.sha256")
+lines = open(m).readlines()
+open(m, "w").write("".join((h + "  r.csv.run.json\n") if l.endswith("  r.csv.run.json\n") else l for l in lines))
+PYNEW
+}
+_rc=0; _ship check "${OK6[@]}" || _rc=$?;                                              _rc_is "$_rc" 0 "check: a step-ca-shaped sensor certificate passes (no connection made)"
+assert_grep "$B6/ship.err" 'settings ok: sensor rr-test01'                              "check: names the sensor from the certificate's URI SAN"
+_rc=0; _ship check --url "$U6" --cert "$P6/nourn.pem" --key "$P6/nourn.key" --ca "$P6/root.pem" || _rc=$?; _rc_is "$_rc" 1 "check: a certificate without urn:tideline:sensor: is refused"
+_rc=0; _ship check --url "$U6" --cert "$P6/rsa.pem" --key "$P6/rsa.key" --ca "$P6/root.pem" || _rc=$?;     _rc_is "$_rc" 1 "check: an RSA key is refused (ES256 needs ECDSA P-256)"
+_rc=0; _ship check --url "$U6" --cert "$P6/rr-test01.pem" --key "$P6/rr-other.key" --ca "$P6/root.pem" || _rc=$?; _rc_is "$_rc" 1 "check: a key that is not the certificate's is refused"
+_rc=0; _ship check --url "http://127.0.0.1:1" --cert "$P6/rr-test01.pem" --key "$P6/rr-test01.key" --ca "$P6/root.pem" || _rc=$?; _rc_is "$_rc" 2 "check: an http:// URL is refused"
+_rc=0; _ship check --url "$U6" --key "$P6/rr-test01.key" --ca "$P6/root.pem" || _rc=$?; _rc_is "$_rc" 2 "check: no certificate given -> usage error"
+cp -r "$B6RUN" "$B6/run1"
+_rc=0; _ship envelope "$B6/run1/r.csv" --cert "$P6/rr-test01.pem" || _rc=$?; cp "$B6/ship.out" "$B6/envelope.json"
+python3 "$B6/validate.py" "$SCHEMAS6" "tideline-envelope/1=$B6/envelope.json" > "$B6/valid2.txt" 2>&1
+assert_grep "$B6/valid2.txt" '^valid$'                                                  "envelope: valid tideline-envelope/1"
+python3 - "$B6/envelope.json" "$B6/run1" > "$B6/env.txt" 2>&1 <<'PYENV'
+import json, sys, hashlib, os
+e = json.load(open(sys.argv[1])); d = sys.argv[2]
+run = json.load(open(os.path.join(d, "r.csv.run.json")))
+man = {l.split("  ", 1)[1].rstrip("\n"): l.split("  ", 1)[0] for l in open(os.path.join(d, "r.csv.manifest.sha256"))}
+print("ids", e["run_id"] == run["run_id"] and e["engagement"] == "eng-2026.014" and e["job_id"] == "job:7" and e["sensor"] == "rr-test01" and e["tool"] == "run-recon")
+print("hashes", all(man.get(p["name"]) == p["sha256"] for p in e["parts"] if p["name"] != "r.csv.manifest.sha256"))
+print("toolman", e["tool_manifest_sha256"] == hashlib.sha256(open(os.path.join(d, "r.csv.manifest.sha256"), "rb").read()).hexdigest())
+print("kinds", [p["kind"] for p in e["parts"]][:2] == ["urls", "services"] and any(p.get("media") == "image/png" for p in e["parts"]))
+print("profile", e["profile"] == run)
+PYENV
+assert_grep "$B6/env.txt" '^ids True$'      "envelope: run_id, engagement, job_id from run.json; sensor from the certificate"
+assert_grep "$B6/env.txt" '^hashes True$'   "envelope: every part's sha256 is the one in the run's manifest"
+assert_grep "$B6/env.txt" '^toolman True$'  "envelope: tool_manifest_sha256 is the manifest file's hash"
+assert_grep "$B6/env.txt" '^kinds True$'    "envelope: the record parts, then artifacts (the manifest, the screenshots)"
+assert_grep "$B6/env.txt" '^profile True$'  "envelope: profile is run.json, unchanged"
+: > "$B6/store/requests.jsonl"
+_rc=0; _ship ship "$B6/run1/r.csv" "${OK6[@]}" || _rc=$?;                              _rc_is "$_rc" 0 "ship: delivered (exit 0)"
+_np="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["parts"]))' "$B6/envelope.json")"
+_rid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["run_id"])' "$B6/envelope.json")"
+if [ "$(_reqs)" = "POST:runs:201 $(for _i in $(seq 1 "$_np"); do printf 'PUT:%d:204 ' "$_i"; done)POST:complete:202" ]; then _pass "ship: open (201), $_np parts (204 each), complete (202)"; else _fail "ship: open, parts, complete  [$(_reqs)]"; fi
+assert_grep "$B6/run1/r.csv.ship-state.json" '"state": "complete"'                     "ship-state.json: complete"
+assert_grep "$B6/run1/r.csv.ship-state.json" '"server_state": "verified"'              "ship-state.json: Tideline verified the run"
+if cmp -s "$B6/store/runs/$_rid/manifest.json" <(head -c -1 "$B6/envelope.json"); then _pass "Tideline stored the manifest bytes that were signed"; else _fail "Tideline stored the manifest bytes that were signed"; fi
+if cmp -s "$B6/store/runs/$_rid/parts/1" "$B6/run1/r.csv.urls.jsonl"; then _pass "the stored urls part equals the local urls.jsonl, byte for byte"; else _fail "the stored urls part equals the local urls.jsonl"; fi
+refute_grep "$B6/store/requests.jsonl" '"status": 40[13]'                              "the signature verified (no 401/403)"
+: > "$B6/store/requests.jsonl"
+_rc=0; _ship ship "$B6/run1/r.csv" || _rc=$?;                                          _rc_is "$_rc" 0 "re-ship with the settings from ship-state.json: exit 0"
+if [ "$(_reqs)" = "POST:runs:200" ]; then _pass "re-ship: Tideline answers 200 (same manifest) and nothing is sent again"; else _fail "re-ship: nothing sent again  [$(_reqs)]"; fi
+_rc=0; _ship status "$B6/run1/r.csv" || _rc=$?;                                        _rc_is "$_rc" 0 "status: exit 0"
+assert_grep "$B6/ship.out" '"state": "verified"'                                        "status: Tideline's state of the run"
+_newrun "$B6/run1" "$B6/run2"
+printf '[{"method":"PUT","part":2,"status":503,"times":5}]' > "$B6/store/faults.json"; : > "$B6/store/requests.jsonl"
+_rc=0; _ship ship "$B6/run2/r.csv" "${OK6[@]}" || _rc=$?;                              _rc_is "$_rc" 4 "Tideline busy (503) on part 2: exit 4, retry later"
+assert_grep "$B6/run2/r.csv.ship-state.json" '"state": "failed"'                        "ship-state.json: failed, with the reason"
+if [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["parts_acknowledged"])' "$B6/run2/r.csv.ship-state.json")" = "[1]" ]; then _pass "ship-state.json: the parts Tideline acknowledged ([1])..."; else _fail "ship-state.json: the parts Tideline acknowledged ([1])"; fi
+assert_grep "$B6/ship.err" 'part 2 \(r\.csv\.services\.jsonl\): HTTP 503'              "...and the error names the part"
+printf '[]' > "$B6/store/faults.json"; : > "$B6/store/requests.jsonl"
+_rc=0; _ship ship "$B6/run2/r.csv" || _rc=$?;                                          _rc_is "$_rc" 0 "the retry delivers the run"
+if _reqs | grep -qE '^POST:runs:200 PUT:2:204 ' && ! _reqs | grep -q 'PUT:1:'; then _pass "the retry re-opens the run (200) and sends only the parts Tideline lacks"; else _fail "the retry sends only the missing parts  [$(_reqs)]"; fi
+_newrun "$B6/run1" "$B6/run3"
+printf '[{"method":"PUT","part":3,"action":"drop","times":1}]' > "$B6/store/faults.json"
+_rc=0; _ship ship "$B6/run3/r.csv" "${OK6[@]}" || _rc=$?;                              _rc_is "$_rc" 4 "a connection dropped mid-upload: exit 4"
+printf '[]' > "$B6/store/faults.json"
+_rc=0; _ship ship "$B6/run3/r.csv" || _rc=$?;                                          _rc_is "$_rc" 0 "...and the next attempt completes it"
+_newrun "$B6/run1" "$B6/run4"; printf '{"x":1}\n' >> "$B6/run4/r.csv.warnings.jsonl"; : > "$B6/store/requests.jsonl"
+_rc=0; _ship ship "$B6/run4/r.csv" "${OK6[@]}" || _rc=$?;                              _rc_is "$_rc" 1 "a part changed after the run: refused locally (exit 1)"
+assert_grep "$B6/ship.err" 'r\.csv\.warnings\.jsonl changed since the run wrote its manifest' "...naming the file"
+assert_absent "$B6/store/requests.jsonl"                                                "...and nothing was sent"
+rm -rf "$B6/run5"; cp -r "$B6/run1" "$B6/run5"; rm -f "$B6/run5/r.csv.ship-state.json"
+printf '{"message":"added"}\n' >> "$B6/run5/r.csv.warnings.jsonl"
+python3 - "$B6/run5" <<'PYCONF'
+import hashlib, os, sys
+d = sys.argv[1]; m = os.path.join(d, "r.csv.manifest.sha256")
+h = hashlib.sha256(open(os.path.join(d, "r.csv.warnings.jsonl"), "rb").read()).hexdigest()
+lines = open(m).readlines()
+open(m, "w").write("".join((h + "  r.csv.warnings.jsonl\n") if l.endswith("  r.csv.warnings.jsonl\n") else l for l in lines))
+PYCONF
+_rc=0; _ship ship "$B6/run5/r.csv" "${OK6[@]}" || _rc=$?;                              _rc_is "$_rc" 5 "the same run_id with a different manifest: Tideline refuses it (409, exit 5)"
+assert_grep "$B6/ship.err" 'HTTP 409'                                                   "...with Tideline's reason"
+_rc=0; _ship status "$B6/run1/r.csv" --url "$U6" --cert "$P6/rr-other.pem" --key "$P6/rr-other.key" --ca "$P6/root.pem" || _rc=$?; _rc_is "$_rc" 5 "another sensor cannot read this sensor's run (403, exit 5)"
+_newrun "$B6/run1" "$B6/run6"; : > "$B6/store/requests.jsonl"
+_rc=0; _ship ship "$B6/run6/r.csv" --url "$U6" --cert "$P6/rogue.pem" --key "$P6/rogue.key" --ca "$P6/root.pem" || _rc=$?; _rc_is "$_rc" 5 "a sensor certificate from another CA: refused in the handshake (exit 5)"
+if [ ! -d "$B6/store/runs/$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["run_id"])' "$B6/run6/r.csv.run.json")" ]; then _pass "...and nothing was stored"; else _fail "...and nothing was stored"; fi
+_rc=0; _ship ship "$B6/run6/r.csv" --url "$U6" --cert "$P6/rr-test01.pem" --key "$P6/rr-test01.key" --ca "$P6/rogue-root.pem" || _rc=$?; _rc_is "$_rc" 5 "the server does not chain to --ca: refused (exit 5)"
+mkdir -p "$B6/sysca"; cp "$P6/root.pem" "$B6/sysca/"; openssl rehash "$B6/sysca" >/dev/null 2>&1 || c_rehash "$B6/sysca" >/dev/null 2>&1
+_rc=0; SSL_CERT_DIR="$B6/sysca" CURL_CA_BUNDLE="$P6/root.pem" SSL_CERT_FILE="$P6/root.pem" _ship ship "$B6/run6/r.csv" --url "$U6" --cert "$P6/rr-test01.pem" --key "$P6/rr-test01.key" --ca "$P6/rogue-root.pem" || _rc=$?
+_rc_is "$_rc" 5 "pinned: a trust store that would accept the server (SSL_CERT_DIR, CURL_CA_BUNDLE) is not used"
+_rc=0; SHIP_RETRIES=0 _ship ship "$B6/run6/r.csv" --url "https://127.0.0.1:9" --cert "$P6/rr-test01.pem" --key "$P6/rr-test01.key" --ca "$P6/root.pem" || _rc=$?; _rc_is "$_rc" 4 "nothing listening: exit 4"
+_rc=0; _ship export "$B6/run1/r.csv" --cert "$P6/rr-test01.pem" --key "$P6/rr-test01.key" || _rc=$?; _rc_is "$_rc" 0 "export: a bundle for a hand-carried upload"
+python3 - "$B6/run1/r.csv.tideline.tar" "$B6/envelope.json" "$B6/run1" "$P6/rr-test01.pem" > "$B6/tar.txt" 2>&1 <<'PYTAR'
+import tarfile, sys, json, gzip, hashlib, base64, subprocess, tempfile, os
+t, envp, d, cert = sys.argv[1:5]
+tf = tarfile.open(t)
+names = tf.getnames()
+body = tf.extractfile("envelope.json").read()
+print("members", names[:2] == ["envelope.json", "signature.txt"] and all(n.startswith("parts/") for n in names[2:]))
+print("envelope", body == open(envp, "rb").read().rstrip(b"\n"))
+e = json.loads(body)
+ok = True
+for p in e["parts"]:
+    raw = gzip.decompress(tf.extractfile("parts/%05d.gz" % p["n"]).read())
+    ok = ok and hashlib.sha256(raw).hexdigest() == p["sha256"] and len(raw) == p["bytes"]
+print("parts", ok and len(names) == 2 + len(e["parts"]))
+sig = tf.extractfile("signature.txt").read().decode().strip()
+der = base64.b64decode(sig.split("sig=", 1)[1])
+with tempfile.TemporaryDirectory() as x:
+    open(os.path.join(x, "b"), "wb").write(body); open(os.path.join(x, "s"), "wb").write(der)
+    pub = subprocess.run(["openssl", "x509", "-in", cert, "-noout", "-pubkey"], capture_output=True).stdout
+    open(os.path.join(x, "k"), "wb").write(pub)
+    r = subprocess.run(["openssl", "dgst", "-sha256", "-verify", os.path.join(x, "k"), "-signature", os.path.join(x, "s"), os.path.join(x, "b")], capture_output=True)
+print("signature", sig.startswith("alg=ES256; enc=der; sig=") and r.returncode == 0)
+PYTAR
+for _k in members envelope parts signature; do assert_grep "$B6/tar.txt" "^$_k True\$" "export: $_k as Tideline expects (envelope.json, signature.txt, parts/NNNNN.gz)"; done
+rm -rf "$B6/nojson"; mkdir -p "$B6/nojson"; cp "$B6/run1/r.csv" "$B6/run1/r.csv.run.json" "$B6/nojson/"
+( cd "$B6/nojson" && sha256sum r.csv r.csv.run.json > r.csv.manifest.sha256 )
+_rc=0; _ship ship "$B6/nojson/r.csv" "${OK6[@]}" || _rc=$?;                            _rc_is "$_rc" 1 "a run without --json is not shipped (exit 1)..."
+assert_grep "$B6/ship.err" 'run run-recon with --json'                                  "...and the message says how to fix it"
+
+section "Batch 6: run-recon --ship (preflight, delivery, exit 4, same outputs as --json)"
+REAL_CURL="$(command -v curl)"
+mv "$MOCKBIN/curl" "$MOCKBIN/curl.b6"
+cat > "$MOCKBIN/curl" <<EOF
+#!/usr/bin/env bash
+# ship-recon's calls (-q first) go to the real curl, on loopback; every other call stays mocked
+[ "\${1:-}" = -q ] && exec "$REAL_CURL" "\$@"
+exec "$MOCKBIN/curl.b6" "\$@"
+EOF
+chmod +x "$MOCKBIN/curl"
+_rr6(){ # <dir> [args...]
+  local o="$1"; shift; rm -rf "$o"; mkdir -p "$o"
+  timeout 60 env PATH="$TESTPATH" HTTPX_BIN=httpx SECLISTS="$SECLISTS_TEST" RECON_CLOUD_CACHE="$B6/cloud.tsv" TLS_CHAIN_CHECK=0 SHIP_RETRIES=0 \
+    bash "$RUN_RECON" -i "$DOMAINS" -D "$o" -o "$o/r.csv" --tls "$@" > /dev/null 2> "$o/stderr.log"
+}
+rm -f "$MOCKLOG"/*.args
+_rc=0; _rr6 "$B6/pre" --ship "$U6" --ship-cert "$B6/missing.pem" --ship-key "$P6/rr-test01.key" --ship-ca "$P6/root.pem" || _rc=$?
+_rc_is "$_rc" 2                                                                        "--ship with an unreadable certificate: refused before the scan (exit 2)"
+assert_grep  "$B6/pre/stderr.log" 'Nothing was sent'                                   "...and nothing was sent"
+if [ ! -e "$MOCKLOG/gau.args" ] && [ ! -e "$B6/pre/r.csv" ]; then _pass "...no tool ran, no CSV"; else _fail "...no tool ran, no CSV"; fi
+_rc=0; _rr6 "$B6/s1" --ship "$U6" --ship-cert "$P6/rr-test01.pem" --ship-key "$P6/rr-test01.key" --ship-ca "$P6/root.pem" --engagement eng-1 || _rc=$?
+_rc_is "$_rc" 0                                                                        "--ship: the run is delivered (exit 0)"
+assert_grep  "$B6/s1/stderr.log" 'Tideline        : run [0-9a-f-]{36} shipped and verified' "--ship: the summary says so"
+assert_grep  "$B6/s1/r.csv.ship-state.json" '"state": "complete"'                     "--ship: ship-state.json complete"
+assert_exists "$B6/s1/r.csv.urls.jsonl"                                                "--ship implies --json"
+refute_grep  "$B6/s1/r.csv.manifest.sha256" 'ship-state'                               "ship-state.json is written after the manifest, not listed in it"
+_rr6 "$B6/j1" --json --engagement eng-1 || true
+if [ "$(cd "$B6/j1" && ls | grep -v '^_work\|stderr.log' | sort | tr '\n' ' ')" = "$(cd "$B6/s1" && ls | grep -v '^_work\|stderr.log\|ship-state' | sort | tr '\n' ' ')" ]; then
+  _pass "--ship writes the same files as --json, plus ship-state.json only"; else _fail "--ship writes the same files as --json, plus ship-state.json only"; fi
+if diff <(sort "$B6/j1/r.csv") <(sort "$B6/s1/r.csv") >/dev/null && cmp -s "$B6/j1/r.csv.urls.jsonl" "$B6/s1/r.csv.urls.jsonl"; then _pass "--ship: the CSV and urls.jsonl equal the --json run's"; else _fail "--ship: the CSV and urls.jsonl equal the --json run's"; fi
+_rc=0; _rr6 "$B6/s2" --ship "https://127.0.0.1:9" --ship-cert "$P6/rr-test01.pem" --ship-key "$P6/rr-test01.key" --ship-ca "$P6/root.pem" || _rc=$?
+_rc_is "$_rc" 4                                                                        "--ship to an unreachable Tideline: the run completes and exits 4"
+assert_exists "$B6/s2/r.csv"                                                           "...the CSV is there"
+assert_grep  "$B6/s2/r.csv.ship-state.json" '"state": "failed"'                       "...ship-state.json says failed"
+assert_grep  "$B6/s2/stderr.log" 'retry with: .*ship-recon\.sh ship .*r\.csv'          "...and the message says how to retry"
+assert_grep  "$B6/s2/r.csv.run.json" '"exit_status": 0'                                "run.json keeps the scan's own exit status"
+mv "$MOCKBIN/curl.b6" "$MOCKBIN/curl"
+kill "$B6PID" 2>/dev/null; wait "$B6PID" 2>/dev/null || true
 
 # --- 53) service health check: --resolvers catches dead resolvers ----------
 # (placed last: swaps the dig mock for one that reports no reply)

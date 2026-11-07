@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tideline:schema:run-recon.vulnx/1",
+  "title": "run-recon vulnx",
+  "description": "One CVE filed against a product seen in the run, from --vulnx (a row of <out>.vulnx.tsv). Values are strings, as in the TSV.",
+  "x-tideline-schema": "run-recon.vulnx/1",
+  "x-minor": 0,
+  "type": "object",
+  "properties": {
+    "vendor": {
+      "type": "string"
+    },
+    "product": {
+      "type": "string"
+    },
+    "versions_seen": {
+      "type": "string"
+    },
+    "hosts": {
+      "type": "string"
+    },
+    "cve": {
+      "type": "string"
+    },
+    "cvss": {
+      "type": "string"
+    },
+    "epss": {
+      "type": "string"
+    },
+    "kev": {
+      "type": "string"
+    },
+    "poc": {
+      "type": "string"
+    },
+    "nuclei_template": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "vendor",
+    "product",
+    "versions_seen",
+    "hosts",
+    "cve",
+    "cvss",
+    "epss",
+    "kev",
+    "poc",
+    "nuclei_template"
+  ],
+  "additionalProperties": {
+    "type": "string"
+  }
+}

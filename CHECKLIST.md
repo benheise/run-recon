@@ -1494,3 +1494,41 @@ tests and was checked against new lab fixtures with the real tools.
 - [x] **Found while building this**: see BENCHMARK.md (`--tls-full` gave no CSV with tlsx 1.4.0 since 1.17,
       tlsx cannot offer weak suites, `expired` is false for a not-yet-valid certificate, the chain check's
       missing verdict on weak hosts, tlsx's `auto` mode reading an open stdin).
+
+## v1.20.0 (unreleased) — Batch 6: JSON output and shipping to Tideline
+
+Tracked in `PLAN.md` section 8 (P1–P3), on `batch-6-json-ship` (stacked on Batch 5). The run-recon side of
+recon-platform-plan §11; the protocol, exit codes, schemas and enrollment are in `SHIPPING.md`.
+
+- [x] **P1 `--json`**: `<out>.<kind>.jsonl`, one JSON object per line, the CSV's and the TSVs' own field
+      names. `urls` and `services` come from the CSV builder itself, from the rows it writes, before the
+      formula guard (`'=` in the CSV, `=` in the JSON); a service is `scheme://host[:port]` under a seed with
+      its root URL's values (recon-db.sh diff's rule), `port` and `url_count` integers. `findings` parses every
+      `<out>.<kind>.txt` line (seed, check, severity, host, `key=value` fields, note, text); the TSV kinds
+      (dnsposture, edges, cnames, zone-names, screenshots, cloud-assets, vulnx, delta) keep their headers;
+      `warnings` holds every warning (run.json keeps 200); `seeds` the per-seed counts. Written before the
+      manifest, so each file is hashed there. JSON Schemas (2020-12) in `schemas/`, one per kind, plus
+      `tideline-envelope/1`; the setup scripts install them.
+- [x] **P2 identifiers**: `run_id` (UUID v4) on every run, in the work dir's state and run.json, kept by
+      `--resume`; `--engagement` and `--job-id` (1–128 of `A-Z a-z 0-9 . _ : -`) in run.json.
+- [x] **P3 `--ship`**: `ship-recon.sh` sends the finished run (signed `tideline-envelope/1`, ES256 over the
+      manifest's exact bytes in `Tideline-Signature`; one gzip part per JSONL file, the run's manifest and
+      each screenshot, each part's SHA-256 the one in `<out>.manifest.sha256`) over mTLS: TLS 1.2+,
+      ECDHE + AES-GCM, the client certificate's URI SAN `urn:tideline:sensor:<id>` as the identity, the
+      server checked against `--ship-ca` alone. Open (201/200/409), PUT the missing parts, complete;
+      `<out>.ship-state.json` after the manifest; resume and idempotent re-ship; `status`, `export` (a bundle
+      for a hand-carried upload), `envelope`, `check`. Settings checked before the scan (exit 2, nothing
+      sent); a failed delivery exits 4 with the run complete locally. Shipping connects directly unless
+      `--ship-proxy` (the scan's `--proxy` is not used).
+- [x] **Mock ingest**: `lab/mock-tideline.py` (loopback only) checks the certificate chain and sensor, the
+      manifest's sensor and signature (DER or P1363), part hashes, sizes and records against the schemas;
+      `faults.json` injects a status or a dropped connection. `lab/gen-ship-certs.sh` makes a
+      step-ca-shaped PKI and the misfits (another CA, no sensor URI, RSA, a server from another CA).
+- [x] **Lab**: `bench-run-recon.sh ship` (new; in `checks`).
+- [x] **Checks:** suite 831 → **946/946**; `bench-run-recon.sh checks` **PASS** on all eleven on the final code
+      (`history` with the PostgreSQL 16 store, after a fix to the check's baseline run: it read a stale `--db`
+      cache). A/B vs Batch 5 on the lab: the default path's CSV
+      identical every round (noise floor applied), timing equal; `--json` +0.1 s CPU, CSV identical; shipping
+      the lab run 0.9 s (BENCHMARK.md).
+- [x] **Found while building this**: curl's `--cacert` alone still trusts the system CA directory (pinned with an
+      empty `--capath`); a connection reset mid-upload is not retried by curl (exit 4, resumed next time).

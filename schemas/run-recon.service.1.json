@@ -1,0 +1,227 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tideline:schema:run-recon.service/1",
+  "title": "run-recon service",
+  "description": "One service (scheme, host and port) under a seed, with the values of its representative URL row: the root URL when it was probed, else its smallest URL. The same rule recon-db.sh diff and --monitor use, so change events agree with <out>.delta.tsv. service omits the default port; port is always explicit. Values are the CSV cells as strings, without the CSV's formula guard (no leading apostrophe). An empty cell is an empty string. A field added in a later run-recon release is a minor version: consumers accept unknown string fields.",
+  "x-tideline-schema": "run-recon.service/1",
+  "x-minor": 0,
+  "type": "object",
+  "properties": {
+    "seed_domain": {
+      "type": "string"
+    },
+    "service": {
+      "type": "string"
+    },
+    "scheme": {
+      "type": "string"
+    },
+    "host": {
+      "type": "string"
+    },
+    "port": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 65535
+    },
+    "url_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "url": {
+      "type": "string"
+    },
+    "sources": {
+      "type": "string"
+    },
+    "status_code": {
+      "type": "string"
+    },
+    "content_length": {
+      "type": "string"
+    },
+    "webserver": {
+      "type": "string"
+    },
+    "title": {
+      "type": "string"
+    },
+    "technologies": {
+      "type": "string"
+    },
+    "ip": {
+      "type": "string"
+    },
+    "asn": {
+      "type": "string"
+    },
+    "asn_org": {
+      "type": "string"
+    },
+    "tls_version": {
+      "type": "string"
+    },
+    "tls_cipher": {
+      "type": "string"
+    },
+    "cert_not_after": {
+      "type": "string"
+    },
+    "cert_issuer": {
+      "type": "string"
+    },
+    "tls_flags": {
+      "type": "string"
+    },
+    "ipv6": {
+      "type": "string"
+    },
+    "cloud": {
+      "type": "string"
+    },
+    "rdap_org": {
+      "type": "string"
+    },
+    "geo": {
+      "type": "string"
+    },
+    "cpe": {
+      "type": "string"
+    },
+    "redirect_location": {
+      "type": "string"
+    },
+    "response_ms": {
+      "type": "string"
+    },
+    "body_sha256": {
+      "type": "string"
+    },
+    "content_type": {
+      "type": "string"
+    },
+    "powered_by": {
+      "type": "string"
+    },
+    "auth": {
+      "type": "string"
+    },
+    "cookies": {
+      "type": "string"
+    },
+    "cookie_issues": {
+      "type": "string"
+    },
+    "missing_sec_headers": {
+      "type": "string"
+    },
+    "hsts_max_age": {
+      "type": "string"
+    },
+    "alt_svc": {
+      "type": "string"
+    },
+    "http_flags": {
+      "type": "string"
+    },
+    "favicon_mmh3": {
+      "type": "string"
+    },
+    "favicon_md5": {
+      "type": "string"
+    },
+    "ptr": {
+      "type": "string"
+    },
+    "robots": {
+      "type": "string"
+    },
+    "security_txt": {
+      "type": "string"
+    },
+    "final_url": {
+      "type": "string"
+    },
+    "redirect_chain": {
+      "type": "string"
+    },
+    "login_form": {
+      "type": "string"
+    },
+    "tls_supported": {
+      "type": "string"
+    },
+    "tls_ciphers": {
+      "type": "string"
+    },
+    "tls_weak_cipher": {
+      "type": "string"
+    },
+    "cert_key": {
+      "type": "string"
+    },
+    "cert_sig_alg": {
+      "type": "string"
+    },
+    "cert_not_before": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "seed_domain",
+    "service",
+    "scheme",
+    "host",
+    "port",
+    "url_count",
+    "url",
+    "sources",
+    "status_code",
+    "content_length",
+    "webserver",
+    "title",
+    "technologies",
+    "ip",
+    "asn",
+    "asn_org",
+    "tls_version",
+    "tls_cipher",
+    "cert_not_after",
+    "cert_issuer",
+    "tls_flags",
+    "ipv6",
+    "cloud",
+    "rdap_org",
+    "geo",
+    "cpe",
+    "redirect_location",
+    "response_ms",
+    "body_sha256",
+    "content_type",
+    "powered_by",
+    "auth",
+    "cookies",
+    "cookie_issues",
+    "missing_sec_headers",
+    "hsts_max_age",
+    "alt_svc",
+    "http_flags",
+    "favicon_mmh3",
+    "favicon_md5",
+    "ptr",
+    "robots",
+    "security_txt",
+    "final_url",
+    "redirect_chain",
+    "login_form",
+    "tls_supported",
+    "tls_ciphers",
+    "tls_weak_cipher",
+    "cert_key",
+    "cert_sig_alg",
+    "cert_not_before"
+  ],
+  "additionalProperties": {
+    "type": "string"
+  }
+}
