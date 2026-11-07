@@ -146,8 +146,55 @@ outcrop -i domains.txt --keep-work           # retain intermediate artifacts for
 outcrop -i domains.txt -o r.csv --resume     # continue an interrupted run (same command + --resume)
 outcrop -i domains.txt --db                   # cache crawl/OSINT + persist inventory (see §6; needs one-time setup)
 outcrop -i domains.txt --no-report            # skip the end-of-run HTML report (see §6)
+outcrop -i domains.txt --user-agent outcrop   # every tool says it is Outcrop (default: a current Chrome's User-Agent)
+outcrop -i domains.txt --header 'X-Scan-Token: 7f3c'   # one more header on every request (repeatable)
+outcrop -i domains.txt --max-runtime 14400    # stop after 4 hours, as SIGTERM would (exit 124; --resume continues)
 outcrop -h
 ```
+
+### Request policy (one User-Agent, headers, timeout and rate for every tool)
+
+Every tool that sends HTTP to a target takes its User-Agent, extra headers, per-request timeout and rate
+from one place, so a WAF or a SOC sees one consistent client, and nothing goes out with a tool's default.
+
+| Setting | Option | Default |
+|---|---|---|
+| User-Agent | `--user-agent browser\|outcrop\|tool\|STRING` | `browser`: a current Chrome on Windows (`… Chrome/157.0.0.0 Safari/537.36`) |
+| Extra headers | `--header 'Name: value'` (repeatable, up to 16) | none |
+| Timeout per request (HTTP and TLS) | `--req-timeout N` | 10 s |
+| Requests per second, per tool | `--rate N` | 150 |
+
+- **The presets.**
+  - `browser` (the default) is a current Chrome on Windows (Chrome 157; raised with each release, since a
+    stale version looks like a bot). A WAF treats the scan like a visitor, which is what an attacker's
+    traffic looks like too.
+  - `outcrop` says what it is: `Mozilla/5.0 (X11; Linux x86_64) Outcrop (authorized asset inventory)`,
+    WebInventory's form. Use it where the SOC or the client wants to recognize, or allowlist, the scan.
+  - `tool` leaves each tool its own default, as before 1.21. httpx and nuclei pick a random browser User-Agent
+    per run, and katana sends Chrome 113. ffuf (`Fuzz Faster U Fool`), feroxbuster, wpscan and whatweb name
+    themselves, and the OWASP Core Rule Set blocks those names (rule 913100), as do many commercial WAFs.
+  - Any other value is sent as given.
+
+  Behind ModSecurity with the CRS in the lab (`bench-run-recon.sh ua`, 3 runs each), `--fuzz` found 177 paths
+  with `browser` or `outcrop` and none with `tool`; nuclei's findings were the same in all three.
+- **Who takes it.** httpx (the probe, enrichment, extras, origin checks, screenshots), katana, nuclei, ffuf,
+  feroxbuster, gospider, hakrawler, xnLinkFinder, getJS, arjun, secretfinder, whatweb, wpscan, gowitness, and
+  every curl request to a target, including the MTA-STS policy fetch. subjs, droopescan, joomscan and cmseek
+  take the User-Agent but have no header option.
+- **The exceptions.** The lab measures them (`bench-run-recon.sh policy`):
+  - httpx's screenshot browser keeps its own User-Agent (it still sends the extra headers); gowitness takes both;
+  - gospider lowercases the User-Agent and fetches JavaScript files without the extra headers. Its robots.txt
+    client ignores the setting, so its robots.txt fetch is off (katana reads robots.txt);
+  - subzy has no option for either;
+  - nuclei templates written as raw (`unsafe`) requests send the template's own headers (36 of nuclei's
+    36,272 requests in the lab).
+- **Header rules.** `Host`, `User-Agent`, `Content-Length`, `Transfer-Encoding` and `Connection` cannot be set.
+  A value may not contain `;`, except in a Cookie header (wpscan and xnLinkFinder split headers on it).
+  xnLinkFinder cuts a header value at its first `:`.
+- **What is recorded.** The banner shows the policy. run.json's `request_policy` holds the User-Agent, the
+  header names (never their values: a header can carry a secret), the timeout and the rate, and the command
+  line in run.json shows `--header 'Name: ***'`. HTTP results in the `--db` cache are kept per policy: a
+  result measured with one User-Agent is not served to a run that sends another.
 
 ### Discovery (host expansion — active; assets you are authorized to assess)
 
@@ -244,7 +291,8 @@ ship-recon.sh export results.csv --cert C --key K        # bundle for a hand-car
 `--json` writes `urls`, `services`, `findings`, `warnings` and `seeds`. It also writes each TSV
 inventory that ran: `dnsposture`, `edges`, `cnames`, `zone-names`, `screenshots`, `cloud-assets`,
 `vulnx` and `delta`. The field names are the CSV's and the TSVs' own, and each kind has a JSON Schema
-in `schemas/`.
+in `schemas/`. Since 1.21 a run-health warning also carries its `kind` (`waf_blocked`, `throttled`), host,
+seed and counts (`run-recon.warning/1`, x-minor 1).
 
 `--ship URL` sends the run to Tideline, the recon results platform, and implies `--json`. The
 certificate and key come from Tideline's step-ca: ECDSA P-256, with the sensor ID as the URI SAN
@@ -431,7 +479,8 @@ artifact, all warnings, and the exit status. The HTML report's run header is bui
 | `2` | bad arguments or input, refused by `--scope`, or unusable `--ship` settings (nothing was sent) |
 | `3` | the run finished with **no results** (0 URL rows). The log ends with "Finished with NO results" instead of "Complete.", and the report shows a banner |
 | `4` | the run finished with results, but `--ship` could not deliver them. The run is complete locally; `ship-recon.sh ship <csv>` retries |
-| `130` / `143` | interrupted by SIGINT (Ctrl-C) / SIGTERM: every stage the run started is stopped, the work dir is kept, and the same command with `--resume` continues it |
+| `124` | stopped by `--max-runtime`: as for SIGTERM below; the work dir's state says `timed-out` |
+| `130` / `143` | interrupted by SIGINT (Ctrl-C) / SIGTERM: every process the run started is stopped before Outcrop exits (SIGKILL for any still running `STOP_GRACE`=10 s after SIGTERM), the work dir is kept, and the same command with `--resume` continues it |
 
 **Evidence: `<out>.manifest.sha256`.** The last thing a run writes is the SHA-256 of every file it wrote:
 the CSV, each `<out>.*` side file, run.json, the report and the screenshots. The file is in `sha256sum`'s
@@ -442,8 +491,14 @@ recording elsewhere.
 
 **Resume.** Each work dir has a `state` file holding the run's status and hashes of the command line,
 the input and the scope file (no values). While a run is going it holds a lock (`flock`) on the work dir.
-On Ctrl-C or SIGTERM, Outcrop freezes and stops every process it started, marks the run interrupted
-and keeps the work dir (exit 130/143). Running the same command again with `--resume`:
+On Ctrl-C, SIGTERM or `--max-runtime`, Outcrop freezes every process of the run, sends them SIGTERM, and
+exits only when they are gone. What still runs `STOP_GRACE` seconds later (10 by default) is killed with
+SIGKILL, so no tool keeps sending to a target after the run has ended. A process of the run is found in the
+tree below Outcrop, or by a tag in its environment (`OUTCROP_RUN`) when it has left the tree (a child that
+daemonized). A long stage of the main process (range sweep, zone and posture checks, the chain check) is
+interrupted at once, not when it ends. The run is then marked interrupted (`timed-out` for `--max-runtime`) and
+the work dir is kept (exit 130/143/124). `bench-run-recon.sh stop` proves it with a packet capture: once
+Outcrop has exited, nothing more reaches the lab. Running the same command again with `--resume`:
 1. finds the newest interrupted work dir whose hashes match (an unlocked one only: never one still in use);
 2. keeps the seeds that finished: their markers, their parts and their raw dirs;
 3. runs the other seeds and the main-process stages (range sweeps, zone and posture checks) again;
@@ -463,9 +518,27 @@ Side files next to the CSV, by flag: `.takeover.txt` + `.cname.tsv` (`--takeover
 `.favicon.txt` (`--favicon`), `.screenshots.tsv` +
 `screenshots-<ts>/` (`--screenshots`), `.nuclei.txt`, `.params.txt`, `.secrets.txt`, `.buckets.txt`,
 `.cms.txt`, `.activescan.txt`, `.osint.txt`, `.virustotal.txt`, `.urlscan.txt`, `.social.txt`,
-`.new-assets.txt` + `.delta.tsv` (`--monitor`), `.scope.txt` (`--scope`), `.<kind>.jsonl` (`--json`), `.run.json`
+`.new-assets.txt` + `.delta.tsv` (`--monitor`), `.scope.txt` (`--scope`), `.health.tsv` (a host was blocked
+by a WAF, throttled, or had request errors), `.<kind>.jsonl` (`--json`), `.run.json`
 (always), `.report.html` and `.manifest.sha256` (always, written last). `.ship-state.json` (`--ship`) is written
 after the manifest and is not listed in it.
+
+**Run health** (1.21; every run but `--passive-only`, with no extra request). A clean result for a host is
+worth little if a WAF answered in its place, or if the host turned the scan away. Outcrop reads both from what
+the run already has:
+- **`waf_blocked`.** A host answered with a WAF vendor's block page: Cloudflare, Akamai, Imperva, AWS WAF
+  (CloudFront, ALB), F5 BIG-IP ASM, Sucuri, ModSecurity, Wordfence, FortiWeb, Barracuda, Azure WAF or
+  DDoS-Guard. The vendor is recognized from the status, headers and title of the response, and from markers
+  in its body (httpx `-er` on the enrichment request). The URL rows stay: they are what the scan saw. A plain
+  403, or a page that only names a vendor, is not a block page.
+- **`throttled`.** A host answered 429, reset connections, timed out or refused the TLS name `THROTTLE_MIN`
+  (5) times or more, and that is at least `THROTTLE_PCT` (10) % of its requests. The counts come from the
+  enrichment pass (httpx `-probe` keeps the requests it could not complete) and from the error logs of the crawl
+  and nuclei (`-elog`).
+
+Each is a warning naming the host (in the log, run.json and, with `--json`, `warnings.jsonl` with its `kind`,
+host, vendor and counts). The report has a Run health table, and `<out>.health.tsv` lists every host with a
+signal. Tideline's run-health panel reads the same fields.
 
 **Zone exposure findings** (`.zone.txt`, one line per zone):
 
@@ -953,7 +1026,9 @@ sudo sh -c './bench-run-recon.sh hosts >> /etc/hosts'    # once: names for tools
 ./bench-run-recon.sh bench --runs 3 --flags "--tls --ipv6" --baseline-script old/run-recon.sh   # A/B two versions
 ./bench-run-recon.sh compare run-a.csv run-b.csv --exact # field-by-field identity
 ./bench-run-recon.sh checks                              # takeover, zone, origin, http, tls, posture, discovery, scope,
-                                                         #   resume, history (RECON_DB_DSN=... adds the store), ship
+                                                         #   resume, history (RECON_DB_DSN=... adds the store), ship,
+                                                         #   waf, throttle, policy, stop
+./bench-run-recon.sh ua --runs 3                         # the User-Agent A/B behind ModSecurity + the OWASP CRS
 ./bench-run-recon.sh down
 ```
 
@@ -990,6 +1065,12 @@ store). Batch 5 adds the `tls` fixtures, and Batch 6 the `ship` check (`--ship` 
 checks in all. Against v1.19.0, interleaved run by run, every existing column is identical on the farm and on the
 lab, except WordPress's plain-HTTP login page (`auth=Form`, `CleartextAuth`: the new login-form detection), and
 the timing is equal.
+
+**v1.21** (Batch 7): the lab gains a ModSecurity + OWASP CRS front (`*.crs.test`), WAF block pages from nine
+vendors, a rate-limited host, an access-log switch and a loopback packet counter. `checks` adds `waf`, `throttle`,
+`policy` (every request of a run carries the policy, read at the ingress's access log) and `stop` (after a
+SIGTERM, no packet reaches the lab once Outcrop has exited). `ua` measures what each User-Agent choice sees
+behind the CRS (section 3, "Request policy").
 
 The v1.16 speed-up is from not querying internet archives for special-use names such as `.test`,
 which cannot exist there. The lab also exposed nine accuracy bugs, all fixed in v1.16 (listed in

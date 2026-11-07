@@ -118,6 +118,12 @@ sensor.
 holds these schemas unchanged (project doc `claude/tideline-schemas-v1.md`). Its first release is the tag
 `schemas-v1.0.0`; Outcrop is to vendor `schemas/schemas/` and `schemas/SHA256SUMS` from it (PLAN.md P4).
 
+**Ahead of Tideline: `run-recon.warning/1` x-minor 1 (Outcrop 1.21).** A run-health warning carries its
+`kind` (`waf_blocked`, `throttled`), `seed`, `host`, `fields` (vendor, statuses) and `counts`. That is the
+warning part of Tideline's planned `schemas-v1.1.0` (TA9). Until Tideline releases it, Outcrop's
+`schemas/run-recon.warning.1.json` is one minor ahead of `schemas-v1.0.0`, and an ingest still on x-minor 0
+refuses a warning that has a kind (the v1.0 schema allows `message` only). The other 13 files are unchanged.
+
 ## Transport
 
 - **TLS.** TLS 1.2 or later, with ECDHE and AES-GCM suites only.
@@ -170,8 +176,8 @@ ship-recon.sh check    --url URL --cert C --key K --ca CA
 ## Record files
 
 `--json` writes one JSON object per line. Each kind has a JSON Schema (2020-12) in `schemas/`, named by
-its `x-tideline-schema` id. The same files, unchanged, are released from benheise/Tideline's `schemas/`
-folder (tag `schemas-v1.0.0`).
+its `x-tideline-schema` id. The same files are released from benheise/Tideline's `schemas/` folder (tag
+`schemas-v1.0.0`), except the warning schema, one minor ahead (above).
 
 | File | Schema | One record per |
 |---|---|---|
@@ -186,7 +192,7 @@ folder (tag `schemas-v1.0.0`).
 | `<csv>.cloud-assets.jsonl` | `run-recon.cloud-asset/1` | row of `.cloud-assets.tsv` |
 | `<csv>.vulnx.jsonl` | `run-recon.vulnx/1` | row of `.vulnx.tsv` |
 | `<csv>.delta.jsonl` | `run-recon.delta/1` | row of `.delta.tsv` (`--monitor`) |
-| `<csv>.warnings.jsonl` | `run-recon.warning/1` | warning, in order, each once (all of them; `run.json` keeps 200) |
+| `<csv>.warnings.jsonl` | `run-recon.warning/1` | warning, in order, each once (all of them; `run.json` keeps 200); a run-health warning also has `kind`, `seed`, `host`, `fields`, `counts` (x-minor 1) |
 | `<csv>.seeds.jsonl` | `run-recon.seed/1` | seed: candidates, resolved, live hosts |
 
 `urls`, `services`, `findings`, `warnings` and `seeds` are always written. The other kinds are written
