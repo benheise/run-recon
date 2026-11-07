@@ -114,9 +114,9 @@ sensor.
   - a certificate that carries the tenant URI still passes, and a combined
     `urn:tideline:sensor:<tenant>:<id>` is refused.
 
-**Source of truth.** The `tideline-schemas` repository (project doc `claude/tideline-schemas-v1.md`) holds
-these schemas unchanged. Once it has a tagged release, Outcrop vendors its `schemas/` and `SHA256SUMS` from
-that release.
+**Source of truth.** The `schemas/` folder of [benheise/Tideline](https://github.com/benheise/Tideline)
+holds these schemas unchanged (project doc `claude/tideline-schemas-v1.md`). Its first release is the tag
+`schemas-v1.0.0`; Outcrop is to vendor `schemas/schemas/` and `schemas/SHA256SUMS` from it (PLAN.md P4).
 
 ## Transport
 
@@ -170,7 +170,8 @@ ship-recon.sh check    --url URL --cert C --key K --ca CA
 ## Record files
 
 `--json` writes one JSON object per line. Each kind has a JSON Schema (2020-12) in `schemas/`, named by
-its `x-tideline-schema` id. These files are to move to the shared `tideline-schemas` repository.
+its `x-tideline-schema` id. The same files, unchanged, are released from benheise/Tideline's `schemas/`
+folder (tag `schemas-v1.0.0`).
 
 | File | Schema | One record per |
 |---|---|---|
