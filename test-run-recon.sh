@@ -3767,6 +3767,9 @@ timeout 25 env PATH="$TESTPATH" HTTPX_BIN=httpx SECLISTS="$SECLISTS_TEST" RECON_
 if [ -s "$OW/b/r.csv" ] && cmp -s "$OW/a/r.csv" "$OW/b/r.csv"; then _pass "a run through run-recon.sh writes the same CSV as outcrop.sh"; else _fail "a run through run-recon.sh writes the same CSV as outcrop.sh"; fi
 assert_grep  "$OW/b/r.csv.run.json" '"tool": "run-recon"'                "run.json keeps the frozen tool id, run-recon"
 assert_grep  "$OW/b/r.csv.run.json" "\"version\": \"${OCVER//./\\.}\""     "...and records Outcrop's version"
+bash "$(dirname "$RUN_RECON")/generate-report.sh" "$OW/b/r.csv" -o "$OW/b.html" >/dev/null 2>&1 || true
+assert_grep  "$OW/b.html" "<b>Outcrop ${OCVER//./\\.}</b>"                   "report: a 1.21 run's header names Outcrop (an older run keeps run-recon)"
+assert_grep  "$OW/b.html" 'command line: <code>outcrop -i '              "report: ...and its command line"
 mkdir -p "$OW/lonely"; cp "$WRAP" "$OW/lonely/run-recon.sh"
 _rc=0; bash "$OW/lonely/run-recon.sh" --version > /dev/null 2> "$OW/lonely.err" || _rc=$?
 _rc_is "$_rc" 2                                                          "the wrapper without outcrop.sh next to it: exit 2..."
