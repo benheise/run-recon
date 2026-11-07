@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # bench-run-recon.sh  --  containerized test range + benchmark harness for
-#                         run-recon, modelled on WebInventory's regression lab
+#                         Outcrop (run-recon), modelled on WebInventory's regression lab
 #                         and PERFORMANCE.md so the two tools compare.
 #
 # The range (lab/docker-compose.yml) runs web services at PINNED versions behind
@@ -67,7 +67,7 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 LAB="$HERE/lab"
-RUN_RECON="${RUN_RECON:-$HERE/run-recon.sh}"
+RUN_RECON="${RUN_RECON:-$HERE/outcrop.sh}"   # Outcrop (run-recon.sh is its wrapper)
 COMPOSE_FILE="$LAB/docker-compose.yml"
 RESOLVERS_FILE="$LAB/resolvers.txt"
 # lab DNS listen address; any 127.0.0.0/8 address works if 127.0.0.1:53 is taken
@@ -368,7 +368,7 @@ cmd_run(){
   while [ "$#" -gt 0 ]; do
     case "$1" in -o|--output) out="${2:-}"; shift 2 || shift;; --farm) farm=1; shift;; *) pass+=("$1"); shift;; esac
   done
-  [ -f "$RUN_RECON" ] || die "run-recon not found at $RUN_RECON (set RUN_RECON=...)"
+  [ -f "$RUN_RECON" ] || die "outcrop.sh not found at $RUN_RECON (set RUN_RECON=...)"
   local targets="$LAB/targets.txt"; [ "$farm" = 1 ] && targets="$LAB/targets-farm.txt"
   [ -f "$targets" ] || die "missing $targets (run: $0 up)"
   [ -n "$out" ] || out="$HERE/bench-out.csv"
@@ -525,7 +525,7 @@ cmd_bench(){
     esac
   done
   case "$runs" in ''|*[!0-9]*) runs=3;; esac
-  [ -f "$RUN_RECON" ] || die "run-recon not found at $RUN_RECON"
+  [ -f "$RUN_RECON" ] || die "outcrop.sh not found at $RUN_RECON"
   local targets="$LAB/targets.txt" expected="$LAB/expected.csv" scen="lab"
   if [ "$farm" = 1 ]; then targets="$LAB/targets-farm.txt"; expected="$LAB/expected-farm.csv"; scen="farm"; fi
   [ -f "$targets" ] || die "missing $targets (run: $0 up)"
@@ -582,7 +582,7 @@ cmd_bench(){
 # takeover: the CNAME fixtures in lab/db.test, checked end to end with the real tools
 cmd_takeover(){
   lab_env
-  [ -f "$RUN_RECON" ] || die "run-recon not found at $RUN_RECON"
+  [ -f "$RUN_RECON" ] || die "outcrop.sh not found at $RUN_RECON"
   [ -s "$LAB/targets-takeover.txt" ] || die "no lab/targets-takeover.txt (run: $0 up)"
   local t; t="$(mktemp -d /tmp/bench-takeover.XXXXXX)"
   log "takeover check against lab/targets-takeover.txt -> $t"
@@ -605,7 +605,7 @@ cmd_takeover(){
 # zone: the --zone-exposure fixtures (db.xfr.test, db.walk.test.signed, db.test)
 cmd_zone(){
   lab_env
-  [ -f "$RUN_RECON" ] || die "run-recon not found at $RUN_RECON"
+  [ -f "$RUN_RECON" ] || die "outcrop.sh not found at $RUN_RECON"
   [ -s "$LAB/targets-zone.txt" ] || die "no lab/targets-zone.txt (run: $0 up)"
   local t; t="$(mktemp -d /tmp/bench-zone.XXXXXX)"
   log "zone exposure check against lab/targets-zone.txt -> $t"
@@ -640,7 +640,7 @@ cmd_zone(){
 # and nginx.test's SPF record); spa.test and wp.test have no reachable origin
 cmd_origin(){
   lab_env
-  [ -f "$RUN_RECON" ] || die "run-recon not found at $RUN_RECON"
+  [ -f "$RUN_RECON" ] || die "outcrop.sh not found at $RUN_RECON"
   [ -s "$LAB/targets-origin.txt" ] || die "no lab/targets-origin.txt (run: $0 up)"
   local t; t="$(mktemp -d /tmp/bench-origin.XXXXXX)"
   log "origin check against lab/targets-origin.txt -> $t"
@@ -670,7 +670,7 @@ cmd_origin(){
 # Caddyfile) and the cloud inventory diff against lab/cloud.tfstate (run-recon 1.20)
 cmd_posture(){
   lab_env
-  [ -f "$RUN_RECON" ] || die "run-recon not found at $RUN_RECON"
+  [ -f "$RUN_RECON" ] || die "outcrop.sh not found at $RUN_RECON"
   [ -s "$LAB/targets-posture.txt" ] || die "no lab/targets-posture.txt (run: $0 up)"
   local t; t="$(mktemp -d /tmp/bench-posture.XXXXXX)"
   # MTA-STS policies are fetched with certificate checks; the lab's are issued by Caddy's local CA
@@ -711,7 +711,7 @@ cmd_posture(){
 # alternate-port URL is a new asset and reaches a local webhook.
 cmd_discovery(){
   lab_env
-  [ -f "$RUN_RECON" ] || die "run-recon not found at $RUN_RECON"
+  [ -f "$RUN_RECON" ] || die "outcrop.sh not found at $RUN_RECON"
   [ -s "$LAB/targets-discovery.txt" ] || die "no lab/targets-discovery.txt (run: $0 up)"
   local t fail=0 port; t="$(mktemp -d /tmp/bench-discovery.XXXXXX)"
   _ck(){ if grep -qE "$2" "$1" 2>/dev/null; then log "  ok   $3"; else log "  FAIL $3 (see $1)"; fail=1; fi; }
@@ -765,7 +765,7 @@ http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()' "$po
 # http: the HTTP-detail fixtures in lab/Caddyfile and lab/db.127 (run-recon 1.19)
 cmd_http(){
   lab_env
-  [ -f "$RUN_RECON" ] || die "run-recon not found at $RUN_RECON"
+  [ -f "$RUN_RECON" ] || die "outcrop.sh not found at $RUN_RECON"
   [ -s "$LAB/targets-http.txt" ] || die "no lab/targets-http.txt (run: $0 up)"
   local t; t="$(mktemp -d /tmp/bench-http.XXXXXX)"
   log "HTTP detail check against lab/targets-http.txt -> $t"
@@ -832,7 +832,7 @@ PYHTTP
 # LAB_ORIGIN_IP reaches the nginx container from the docker bridge gateway.
 cmd_scope(){
   lab_env
-  [ -f "$RUN_RECON" ] || die "run-recon not found at $RUN_RECON"
+  [ -f "$RUN_RECON" ] || die "outcrop.sh not found at $RUN_RECON"
   local t fail=0 rc ip pip cid gw n0 n1 n2
   t="$(mktemp -d /tmp/bench-scope.XXXXXX)"
   _ck(){ if grep -qE "$2" "$1" 2>/dev/null; then log "  ok   $3"; else log "  FAIL $3 (see $1)"; fail=1; fi; }
@@ -893,7 +893,7 @@ cmd_scope(){
 # uninterrupted run's (field by field; the second reference run is the noise floor)
 cmd_resume(){
   lab_env
-  [ -f "$RUN_RECON" ] || die "run-recon not found at $RUN_RECON"
+  [ -f "$RUN_RECON" ] || die "outcrop.sh not found at $RUN_RECON"
   local t fail=0 rc pid i
   t="$(mktemp -d /tmp/bench-resume.XXXXXX)"
   log "resume check -> $t"
@@ -928,7 +928,7 @@ cmd_resume(){
 # the run CSVs and, when RECON_DB_DSN points at a PostgreSQL database, from the store (--db).
 cmd_history(){
   lab_env
-  [ -f "$RUN_RECON" ] || die "run-recon not found at $RUN_RECON"
+  [ -f "$RUN_RECON" ] || die "outcrop.sh not found at $RUN_RECON"
   local t fail=0 db=()
   t="$(mktemp -d /tmp/bench-history.XXXXXX)"
   [ -n "${RECON_DB_DSN:-}" ] && db=(--db)
@@ -966,7 +966,7 @@ cmd_history(){
 # (-min-version/-max-version), and the NULL-suite acceptance against the container's openssl.
 cmd_tls(){
   lab_env
-  [ -f "$RUN_RECON" ] || die "run-recon not found at $RUN_RECON"
+  [ -f "$RUN_RECON" ] || die "outcrop.sh not found at $RUN_RECON"
   [ -s "$LAB/targets-tls.txt" ] || die "no lab/targets-tls.txt (run: $0 up)"
   local t v fail=0; t="$(mktemp -d /tmp/bench-tls.XXXXXX)"
   log "TLS posture check (--tls-enum) against lab/targets-tls.txt -> $t"
@@ -1035,7 +1035,7 @@ PYTLS
 
 cmd_ship(){
   lab_env
-  [ -f "$RUN_RECON" ] || die "run-recon not found at $RUN_RECON"
+  [ -f "$RUN_RECON" ] || die "outcrop.sh not found at $RUN_RECON"
   local t rc mp port i fail=0 ship
   ship="$(dirname "$RUN_RECON")/ship-recon.sh"
   t="$(mktemp -d /tmp/bench-ship.XXXXXX)"

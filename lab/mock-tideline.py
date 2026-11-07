@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """mock-tideline.py -- a stand-in for Tideline's ingest service, for the suite and the lab.
 
-It implements the run-recon side of the ingest protocol (recon-platform-plan section 5) and
+It implements the sensor-facing side of the ingest protocol (recon-platform-plan section 5) and
 checks what a real ingest checks, so a passing shipper is a correct one:
 
   POST /v1/runs                      signed manifest -> 201 (new) | 200 (same bytes) | 409 (other bytes)

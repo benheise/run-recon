@@ -1,16 +1,16 @@
-# EASM URL Enumeration Toolkit
+# Outcrop: EASM URL Enumeration Toolkit
 
-Two scripts that stand up an OSS external-attack-surface URL-enumeration pipeline and run it against a list of domains you own, emitting a CSV that maps each seed domain to the URLs discovered on it.
+Outcrop was named run-recon until 1.21 (the repository was `benheise/run-recon`; `run-recon.sh` still works, as a wrapper that runs `outcrop.sh`). Two scripts that stand up an OSS external-attack-surface URL-enumeration pipeline and run it against a list of domains you own, emitting a CSV that maps each seed domain to the URLs discovered on it.
 
 ```
 setup-recon-env.sh   # native Linux (Kali/Debian/Fedora/Arch): install the toolchain
 Setup-ReconEnv.ps1   # Windows: provision WSL2 + install the toolchain (run once)
-run-recon.sh         # domains.txt -> results.csv  (+ optional side artifacts)
+outcrop.sh           # domains.txt -> results.csv  (+ optional side artifacts); run-recon.sh = its former name
 ```
 
-On Kali/Debian/Fedora/Arch run `sudo ./setup-recon-env.sh` (add `--include-heavy` for SecLists + nuclei-templates + feroxbuster); on Windows use `Setup-ReconEnv.ps1` as below. Both provision the same toolchain and install `run-recon.sh` as the `run-recon` command.
+On Kali/Debian/Fedora/Arch run `sudo ./setup-recon-env.sh` (add `--include-heavy` for SecLists + nuclei-templates + feroxbuster); on Windows use `Setup-ReconEnv.ps1` as below. Both provision the same toolchain and install `outcrop.sh` as the `outcrop` command (and `run-recon.sh`, the former name, as `run-recon`).
 
-Tool versions are **pinned** (httpx 1.12.0, katana 1.8.0, tlsx 1.4.0, dnsx 1.3.1, nuclei 3.11.1, …), because run-recon parses their output and releases change it without notice. Each run logs the versions it found and warns when a core tool is not the lab-verified one. To upgrade on purpose: `RECON_TOOLS_LATEST=1 sudo ./setup-recon-env.sh --force`, then re-run the benchmark lab (§7). `TOOL-COVERAGE.md` lists every ProjectDiscovery tool, its status and the WebInventory parity gaps.
+Tool versions are **pinned** (httpx 1.12.0, katana 1.8.0, tlsx 1.4.0, dnsx 1.3.1, nuclei 3.11.1, …), because Outcrop parses their output and releases change it without notice. Each run logs the versions it found and warns when a core tool is not the lab-verified one. To upgrade on purpose: `RECON_TOOLS_LATEST=1 sudo ./setup-recon-env.sh --force`, then re-run the benchmark lab (§7). `TOOL-COVERAGE.md` lists every ProjectDiscovery tool, its status and the WebInventory parity gaps.
 
 > **Authorization.** Only run this against assets your organization owns or is explicitly authorized to assess. The default mode sends live HTTP traffic to the targets (crawl + validation). Use `--passive-only` for zero target traffic.
 
@@ -26,7 +26,7 @@ Tool versions are **pinned** (httpx 1.12.0, katana 1.8.0, tlsx 1.4.0, dnsx 1.3.1
 
 ## 2. Setup (Windows, once)
 
-Keep both files in the **same folder** so the setup script can auto-install `run-recon.sh` into the distro.
+Keep both files in the **same folder** so the setup script can auto-install `outcrop.sh` (and the `run-recon.sh` wrapper) into the distro.
 
 ```powershell
 # from an ELEVATED PowerShell the first time
@@ -82,15 +82,15 @@ wsl -d Ubuntu
 # scheme prefixes and CRLF line endings are tolerated/stripped.
 printf '%s\n' example.com api.example.com > domains.txt
 
-run-recon -i domains.txt -o results.csv
+outcrop -i domains.txt -o results.csv
 ```
 
 ### Scope (checked before anything is sent)
 
 ```bash
-run-recon -i domains.txt --scope scope.txt --list-targets   # the plan: each seed in scope or why not; nothing sent
-run-recon -i domains.txt --scope scope.txt -o results.csv   # the run, held to scope.txt (fail-closed)
-run-recon -i domains.txt --scope scope.txt --drop-out-of-scope   # skip out-of-scope seeds instead of stopping
+outcrop -i domains.txt --scope scope.txt --list-targets   # the plan: each seed in scope or why not; nothing sent
+outcrop -i domains.txt --scope scope.txt -o results.csv   # the run, held to scope.txt (fail-closed)
+outcrop -i domains.txt --scope scope.txt --drop-out-of-scope   # skip out-of-scope seeds instead of stopping
 ```
 
 The scope file has one entry per line (`#` comments), like WebInventory's `-Scope`:
@@ -112,7 +112,7 @@ Fail-closed means:
 - **Discovered names.** A name found by any source passes only if no exclusion covers it. A name that
   resolves into an excluded range is never contacted: it is checked with dnsx before the certificate
   harvest, the takeover check and the probe.
-- **Addresses run-recon picks itself** are contacted only inside the allowed ranges: `--origin`
+- **Addresses Outcrop picks itself** are contacted only inside the allowed ranges: `--origin`
   candidates, `--favicon` / certificate-search hits, and names found on range certificates (those must
   also be among the scope's names). A scope with no address entries means no origin verification.
 - **Tools that follow links.**
@@ -128,39 +128,39 @@ Fail-closed means:
 - **The record.** What was held back goes to `<out>.scope.txt`, each item with the reason it was not
   contacted. run.json records the scope file's SHA-256, the seed counts and what was held back.
 
-Without `--scope`, run-recon keeps each seed's discoveries under that seed, as before. Input lines it
+Without `--scope`, Outcrop keeps each seed's discoveries under that seed, as before. Input lines it
 ignores (not a domain, an ASN or a CIDR) are now named in a warning instead of being dropped silently.
 
 ### Modes & tuning
 
 ```bash
-run-recon -i domains.txt --passive-only        # archives only; no traffic to targets (may be stale)
-run-recon -i domains.txt --no-validate         # crawl, but skip per-URL httpx enrichment
-run-recon -i domains.txt --subs                # subfinder + amass + assetfinder subdomain enrichment
-run-recon -i domains.txt --deep                # also run waymore (broader, slower passive)
-run-recon -i domains.txt -t 10 --rate 200      # 10 domains in parallel, 200 req/s where supported
-run-recon -i domains.txt --crawl-depth 3       # deeper katana crawl
-run-recon -i domains.txt --max-urls 20000      # raise the per-domain validation cap (default 5000)
-run-recon -i domains.txt --no-filter-static    # keep image/font/css URLs (default: filtered)
-run-recon -i domains.txt --keep-work           # retain intermediate artifacts for audit
-run-recon -i domains.txt -o r.csv --resume     # continue an interrupted run (same command + --resume)
-run-recon -i domains.txt --db                   # cache crawl/OSINT + persist inventory (see §6; needs one-time setup)
-run-recon -i domains.txt --no-report            # skip the end-of-run HTML report (see §6)
-run-recon -h
+outcrop -i domains.txt --passive-only        # archives only; no traffic to targets (may be stale)
+outcrop -i domains.txt --no-validate         # crawl, but skip per-URL httpx enrichment
+outcrop -i domains.txt --subs                # subfinder + amass + assetfinder subdomain enrichment
+outcrop -i domains.txt --deep                # also run waymore (broader, slower passive)
+outcrop -i domains.txt -t 10 --rate 200      # 10 domains in parallel, 200 req/s where supported
+outcrop -i domains.txt --crawl-depth 3       # deeper katana crawl
+outcrop -i domains.txt --max-urls 20000      # raise the per-domain validation cap (default 5000)
+outcrop -i domains.txt --no-filter-static    # keep image/font/css URLs (default: filtered)
+outcrop -i domains.txt --keep-work           # retain intermediate artifacts for audit
+outcrop -i domains.txt -o r.csv --resume     # continue an interrupted run (same command + --resume)
+outcrop -i domains.txt --db                   # cache crawl/OSINT + persist inventory (see §6; needs one-time setup)
+outcrop -i domains.txt --no-report            # skip the end-of-run HTML report (see §6)
+outcrop -h
 ```
 
 ### Discovery (host expansion — active; assets you are authorized to assess)
 
 ```bash
-run-recon -i domains.txt --resolve             # dnsx: keep only resolving hosts; routes DNS via dedicated resolvers (Pi-hole bypass)
-run-recon -i domains.txt --certs               # tlsx: harvest sibling hostnames from TLS certs (SAN/CN), pre-probe + live-host feedback loop
-run-recon -i domains.txt --permute             # alterx: permute discovered subdomains (implies --resolve)
-run-recon -i domains.txt --brute               # shuffledns/puredns + massdns: dictionary bruteforce vs the apex
-run-recon -i domains.txt --ports               # naabu: find non-standard web ports before httpx
-run-recon -i domains.txt --rounds 2            # recursive: re-enumerate newly discovered subdomains
-run-recon -i domains.txt --favicon             # uncover: Shodan/Censys/Fofa pivot (needs API keys)
-run-recon -i domains.txt --refresh-resolvers   # regenerate the resolver list with dnsvalidator (fresh, validated)
-run-recon -i domains.txt --resolvers res.txt   # custom resolver list for the DNS-heavy stages
+outcrop -i domains.txt --resolve             # dnsx: keep only resolving hosts; routes DNS via dedicated resolvers (Pi-hole bypass)
+outcrop -i domains.txt --certs               # tlsx: harvest sibling hostnames from TLS certs (SAN/CN), pre-probe + live-host feedback loop
+outcrop -i domains.txt --permute             # alterx: permute discovered subdomains (implies --resolve)
+outcrop -i domains.txt --brute               # shuffledns/puredns + massdns: dictionary bruteforce vs the apex
+outcrop -i domains.txt --ports               # naabu: find non-standard web ports before httpx
+outcrop -i domains.txt --rounds 2            # recursive: re-enumerate newly discovered subdomains
+outcrop -i domains.txt --favicon             # uncover: Shodan/Censys/Fofa pivot (needs API keys)
+outcrop -i domains.txt --refresh-resolvers   # regenerate the resolver list with dnsvalidator (fresh, validated)
+outcrop -i domains.txt --resolvers res.txt   # custom resolver list for the DNS-heavy stages
 
 # ASN / CIDR seeds are auto-detected in the input file and cert-scanned into hostnames.
 # ASN seeds need a free ProjectDiscovery Cloud key for asnmap (export PDCP_API_KEY=...,
@@ -171,70 +171,70 @@ printf '%s\n' AS13335 192.0.2.0/24 >> domains.txt
 ### Extra URL sources
 
 ```bash
-run-recon -i domains.txt --crawlers-all        # add gospider + hakrawler (wider crawl than katana alone)
-run-recon -i domains.txt --js                  # mine JS for endpoints (subjs/getJS -> xnLinkFinder); urlfinder auto-runs
-run-recon -i domains.txt --github --github-token gh.txt   # mine GitHub code for subdomains + endpoints (token file, 1/line)
-GITHUB_TOKEN=ghp_xxx run-recon -i domains.txt --github    # or supply the token via env
+outcrop -i domains.txt --crawlers-all        # add gospider + hakrawler (wider crawl than katana alone)
+outcrop -i domains.txt --js                  # mine JS for endpoints (subjs/getJS -> xnLinkFinder); urlfinder auto-runs
+outcrop -i domains.txt --github --github-token gh.txt   # mine GitHub code for subdomains + endpoints (token file, 1/line)
+GITHUB_TOKEN=ghp_xxx outcrop -i domains.txt --github    # or supply the token via env
 ```
 
 ### Analysis / triage (side artifacts written next to the CSV — not URL rows)
 
 ```bash
-run-recon -i domains.txt --takeover            # CNAMEs of every candidate, dangling targets, subzy/nuclei
+outcrop -i domains.txt --takeover            # CNAMEs of every candidate, dangling targets, subzy/nuclei
                                                #   -> results.csv.takeover.txt + results.csv.cname.tsv
-run-recon -i domains.txt --extras              # robots.txt (paths become URL rows), security.txt, one 404 probe,
+outcrop -i domains.txt --extras              # robots.txt (paths become URL rows), security.txt, one 404 probe,
                                                #   favicon hashes -> robots/security_txt/favicon_* columns + results.csv.extras.txt;
                                                #   also follows same-host redirects to the end (final_url, login_form)
-run-recon -i domains.txt --tls-enum            # --tls + the version matrix (TLS 1.3 .. SSL 3.0) and a weak-only hello
+outcrop -i domains.txt --tls-enum            # --tls + the version matrix (TLS 1.3 .. SSL 3.0) and a weak-only hello
                                                #   -> tls_supported, tls_ciphers, tls_weak_cipher; WeakTLS / WeakCipher
-run-recon -i domains.txt --zone-exposure       # each seed's DNS zone: AXFR on every name server, NSEC walk, NSEC3
+outcrop -i domains.txt --zone-exposure       # each seed's DNS zone: AXFR on every name server, NSEC walk, NSEC3
                                                #   -> results.csv.zone.txt + results.csv.zone-names.txt (names feed the scan)
-run-recon -i domains.txt --dns-posture         # SPF, DMARC, MTA-STS, TLS-RPT, CAA, dangling MX/NS, lame NS per seed + zone
+outcrop -i domains.txt --dns-posture         # SPF, DMARC, MTA-STS, TLS-RPT, CAA, dangling MX/NS, lame NS per seed + zone
                                                #   -> results.csv.dnsposture.txt + results.csv.dnsposture.tsv
-run-recon -i domains.txt --cloudlist cl.yaml   # your cloud accounts (cloudlist) vs what the scan found
+outcrop -i domains.txt --cloudlist cl.yaml   # your cloud accounts (cloudlist) vs what the scan found
                                                #   -> results.csv.cloud.txt + results.csv.cloud-assets.tsv
-run-recon -i domains.txt --tld-variants        # the seed's name under other TLDs (tldfinder), listed only
+outcrop -i domains.txt --tld-variants        # the seed's name under other TLDs (tldfinder), listed only
                                                #   -> results.csv.tld-variants.txt
-run-recon -i domains.txt --vulnx               # CVEs filed against each product seen (vulnx; any version)
+outcrop -i domains.txt --vulnx               # CVEs filed against each product seen (vulnx; any version)
                                                #   -> results.csv.vulnx.txt + results.csv.vulnx.tsv
-run-recon -i domains.txt --screenshots         # httpx -ss / gowitness, each capture validated -> screenshots-<ts>/
+outcrop -i domains.txt --screenshots         # httpx -ss / gowitness, each capture validated -> screenshots-<ts>/
                                                #   + results.csv.screenshots.tsv (ok / blank / failed / suspect)
-run-recon -i domains.txt --origin              # edge detection + origin search, verified directly
+outcrop -i domains.txt --origin              # edge detection + origin search, verified directly
                                                #   -> results.csv.origin.txt (verified origins) + results.csv.edge.tsv
-run-recon -i domains.txt --vhost               # ffuf Host-header bruteforce   -> new host rows
-run-recon -i domains.txt --nuclei              # templated vuln/misconfig scan -> results.csv.nuclei.txt   [opt-in]
-run-recon -i domains.txt --nuclei --interactsh-server https://oast.example.internal
+outcrop -i domains.txt --vhost               # ffuf Host-header bruteforce   -> new host rows
+outcrop -i domains.txt --nuclei              # templated vuln/misconfig scan -> results.csv.nuclei.txt   [opt-in]
+outcrop -i domains.txt --nuclei --interactsh-server https://oast.example.internal
                                                # nuclei callbacks to YOUR server (default: callbacks off)
-run-recon -i domains.txt --params              # arjun hidden-parameter search -> results.csv.params.txt   [opt-in]
-run-recon -i domains.txt --secrets             # secretfinder/trufflehog on JS -> results.csv.secrets.txt  [implies --js]
-run-recon -i domains.txt --buckets             # cloud_enum S3/Azure/GCP storage -> results.csv.buckets.txt
-run-recon -i domains.txt --active              # active CMS/app scan of live hosts -> results.csv.cms.txt
-run-recon -i domains.txt --activescan          # thorough scan: feroxbuster/ffuf over SecLists + nuclei -> results.csv.activescan.txt
-SECLISTS=/opt/recon/wordlists/SecLists run-recon -i d.txt --activescan   # point at a custom SecLists root
-run-recon -i domains.txt --osint               # RDAP + Shodan InternetDB + Team Cymru ASN -> results.csv.osint.txt
-VT_API_KEY=xxx run-recon -i d.txt --virustotal # VirusTotal passive DNS + reputation + subdomains
-run-recon -i domains.txt --osint --urlscan     # add urlscan.io historical URLs/IPs (in --all: --osint only)
-run-recon -i domains.txt --social              # social-media accounts for the org brand -> results.csv.social.txt
-run-recon -i domains.txt --social-user acmecorp   # search a specific username instead of the domain-derived brand
-WPSCAN_API_TOKEN=xxx run-recon -i d.txt --active   # add WPScan vuln-DB data (25 req/day on the free tier)
-run-recon -i domains.txt --active --cms-wordlist plugins.txt   # custom plugin/theme slug list for the native brute
+outcrop -i domains.txt --params              # arjun hidden-parameter search -> results.csv.params.txt   [opt-in]
+outcrop -i domains.txt --secrets             # secretfinder/trufflehog on JS -> results.csv.secrets.txt  [implies --js]
+outcrop -i domains.txt --buckets             # cloud_enum S3/Azure/GCP storage -> results.csv.buckets.txt
+outcrop -i domains.txt --active              # active CMS/app scan of live hosts -> results.csv.cms.txt
+outcrop -i domains.txt --activescan          # thorough scan: feroxbuster/ffuf over SecLists + nuclei -> results.csv.activescan.txt
+SECLISTS=/opt/recon/wordlists/SecLists outcrop -i d.txt --activescan   # point at a custom SecLists root
+outcrop -i domains.txt --osint               # RDAP + Shodan InternetDB + Team Cymru ASN -> results.csv.osint.txt
+VT_API_KEY=xxx outcrop -i d.txt --virustotal # VirusTotal passive DNS + reputation + subdomains
+outcrop -i domains.txt --osint --urlscan     # add urlscan.io historical URLs/IPs (in --all: --osint only)
+outcrop -i domains.txt --social              # social-media accounts for the org brand -> results.csv.social.txt
+outcrop -i domains.txt --social-user acmecorp   # search a specific username instead of the domain-derived brand
+WPSCAN_API_TOKEN=xxx outcrop -i d.txt --active   # add WPScan vuln-DB data (25 req/day on the free tier)
+outcrop -i domains.txt --active --cms-wordlist plugins.txt   # custom plugin/theme slug list for the native brute
 ```
 
 ### Monitoring & umbrella
 
 ```bash
-run-recon -i domains.txt --monitor                       # diff vs newest prior recon-*.csv -> results.csv.new-assets.txt
+outcrop -i domains.txt --monitor                       # diff vs newest prior recon-*.csv -> results.csv.new-assets.txt
                                                          #   + results.csv.delta.tsv (each service, field by field)
-run-recon -i domains.txt --monitor --monitor-prev old.csv --notify   # diff vs a specific CSV, push via 'notify'
-NOTIFY_CONFIG=notify.yaml run-recon -i d.txt --monitor --notify      # one message per run to the providers in notify.yaml
-run-recon -i domains.txt --all                           # full discovery + defensive set (see below)
+outcrop -i domains.txt --monitor --monitor-prev old.csv --notify   # diff vs a specific CSV, push via 'notify'
+NOTIFY_CONFIG=notify.yaml outcrop -i d.txt --monitor --notify      # one message per run to the providers in notify.yaml
+outcrop -i domains.txt --all                           # full discovery + defensive set (see below)
 ```
 
 ### JSON output & Tideline
 
 ```bash
-run-recon -i domains.txt --json                          # also every record kind as JSON lines: results.csv.<kind>.jsonl
-run-recon -i domains.txt --engagement eng-2026-014 \
+outcrop -i domains.txt --json                          # also every record kind as JSON lines: results.csv.<kind>.jsonl
+outcrop -i domains.txt --engagement eng-2026-014 \
   --ship https://tideline.internal:8443 --ship-cert rr-kali01.crt --ship-key rr-kali01.key --ship-ca root_ca.crt
                                                          # send the finished run to Tideline (mTLS, signed, resumable)
 ship-recon.sh ship results.csv                           # retry a delivery that failed (exit 4): sends only what is missing
@@ -302,7 +302,7 @@ Active stages (5–8) are skipped under `--passive-only`; enrichment (7) is skip
 | `--screenshots` | visual triage | httpx -ss (browser routed like httpx) / gowitness | `screenshots-<ts>/`, `.screenshots.tsv` (status per host) |
 | `--origin` | edge detection + origin search | httpx (headers, body hash, favicon), tlsx -jarm, cdncheck, dnsx (A+AAAA), dig (SPF/MX), curl `--resolve` | `.origin.txt` (verified, and protected origins), `.edge.tsv` |
 | `--tls` | TLS posture | tlsx (`-cert`: the leaf certificate) + chain validation (Python `ssl`, system trust store) | CSV cols `tls_version`..`tls_flags`, `cert_key`, `cert_sig_alg`, `cert_not_before` (joined to https rows) |
-| `--tls-enum` (`--tls-full`) | TLS + version matrix + weak-cipher probe | run-recon's own ClientHellos, stopped at the ServerHello (WebInventory's plan: 6 per https host) | cols `tls_supported`, `tls_ciphers`, `tls_weak_cipher`; `WeakTLS` / `WeakCipher` |
+| `--tls-enum` (`--tls-full`) | TLS + version matrix + weak-cipher probe | Outcrop's own ClientHellos, stopped at the ServerHello (WebInventory's plan: 6 per https host) | cols `tls_supported`, `tls_ciphers`, `tls_weak_cipher`; `WeakTLS` / `WeakCipher` |
 | `--ipv6` | AAAA resolution | dnsx -aaaa | CSV col `ipv6` (`;`-joined v6 addrs per host) |
 | `--enrich` | per-IP attribution | cloud IP-range feeds + RDAP + reverse DNS + MaxMind | CSV cols `cloud`, `rdap_org`, `ptr`, `geo` |
 | `--geodb PATH` | geo country source | mmdblookup (libmaxminddb) | sets `geo`; implies `--enrich` |
@@ -420,7 +420,7 @@ The CSV is written inside the distro. Open it from Windows via
 
 ### Run record, exit status and side files
 
-Every run writes `<out>.run.json`: run-recon version, `run_id` (with `engagement` and `job_id`), the command line (proxy credentials replaced by
+Every run writes `<out>.run.json`: Outcrop version, `run_id` (with `engagement` and `job_id`), the command line (proxy credentials replaced by
 `***`), start time and duration, seed count and per-seed counts (candidates, resolved, live hosts), the
 versions of httpx/katana/tlsx/dnsx, the resolvers and the result of their check, line counts of every side
 artifact, all warnings, and the exit status. The HTML report's run header is built from it.
@@ -442,7 +442,7 @@ recording elsewhere.
 
 **Resume.** Each work dir has a `state` file holding the run's status and hashes of the command line,
 the input and the scope file (no values). While a run is going it holds a lock (`flock`) on the work dir.
-On Ctrl-C or SIGTERM, run-recon freezes and stops every process it started, marks the run interrupted
+On Ctrl-C or SIGTERM, Outcrop freezes and stops every process it started, marks the run interrupted
 and keeps the work dir (exit 130/143). Running the same command again with `--resume`:
 1. finds the newest interrupted work dir whose hashes match (an unlocked one only: never one still in use);
 2. keeps the seeds that finished: their markers, their parts and their raw dirs;
@@ -512,7 +512,7 @@ policy and where it came from, MTA-STS mode, TLS-RPT, CAA issuers, name servers)
 "Email and DNS posture" table.
 
 **Cloud inventory** (`.cloud.txt`, `--cloudlist [CONFIG]`, default `~/.config/cloudlist/provider-config.yaml`).
-cloudlist lists the assets of the accounts in the provider config (`-pc CONFIG -json`), and run-recon compares
+cloudlist lists the assets of the accounts in the provider config (`-pc CONFIG -json`), and Outcrop compares
 them with the scan's inventory (the `host`, `ip` and `ipv6` columns): `cloud-asset-unseen [info]` for an
 asset's name or public address the scan did not find (`scope=in` when it is under a seed: add it as a seed if
 it should be covered, or it is not reachable from the internet), and `cloud-ip-unaccounted [low]` for an
@@ -587,7 +587,7 @@ comparison request goes through httpx and the proxy instead.
 
 **Screenshots** (`.screenshots.tsv`: host, file, status, reason, bytes). httpx's headless Chrome does not
 use httpx's `-r` or `-proxy`, and it ignores `NO_PROXY`: names meant to be reached directly went to the
-proxy, and the "screenshot" was the proxy's error page. run-recon now passes the browser `--proxy-server`
+proxy, and the "screenshot" was the proxy's error page. Outcrop now passes the browser `--proxy-server`
 (from `--proxy`) and a `--proxy-bypass-list` built from `NO_PROXY`, and uses an installed Chrome or
 Chromium. The browser also resolves names with the system resolver, not `--resolvers`: with `--resolvers`,
 it gets `--host-resolver-rules` mapping each host to the address your resolvers gave, so a name only they
@@ -611,7 +611,7 @@ The point of EASM is *change over time*, not a one-shot snapshot. The pipeline h
 
 ```bash
 # nightly via cron; --monitor auto-diffs against the newest earlier recon-*.csv in the out-dir
-0 3 * * *  /usr/local/bin/run-recon -i /home/me/domains.txt -D /home/me/recon-runs --monitor --notify >> /home/me/recon.log 2>&1
+0 3 * * *  /usr/local/bin/outcrop -i /home/me/domains.txt -D /home/me/recon-runs --monitor --notify >> /home/me/recon.log 2>&1
 ```
 
 `--monitor` writes `results.csv.new-assets.txt`; add `--notify` to push that list through ProjectDiscovery `notify` (Slack/Discord/webhook, configured in `~/.config/notify/`). Point at a specific baseline with `--monitor-prev old.csv`.
@@ -653,7 +653,7 @@ cut -d, -f2 results.csv | tail -n +2 | httpx -silent | nuclei -t ~/nuclei-templa
 
 ### HTML report (on by default)
 
-At the end of every run, `run-recon.sh` builds a single self-contained
+At the end of every run, `outcrop.sh` builds a single self-contained
 `<out>.report.html` next to the CSV. It ties together everything gathered about
 each host — the CSV inventory (IP / ASN / org / status / tech), the findings
 from the side-artifact files, and screenshots — and highlights
@@ -686,11 +686,11 @@ finding line shows the CVE, CVSS, EPSS, a `KEV`/`KEV/ransomware` flag, the match
 description. The join CSV is auto-detected; override with `--vulns FILE`.
 
 ```bash
-run-recon -i domains.txt -o results.csv --screenshots --nuclei --takeover --osint
+outcrop -i domains.txt -o results.csv --screenshots --nuclei --takeover --osint
 # -> results.csv.report.html   (open in a browser)
 
 # suppress it:
-run-recon -i domains.txt -o results.csv --no-report
+outcrop -i domains.txt -o results.csv --no-report
 
 # or generate one after the fact from an existing run's files:
 ./generate-report.sh -o report.html results.csv
@@ -701,7 +701,7 @@ run-recon -i domains.txt -o results.csv --no-report
 ```
 
 Automated severities are heuristic — always review findings manually. The
-generator needs `python3`; it lives next to `run-recon.sh` and is invoked
+generator needs `python3`; it lives next to `outcrop.sh` and is invoked
 automatically, so keep the two together.
 
 ### PostgreSQL cache/store (`--db`, reuses Kali's Metasploit Postgres)
@@ -748,11 +748,11 @@ a cold run (where the cache is empty):
 
 Two more timeout levers, independent of the DB:
 
-- `run-recon --dns-cache`'s companion — `setup-recon-env.sh --dns-cache` sets up a
+- `outcrop --dns-cache`'s companion — `setup-recon-env.sh --dns-cache` sets up a
   local **unbound** caching resolver and a resolvers file; point the DNS-heavy
   stages at it with `--resolvers /opt/recon/resolvers.txt` so they dedupe DNS
   transparently and local hits never time out;
-- `run-recon --proxy http://127.0.0.1:3128` routes the GET-heavy stages
+- `outcrop --proxy http://127.0.0.1:3128` routes the GET-heavy stages
   (curl / whatweb / gau / httpx) through a caching HTTP(S) proxy you run
   (e.g. a squid with SSL-bump, or mitmproxy). The installer does **not** bundle
   one — an HTTPS-intercepting cache needs a CA install and is too invasive to set
@@ -765,7 +765,7 @@ Everything is **fail-soft**: if psql or the DB is unavailable, the run simply
 proceeds uncached (with a warning) — `--db` never breaks a run.
 
 **Setup is automatic:** `setup-recon-env.sh` installs `recon-db.sh` (and
-`generate-report.sh`) next to `run-recon.sh` and runs `recon-db.sh init` for you
+`generate-report.sh`) next to `outcrop.sh` and runs `recon-db.sh init` for you
 (pass `--no-db` to skip). `init` sets up the store by method order:
 
 1. **Primary — a dedicated `recon` role + database on the local PostgreSQL,**
@@ -782,7 +782,7 @@ proceeds uncached (with a warning) — `--db` never breaks a run.
    only authorizes `msf` for the `msf` database), stores the namespaced
    `recon_cache` / `recon_hosts` tables **in the `msf` database itself** (no
    collision with Metasploit's tables).
-3. **Otherwise** it reports and exits non-zero, and run-recon simply runs
+3. **Otherwise** it reports and exits non-zero, and Outcrop simply runs
    without the cache.
 
 The resolved connection (including the password) is saved to
@@ -800,8 +800,8 @@ You can override everything with standard libpq env vars (`PGHOST` / `PGUSER` /
 **Use it:**
 
 ```bash
-run-recon -i domains.txt -o results.csv --osint --db
-CACHE_TTL=86400 run-recon -i domains.txt -o results.csv --db   # 1-day freshness (default 7 days)
+outcrop -i domains.txt -o results.csv --osint --db
+CACHE_TTL=86400 outcrop -i domains.txt -o results.csv --db   # 1-day freshness (default 7 days)
 ```
 
 **Inspect / maintain the store directly:**
@@ -942,7 +942,7 @@ WebInventory's regression lab and `PERFORMANCE.md`, so the two tools can be comp
 services. The range is WebInventory's farm mix at **pinned** versions: nginx 1.21.6, WordPress
 6.4.3 on Apache/PHP, a 120 KB single-page app and Jenkins 2.426.1. It runs behind a Caddy TLS
 ingress, with lab DNS for RFC 6761 `.test` names, and binds to loopback only. `lab/expected.csv`
-holds the status, technologies, CPEs, TLS flags and IPv6 addresses run-recon must report. Run it on
+holds the status, technologies, CPEs, TLS flags and IPv6 addresses Outcrop must report. Run it on
 a host you own, never against anything else.
 
 ```bash
@@ -1001,11 +1001,11 @@ late retry. `lab/README.md` covers ports, DNS and proxies.
 ## 8. Caveats & notes
 
 - **Progress & wall-clock guards.** Each pipeline phase prints a stage marker with elapsed time (e.g. `> content discovery (--fuzz) [example.com 00:03:12]`), a heartbeat every `HEARTBEAT`s shows overall progress (`... running 01:20:00 (2/5 domains complete)`), and each domain reports `done (N urls, HH:MM:SS)`. Suppress with `--no-progress`. Because the per-request `-timeout` flags on the underlying tools do **not** bound total runtime, every stage also runs under a wall-clock cap so a slow source, a huge SecLists wordlist, or a recursive `feroxbuster` can't hang the run for hours. Defaults (seconds, env-overridable; `0` disables): `STAGE_TIMEOUT=900`, `PASSIVE_TIMEOUT=600`, `BRUTE_TIMEOUT=1800`, `FUZZ_TIMEOUT=1800`, `SCAN_TIMEOUT=2400`. `--activescan`/`--all` are the most likely to hit these — raise `FUZZ_TIMEOUT`/`SCAN_TIMEOUT` for a thorough long run, lower them for a quick pass.
-- **Takeover check, callbacks and stdin (v1.17).** `--takeover` now looks up the CNAME of every candidate name, including names that no longer resolve (a dangling CNAME returns NXDOMAIN, so the old live-hosts-only check missed exactly those). Dangling targets are graded `[high]` for takeover-prone services and `[medium]` otherwise; subzy and nuclei then fingerprint every name that has a CNAME. nuclei never calls public interactsh servers unless you set `NUCLEI_OAST=public`. katana now uses `--resolvers` and `--proxy` like the other tools (v1.16 crawled through the system resolver and straight past a jump-host proxy). run-recon closes its stdin at start-up, because tlsx, katana and `mapcidr -aggregate` read stdin even when given a file, and the ASN/CIDR stage could otherwise wait forever when started from CI or `ssh host run-recon` without a terminal. Text cells in the CSV that start with `= + - @` get a leading apostrophe (formula-injection guard); the report and the DB import remove it.
+- **Takeover check, callbacks and stdin (v1.17).** `--takeover` now looks up the CNAME of every candidate name, including names that no longer resolve (a dangling CNAME returns NXDOMAIN, so the old live-hosts-only check missed exactly those). Dangling targets are graded `[high]` for takeover-prone services and `[medium]` otherwise; subzy and nuclei then fingerprint every name that has a CNAME. nuclei never calls public interactsh servers unless you set `NUCLEI_OAST=public`. katana now uses `--resolvers` and `--proxy` like the other tools (v1.16 crawled through the system resolver and straight past a jump-host proxy). Outcrop closes its stdin at start-up, because tlsx, katana and `mapcidr -aggregate` read stdin even when given a file, and the ASN/CIDR stage could otherwise wait forever when started from CI or `ssh host run-recon` without a terminal. Text cells in the CSV that start with `= + - @` get a leading apostrophe (formula-injection guard); the report and the DB import remove it.
 - **Load, retries and thread count.** httpx retries a failed request twice (`HTTP_RETRIES=2`), and URLs or TLS hosts that still return nothing get one more pass after a short pause (`LATE_RETRY=1`). Neither costs anything when nothing fails. Those failures are never negative-cached under `--db`, so a blip is retried on the next run instead of staying blank for `NEG_TTL`. On a 2 vCPU box, `-t 10` was 1.7x faster than the default `-t 5` with identical output. `-t 20` lost 1–3 hosts per run until the late retry was added. Raise `-t` for internal or lab seeds. On public seeds, more workers also means more parallel archive and API queries, so watch for HTTP 429 before raising it. Internal IPs are never sent to Team Cymru, RDAP or InternetDB. Special-use names (`.test`, `.internal`, `.local`, `.home.arpa`, …) skip internet archives and subdomain APIs; set `SKIP_SPECIAL_USE=0` to query them anyway.
 - **OSINT enrichment is passive and mostly key- and `jq`-gated.** `--osint`/`--virustotal`/`--urlscan` query third-party APIs *about* your domains/IPs — no packets to the target — so they run even under `--passive-only` and are safe by default. `--osint` is free and needs no key (RDAP + Shodan InternetDB + Team Cymru); `--virustotal` needs `VT_API_KEY` (free tier ~4 req/min, 500/day) and `--urlscan` takes an optional `URLSCAN_API_KEY`. All parse JSON with **`jq`** (a base package the installer provides) — without `jq` the RDAP/InternetDB/VT/urlscan lookups are skipped (the awk-based Team Cymru ASN still runs). The much larger menu of external OSINT sources — passive-DNS bulk, zone-file programs, breach providers, third-party ratings, paid scan tiers — is catalogued in `DATA-SOURCES.md`; most need custom fetchers, and the biggest quick win is pasting API keys into the scaffolded `subfinder` provider config to unlock Censys/Shodan/VirusTotal/SecurityTrails/etc. for passive subdomain discovery.
 - **Passive ≠ live.** Archived URLs frequently 404; that's why the default mode re-validates with `httpx`. Conversely, stale archive hits are valuable — forgotten admin panels / deprecated APIs that may still be reachable.
-- **`httpx` means ProjectDiscovery httpx, invoked as `httpx-toolkit`.** Two unrelated tools share the name `httpx`: PD's Go toolkit (what this pipeline needs — it fills the `status_code`/`title`/`technologies` columns) and the Python `httpx` HTTP client, which owns `/usr/bin/httpx` on Kali. To avoid the collision, run-recon calls the binary **`httpx-toolkit`** by default (the name Kali's `apt install httpx-toolkit` uses; the installer also exposes its go-installed PD httpx under that name). If yours is named plain `httpx` or lives at a custom path, point at it with `HTTPX_BIN=/path/to/httpx run-recon ...`.
+- **`httpx` means ProjectDiscovery httpx, invoked as `httpx-toolkit`.** Two unrelated tools share the name `httpx`: PD's Go toolkit (what this pipeline needs — it fills the `status_code`/`title`/`technologies` columns) and the Python `httpx` HTTP client, which owns `/usr/bin/httpx` on Kali. To avoid the collision, Outcrop calls the binary **`httpx-toolkit`** by default (the name Kali's `apt install httpx-toolkit` uses; the installer also exposes its go-installed PD httpx under that name). If yours is named plain `httpx` or lives at a custom path, point at it with `HTTPX_BIN=/path/to/httpx Outcrop ...`.
 - **Attribution.** The scope filter enforces host ∈ seed domain, but shared hosting / CDNs can still host third-party content under your name. Confirm ownership (IP/ASN/cert/DNS) before acting on findings. This matters most for **ASN/CIDR seed mode** and `--favicon`, which pull hostnames from certificates/internet-scan data that you should verify you own.
 - **`--brute` needs `massdns`.** The installer builds it from source; if that fails, `--brute` falls back to `puredns` (also needs massdns) and otherwise no-ops with a warning. Large bruteforce runs benefit from a fresh resolver list (`--resolvers`).
 - **`--github` needs a GitHub token.** `github-subdomains`/`github-endpoints` hit the authenticated code-search API; without a token (`--github-token FILE` or `GITHUB_TOKEN`) they're skipped. Use a token with no scopes (public search only), and ideally several in a `.tokens`-style file — GitHub rate-limits code search hard. This stage is passive with respect to your targets (it queries GitHub, not them).
@@ -1035,7 +1035,7 @@ late retry. `lab/README.md` covers ports, DNS and proxies.
   **inter-request delay** values for those data sources (many throttle or deny after only a few requests).
   It measures latency, parses `Retry-After` / `X-RateLimit-*` headers, and runs a gentle rate ramp that
   stops at the first throttle and backs off. Its **`--recon-osint`** mode drives the exact endpoints the
-  `--osint`/`--virustotal`/`--urlscan` stages hit and emits **run-recon's own variable names**, so the
+  `--osint`/`--virustotal`/`--urlscan` stages hit and emits **Outcrop's own variable names**, so the
   output wires straight back in via `--limits`:
 
   ```bash
@@ -1043,10 +1043,10 @@ late retry. `lab/README.md` covers ports, DNS and proxies.
   export VT_API_KEY=... URLSCAN_API_KEY=...        # optional
   ./probe-datasource-limits.sh --recon-osint --emit-config limits.env
   # 2) run recon with the derived per-source timeouts + delays applied
-  run-recon -i domains.txt --osint --virustotal --urlscan --limits limits.env
+  outcrop -i domains.txt --osint --virustotal --urlscan --limits limits.env
   ```
 
-  `limits.env` sets `RDAP_/INTERNETDB_/VT_/URLSCAN_` `*_TIMEOUT` and `*_DELAY` (seconds). run-recon's OSINT
+  `limits.env` sets `RDAP_/INTERNETDB_/VT_/URLSCAN_` `*_TIMEOUT` and `*_DELAY` (seconds). Outcrop's OSINT
   lookups honor them per source (each defaults to `STAGE_TIMEOUT` / no delay); the InternetDB per-IP loop and
   the VirusTotal calls are spaced by their `*_DELAY`. Team Cymru (ASN) is DNS-based and `--social`
   (tookie-osint) hits many sites, so neither is HTTP-rate-probed. You can also probe arbitrary endpoints:

@@ -22,8 +22,9 @@
          - git + dedicated venvs: LinkFinder, SecretFinder
          - (optional, -IncludeHeavyTools) SecLists wordlists, nuclei-templates,
            feroxbuster
-    4. Installs the companion run-recon.sh (found next to this script) into the
-       distro at /opt/recon/bin/run-recon.sh and symlinks it to /usr/local/bin/run-recon.
+    4. Installs Outcrop (outcrop.sh, found next to this script) into the distro at
+       /opt/recon/bin/outcrop.sh and symlinks it to /usr/local/bin/outcrop. run-recon.sh,
+       the former name, goes beside it as a wrapper (command: run-recon).
 
 .PARAMETER Distro
     WSL distribution name to use/install. Default: Ubuntu.
@@ -204,7 +205,7 @@ goinstall github.com/tomnomnom/unfurl@v0.4.3                           unfurl
 goinstall github.com/tomnomnom/qsreplace@v0.0.3                        qsreplace
 goinstall github.com/tomnomnom/gf@v0.0.0-20200618134122-dcd4c361f9f5                               gf
 goinstall github.com/projectdiscovery/httpx/cmd/httpx@v1.12.0           httpx
-# expose PD httpx as 'httpx-toolkit' (run-recon's default name; dodges python3-httpx)
+# expose PD httpx as 'httpx-toolkit' (Outcrop's default name; dodges python3-httpx)
 if have httpx && [ ! -e /usr/local/bin/httpx-toolkit ]; then ln -sf /usr/local/bin/httpx /usr/local/bin/httpx-toolkit; fi
 goinstall github.com/projectdiscovery/katana/cmd/katana@v1.8.0         katana
 goinstall github.com/projectdiscovery/subfinder/v2/cmd/subfinder@v2.17.0 subfinder
@@ -516,26 +517,31 @@ if ($provExit -ne 0) {
     Write-Ok "Provisioning finished."
 }
 
-# --- install the companion operational script ------------------------------
-$localRun = Join-Path $PSScriptRoot 'run-recon.sh'
+# --- install Outcrop (outcrop.sh) and its former name, the run-recon.sh wrapper ---
+$localRun = Join-Path $PSScriptRoot 'outcrop.sh'
 if (Test-Path $localRun) {
-    Write-Step "Installing run-recon.sh into the distro..."
-    $runText = Get-Content -Raw -Path $localRun
-    $winRun  = Join-Path $env:TEMP 'run-recon.sh'
-    Write-LfFile -Path $winRun -Text $runText
-    $wslRun = ConvertTo-WslPath $winRun
-    $bashCmd = "mkdir -p '$InstallRoot/bin'; cp '$wslRun' '$InstallRoot/bin/run-recon.sh'; chmod +x '$InstallRoot/bin/run-recon.sh'; ln -sf '$InstallRoot/bin/run-recon.sh' /usr/local/bin/run-recon"
-    try {
-        & wsl.exe -d $Distro -u root -- bash -c $bashCmd
-        Write-Ok "Installed: $InstallRoot/bin/run-recon.sh  (command: run-recon)"
-    } catch {
-        Write-Warn2 "Could not auto-install run-recon.sh. Copy it manually into WSL."
-    } finally {
-        Remove-Item $winRun -ErrorAction SilentlyContinue
+    foreach ($name in @('outcrop.sh', 'run-recon.sh')) {
+        $src = Join-Path $PSScriptRoot $name
+        if (-not (Test-Path $src)) { continue }
+        $cmd = $name -replace '\.sh$', ''
+        Write-Step "Installing $name into the distro..."
+        $runText = Get-Content -Raw -Path $src
+        $winRun  = Join-Path $env:TEMP $name
+        Write-LfFile -Path $winRun -Text $runText
+        $wslRun = ConvertTo-WslPath $winRun
+        $bashCmd = "mkdir -p '$InstallRoot/bin'; cp '$wslRun' '$InstallRoot/bin/$name'; chmod +x '$InstallRoot/bin/$name'; ln -sf '$InstallRoot/bin/$name' /usr/local/bin/$cmd"
+        try {
+            & wsl.exe -d $Distro -u root -- bash -c $bashCmd
+            Write-Ok "Installed: $InstallRoot/bin/$name  (command: $cmd)"
+        } catch {
+            Write-Warn2 "Could not auto-install $name. Copy it manually into WSL."
+        } finally {
+            Remove-Item $winRun -ErrorAction SilentlyContinue
+        }
     }
 } else {
-    Write-Warn2 "run-recon.sh not found next to this script ($PSScriptRoot)."
-    Write-Warn2 "Place run-recon.sh in the same folder and re-run, or copy it into WSL yourself."
+    Write-Warn2 "outcrop.sh not found next to this script ($PSScriptRoot)."
+    Write-Warn2 "Place outcrop.sh (and run-recon.sh, its former name) in the same folder and re-run, or copy them into WSL yourself."
 }
 
 # --- final guidance --------------------------------------------------------
@@ -551,11 +557,11 @@ Next steps (inside WSL):
   printf '%s\n' example.com api.example.com > domains.txt
 
   # run the enumeration (passive + crawl + validate by default)
-  run-recon -i domains.txt -o results.csv
+  outcrop -i domains.txt -o results.csv            # (run-recon, the former name, still works)
 
   # faster / quieter variants:
-  run-recon -i domains.txt --passive-only          # no traffic to targets
-  run-recon -i domains.txt --subs --deep -t 10     # subdomains + waymore, 10 parallel
+  outcrop -i domains.txt --passive-only            # no traffic to targets
+  outcrop -i domains.txt --subs --deep -t 10       # subdomains + waymore, 10 parallel
 
 The CSV is written inside the distro. Open it from Windows via:
   \\wsl.localhost\$Distro\home\<user>\results.csv     (or use a path under /mnt/c/...)

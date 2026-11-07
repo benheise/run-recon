@@ -23,8 +23,9 @@
 #     xnLinkFinder
 #   - git + dedicated venvs: LinkFinder, SecretFinder
 #   - (optional, --include-heavy) SecLists wordlists, nuclei-templates, feroxbuster
-# Then installs the companion run-recon.sh (found next to this script) to
-# /opt/recon/bin/run-recon.sh and symlinks it to /usr/local/bin/run-recon.
+# Then installs Outcrop (outcrop.sh, found next to this script) to /opt/recon/bin/ and
+# symlinks it to /usr/local/bin/outcrop; run-recon.sh, its former name, is installed
+# beside it as a wrapper and stays available as /usr/local/bin/run-recon.
 #
 # Run as root, or as a user with sudo (privileged steps are sudo-wrapped).
 # NOTE: no `set -e` -- one failed tool must not abort the whole run; each
@@ -234,7 +235,7 @@ if [ "$(id -u)" -ne 0 ]; then
   fi
 fi
 
-RUNNER_FOUND="no"; [ -f "$SCRIPT_DIR/run-recon.sh" ] && RUNNER_FOUND="yes"
+RUNNER_FOUND="no"; [ -f "$SCRIPT_DIR/outcrop.sh" ] && RUNNER_FOUND="yes"
 
 # ---------------------------------------------------------------------------
 # Dry-run: print the plan and exit without mutating anything
@@ -249,7 +250,7 @@ if [ "$DRY_RUN" = "1" ]; then
   log " Go version       : $GO_VERSION"
   log " Include heavy    : $([ "$INCLUDE_HEAVY" = 1 ] && echo yes || echo no)"
   log " Force            : $([ "$FORCE" = 1 ] && echo yes || echo no)"
-  log " run-recon.sh     : $RUNNER_FOUND ($SCRIPT_DIR/run-recon.sh)"
+  log " outcrop.sh       : $RUNNER_FOUND ($SCRIPT_DIR/outcrop.sh; run-recon.sh is its wrapper)"
   log " companion scripts: generate-report.sh=$([ -f "$SCRIPT_DIR/generate-report.sh" ] && echo yes || echo no) recon-db.sh=$([ -f "$SCRIPT_DIR/recon-db.sh" ] && echo yes || echo no)"
   log " recon DB setup   : $([ "$SETUP_DB" = 1 ] && echo "yes (recon-db.sh init; dedicated 'recon' DB, msfdb backup)" || echo "no (--no-db)")"
   log " DNS cache        : $([ "$SETUP_DNS_CACHE" = 1 ] && echo "yes (unbound @127.0.0.1)" || echo "no (--dns-cache to enable)")"
@@ -627,17 +628,23 @@ date | as_root tee "$INSTALL_ROOT/.provisioned" >/dev/null
 
 # ===========================================================================
 # 8) install the companion operational scripts
-#    run-recon.sh needs generate-report.sh, recon-db.sh and ship-recon.sh to live NEXT
+#    outcrop.sh needs generate-report.sh, recon-db.sh and ship-recon.sh to live NEXT
 #    TO IT (it resolves them relative to its own path), so install them together.
+#    run-recon.sh (the former name, a wrapper that runs outcrop.sh) goes beside them.
 # ===========================================================================
 if [ "$RUNNER_FOUND" = "yes" ]; then
   log "Installing toolkit scripts from $SCRIPT_DIR ..."
   as_root install -d "$INSTALL_ROOT/bin" 2>/dev/null || true
-  if as_root install -m 0755 "$SCRIPT_DIR/run-recon.sh" "$INSTALL_ROOT/bin/run-recon.sh" \
-     && as_root ln -sf "$INSTALL_ROOT/bin/run-recon.sh" /usr/local/bin/run-recon; then
-    ok "Installed: $INSTALL_ROOT/bin/run-recon.sh  (command: run-recon)"
+  if as_root install -m 0755 "$SCRIPT_DIR/outcrop.sh" "$INSTALL_ROOT/bin/outcrop.sh" \
+     && as_root ln -sf "$INSTALL_ROOT/bin/outcrop.sh" /usr/local/bin/outcrop; then
+    ok "Installed: $INSTALL_ROOT/bin/outcrop.sh  (command: outcrop)"
   else
-    warn "Could not install run-recon.sh automatically."
+    warn "Could not install outcrop.sh automatically."
+  fi
+  # the former name: existing scripts and cron jobs that call run-recon keep working
+  if [ -f "$SCRIPT_DIR/run-recon.sh" ] && as_root install -m 0755 "$SCRIPT_DIR/run-recon.sh" "$INSTALL_ROOT/bin/run-recon.sh" \
+     && as_root ln -sf "$INSTALL_ROOT/bin/run-recon.sh" /usr/local/bin/run-recon; then
+    ok "Installed: $INSTALL_ROOT/bin/run-recon.sh  (command: run-recon, the former name; it runs outcrop)"
   fi
   for _companion in generate-report.sh recon-db.sh ship-recon.sh; do
     _cmd="${_companion%.sh}"
@@ -670,8 +677,8 @@ if [ "$RUNNER_FOUND" = "yes" ]; then
     fi
   fi
 else
-  warn "run-recon.sh not found next to this script ($SCRIPT_DIR)."
-  warn "Place run-recon.sh (with generate-report.sh + recon-db.sh) alongside this installer and re-run."
+  warn "outcrop.sh not found next to this script ($SCRIPT_DIR)."
+  warn "Place outcrop.sh (with generate-report.sh, recon-db.sh, ship-recon.sh and run-recon.sh) alongside this installer and re-run."
 fi
 
 # ===========================================================================
@@ -712,7 +719,7 @@ if [ "$SETUP_DB" = "1" ]; then
       bash "$DB_LIB" init && DB_OK=1 || DB_OK=0
     fi
     if [ "${DB_OK:-0}" = "1" ]; then
-      ok "recon DB ready - run-recon --db will cache crawl/OSINT results and persist inventory."
+      ok "recon DB ready - outcrop --db will cache crawl/OSINT results and persist inventory."
     else
       warn "recon DB setup did not complete; '--db' will run uncached. See recon-db.sh notes to finish manually."
     fi
@@ -756,7 +763,7 @@ UCONF
         as_root install -d "$INSTALL_ROOT" 2>/dev/null || true
         printf '127.0.0.1\n' | as_root tee "$INSTALL_ROOT/resolvers.txt" >/dev/null 2>&1 || true
         ok "unbound caching resolver ready. Point DNS-heavy stages at it with:"
-        ok "    run-recon --resolvers $INSTALL_ROOT/resolvers.txt ..."
+        ok "    outcrop --resolvers $INSTALL_ROOT/resolvers.txt ..."
       else
         warn "Could not write the unbound config; skipping DNS cache."
       fi
@@ -802,12 +809,12 @@ ok " Setup complete."
   echo "  printf '%s\\n' example.com api.example.com > domains.txt"
   echo ""
   echo "  # run the enumeration (passive + crawl + validate by default)"
-  echo "  run-recon -i domains.txt -o results.csv"
+  echo "  outcrop -i domains.txt -o results.csv          # (run-recon, the former name, still works)"
   echo ""
   echo "  # faster / quieter variants:"
-  echo "  run-recon -i domains.txt --passive-only        # no traffic to targets"
-  echo "  run-recon -i domains.txt --subs --deep -t 10   # subdomains + waymore, 10 parallel"
-  echo "  run-recon -i domains.txt --subs --resolve --certs --permute"
+  echo "  outcrop -i domains.txt --passive-only          # no traffic to targets"
+  echo "  outcrop -i domains.txt --subs --deep -t 10     # subdomains + waymore, 10 parallel"
+  echo "  outcrop -i domains.txt --subs --resolve --certs --permute"
   echo "                                                 # validated hosts + cert SANs + permutations"
   echo "                                                 # (dnsx/tlsx/httpx routed via dedicated resolvers)"
   echo ""
@@ -817,11 +824,11 @@ ok " Setup complete."
   if [ "$SETUP_DB" = "1" ]; then
     echo "  # the recon PostgreSQL cache is set up -- enable it to skip re-crawling"
     echo "  # targets and re-hitting OSINT APIs, and to persist each run's inventory:"
-    echo "  run-recon -i domains.txt -o results.csv --osint --db"
+    echo "  outcrop -i domains.txt -o results.csv --osint --db"
     echo "  recon-db stats                                 # inspect the cache/store"
   else
     echo "  # recon DB was skipped (--no-db). To enable caching later:"
-    echo "  sudo recon-db init  &&  run-recon -i domains.txt --db"
+    echo "  sudo recon-db init  &&  outcrop -i domains.txt --db"
   fi
   echo ""
   if [ "$WSL" = "yes" ]; then

@@ -1,6 +1,7 @@
-# run-recon plan
+# Outcrop plan (formerly run-recon)
 
-The tracked list of open work for the run-recon toolkit (run-recon.sh, generate-report.sh,
+The tracked list of open work for the Outcrop toolkit, named run-recon until 1.21 (outcrop.sh, with run-recon.sh as
+its wrapper; generate-report.sh,
 recon-db.sh, bench-run-recon.sh, the lab and the test suite). Each item says how it will be
 checked. The method stays WebInventory's: lab fixtures, 3 runs, medians, and a change to the
 default path is kept only if it is no slower and its output is identical (or the difference is a
@@ -112,6 +113,16 @@ release, brought forward at Ben's request. Details: SHIPPING.md.
 | P2 | `run_id` (UUID v4, kept across `--resume`), `--engagement`, `--job-id` in run.json and the manifest | Done | suite (incl. `--resume`) |
 | P3 | `--ship URL` with `--ship-cert`/`--ship-key`/`--ship-ca`/`--ship-proxy`: mTLS pinned to the Tideline CA (an empty `--capath`: `--cacert` alone still trusts the system store), signed `tideline-envelope/1` (ES256), gzip parts hashed as in the run's manifest, `ship-state.json`, exit 4; preflight before the scan; `ship-recon.sh` ship/status/export/envelope/check | Done | suite against `lab/mock-tideline.py` (delivery, re-ship, resume, refusals, pinning, export); `bench-run-recon.sh ship` (the shipped records equal the local CSV row for row) |
 | P4 | WebInventory's side (`-ShipTo`, `Send-WebInventoryRun.ps1`, `Register-WebInventorySensor.ps1`) against the same envelope; run-recon vendoring `schemas/` and `SHA256SUMS` from a tagged `tideline-schemas` release (the repository is drafted: `claude/tideline-schemas-v1.md`) | Planned (WebInventory, Tideline) | contract test of both tools' lab output; `sha256sum -c` of the vendored copy |
+
+## 9. v1.21: the Outcrop name
+
+The repository was renamed `benheise/Outcrop` on 2026-11-07, and Ben chose to carry the name into the tool in
+1.21, after the v1.20.0 release.
+
+| ID | Item | Status | Check |
+|---|---|---|---|
+| O1 | `outcrop.sh` is the command (installed as `outcrop`); `run-recon.sh` stays as a wrapper that execs it (same arguments, environment, exit status and PID), installed as `run-recon`, so existing scripts and cron jobs keep working. The name changes in help, messages, the report header (for runs from 1.21 on), the setup scripts and the current docs | Done (`outcrop-v1.21`, PR #10) | suite: the wrapper's version, a symlinked install, exit status, the same CSV, a missing outcrop.sh |
+| O2 | Unchanged on purpose: the frozen machine ids (`tool` = `run-recon` in run.json and the Tideline envelope; the `run-recon.*/1` schemas); output names (`recon-<ts>.csv`); the companion scripts (`generate-report.sh`, `recon-db.sh`, `ship-recon.sh`); the dev scripts (`bench-run-recon.sh`, `test-run-recon.sh`); the cloud-feed cache path; history sections of the docs | Decided | suite pins the tool id |
 
 ## Done (for reference)
 

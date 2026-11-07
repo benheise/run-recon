@@ -1536,3 +1536,27 @@ recon-platform-plan §11; the protocol, exit codes, schemas and enrollment are i
       the lab run 0.9 s (BENCHMARK.md).
 - [x] **Found while building this**: curl's `--cacert` alone still trusts the system CA directory (pinned with an
       empty `--capath`); a connection reset mid-upload is not retried by curl (exit 4, resumed next time).
+
+## v1.21.0 (unreleased) — Outcrop: run-recon renamed
+
+Tracked in `PLAN.md` section 9 (O1, O2), on `outcrop-v1.21`. The repository was renamed `benheise/Outcrop` on
+2026-11-07; the tool follows in 1.21, after the v1.20.0 release.
+
+- [x] **`outcrop.sh`** is the main script: a pure `git mv` from `run-recon.sh`, so `git log --follow outcrop.sh`
+      keeps its history. `--version` prints `outcrop v1.21.0-dev`; help, `--list-targets`, notify messages and
+      warnings say Outcrop. `VERSION` 1.21.0-dev in outcrop.sh and ship-recon.sh.
+- [x] **`run-recon.sh`** is now a wrapper: it finds `outcrop.sh` next to itself (through symlinks) and `exec`s it
+      with the same arguments, so exit status, signals, `--resume` and the PID are unchanged for existing scripts
+      and cron jobs. It exits 2 with a message when outcrop.sh is missing.
+- [x] **Setup:** `setup-recon-env.sh` and `Setup-ReconEnv.ps1` install `outcrop.sh` as `outcrop` and the wrapper
+      as `run-recon`.
+- [x] **Report:** the run header names Outcrop for runs from 1.21 on, and run-recon for older ones (it reads the
+      run's version).
+- [x] **Kept:**
+      - the frozen machine ids: `tool` = `run-recon` in run.json and the envelope, the `run-recon.*/1` schemas;
+        the suite pins the envelope's tool id;
+      - the `recon-<ts>.csv` names;
+      - the companion and dev script names;
+      - `~/.cache/run-recon/` for the cloud feeds.
+
+      run-recon sends no custom User-Agent to targets, so a SOC rule keyed on it cannot break.
