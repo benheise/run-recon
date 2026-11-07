@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# ship-recon.sh  --  send a finished run-recon run to Tideline (the recon results platform)
+# ship-recon.sh  --  send a finished Outcrop (run-recon) run to Tideline (the recon results platform)
 #
 #   ship-recon.sh ship     <csv> [--url URL --cert C --key K --ca CA] [--proxy P] [--dry-run]
 #   ship-recon.sh status   <csv> [--url URL --cert C --key K --ca CA] [--proxy P]
@@ -31,15 +31,15 @@
 # part): fix the cause first. `status`: 0 known, 4 unreachable, 5 unknown or refused.
 #
 set -euo pipefail
-VERSION="1.20.0"
+VERSION="1.21.0-dev"
 exec python3 -I - "$VERSION" "$@" <<'PYSHIP'
 import sys, os, re, json, hashlib, subprocess, tempfile, shutil, gzip, time, datetime, fcntl, tarfile, io, stat
 
 VERSION = sys.argv[1]
 ARGV = sys.argv[2:]
-TOOL = "run-recon"
+TOOL = "run-recon"          # frozen tool id (tideline-envelope/1, run-recon.*/1): Outcrop keeps it
 ENVELOPE = "tideline-envelope/1"
-UA = "run-recon-ship/" + VERSION
+UA = "outcrop-ship/" + VERSION
 KINDS = [("urls", "run-recon.url/1"), ("services", "run-recon.service/1"), ("findings", "run-recon.finding/1"),
          ("dnsposture", "run-recon.dnsposture/1"), ("edges", "run-recon.edge/1"), ("cnames", "run-recon.cname/1"),
          ("zone-names", "run-recon.zone-name/1"), ("screenshots", "run-recon.screenshot/1"),
@@ -57,7 +57,7 @@ USAGE_TEXT = """usage: ship-recon.sh ship     <csv> [--url URL --cert FILE --key
        ship-recon.sh export   <csv> --cert FILE --key FILE [-o BUNDLE.tar]
        ship-recon.sh envelope <csv> --cert FILE
        ship-recon.sh check    --url URL --cert FILE --key FILE --ca FILE [--proxy URL]
-Send a finished run-recon run (made with --json) to Tideline. See SHIPPING.md."""
+Send a finished Outcrop run (made with --json) to Tideline. See SHIPPING.md."""
 
 
 class Fail(Exception):
@@ -256,9 +256,9 @@ def build(csvp, sensor):
     run = json.load(open(rp, encoding="utf-8"))
     rid = run.get("run_id") or ""
     if not UUID4.match(rid):
-        raise Fail(LOCAL, "%s has no run_id: it was written by run-recon before 1.20; re-run with --json" % rp)
+        raise Fail(LOCAL, "%s has no run_id: it was written before 1.20 (run-recon); re-run with --json" % rp)
     if base + ".urls.jsonl" not in man:
-        raise Fail(LOCAL, "the run has no JSON lines (%s.urls.jsonl): run run-recon with --json (or --ship)" % base)
+        raise Fail(LOCAL, "the run has no JSON lines (%s.urls.jsonl): run outcrop with --json (or --ship)" % base)
     parts = []
     for kind, sid in KINDS:
         rel = "%s.%s.jsonl" % (base, kind)

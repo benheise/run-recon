@@ -18,8 +18,8 @@
 #
 set -uo pipefail
 
-RUN_RECON="${1:-$(cd "$(dirname "$0")" && pwd)/run-recon.sh}"
-if [ ! -f "$RUN_RECON" ]; then echo "run-recon.sh not found at: $RUN_RECON" >&2; exit 2; fi
+RUN_RECON="${1:-$(cd "$(dirname "$0")" && pwd)/outcrop.sh}"
+if [ ! -f "$RUN_RECON" ]; then echo "outcrop.sh not found at: $RUN_RECON" >&2; exit 2; fi
 
 # Keep the suite independent of the ambient environment: a GITHUB_TOKEN/GH_TOKEN
 # injected by the host (CI, a gh-configured shell) would otherwise make the
@@ -1235,7 +1235,7 @@ assert_grep  "$CSV.new-assets.txt" 'gau-path'                         "new URL f
 refute_grep  "$CSV.new-assets.txt" 'OLD-ONLY'                         "prior-only URL not reported as new"
 assert_grep  "$ERRLOG" 'new asset'                                    "monitoring summary reports new assets"
 assert_grep  "$MOCKLOG/notify.args" -- '^-silent -bulk $'               "notify sends one message per run (-bulk)"
-assert_grep  "$MOCKLOG/notify.stdin" '^run-recon: [0-9]+ new asset\(s\) vs prev\.csv$' "the message opens with a summary line"
+assert_grep  "$MOCKLOG/notify.stdin" '^outcrop: [0-9]+ new asset\(s\) vs prev\.csv$' "the message opens with a summary line"
 assert_grep  "$MOCKLOG/notify.stdin" 'gau-path'                       "...and lists the new assets"
 NOTIFY_CONFIG="$TMP/notify.yaml" run_case monitor_cfg --monitor --monitor-prev "$PREVCSV" --notify
 assert_grep  "$MOCKLOG/notify.args" -- "-pc $TMP/notify\.yaml"          "NOTIFY_CONFIG picks the providers (-pc)"
@@ -1926,9 +1926,9 @@ BENCH="$(dirname "$RUN_RECON")/bench-run-recon.sh"
 BD="$TMP/bench"; rm -rf "$BD"; mkdir -p "$BD"
 _rc(){ if [ "$(cat "$1" 2>/dev/null)" = "$2" ]; then _pass "$3"; else _fail "$3  [rc=$(cat "$1" 2>/dev/null), want $2]"; fi; }
 if [ ! -f "$BENCH" ]; then
-  _fail "bench-run-recon.sh present next to run-recon.sh"
+  _fail "bench-run-recon.sh present next to outcrop.sh"
 else
-  _pass "bench-run-recon.sh present next to run-recon.sh"
+  _pass "bench-run-recon.sh present next to outcrop.sh"
   printf 'host,status,technologies,cpe,tls_flags\n' > "$BD/expected.csv"
   printf 'nginx.lab,200,Nginx,cpe:2.3:a:f5:nginx:1.21.6,CertUntrusted\n' >> "$BD/expected.csv"
   printf 'wp.lab,200,WordPress;PHP,cpe:2.3:a:wordpress:wordpress:6.4,CertUntrusted\n' >> "$BD/expected.csv"
@@ -3653,7 +3653,7 @@ for _k in members envelope parts signature; do assert_grep "$B6/tar.txt" "^$_k T
 rm -rf "$B6/nojson"; mkdir -p "$B6/nojson"; cp "$B6/run1/r.csv" "$B6/run1/r.csv.run.json" "$B6/nojson/"
 ( cd "$B6/nojson" && sha256sum r.csv r.csv.run.json > r.csv.manifest.sha256 )
 _rc=0; _ship ship "$B6/nojson/r.csv" "${OK6[@]}" || _rc=$?;                            _rc_is "$_rc" 1 "a run without --json is not shipped (exit 1)..."
-assert_grep "$B6/ship.err" 'run run-recon with --json'                                  "...and the message says how to fix it"
+assert_grep "$B6/ship.err" 'run outcrop with --json'                                    "...and the message says how to fix it"
 
 section "Batch 6: run-recon --ship (preflight, delivery, exit 4, same outputs as --json)"
 REAL_CURL="$(command -v curl)"
@@ -3706,6 +3706,7 @@ ok("header", '"Tideline-Signature: " + sig' in src and '"alg=ES256; enc=der; sig
    and 'self.headers.get("Tideline-Signature")' in msrc)
 ok("sensor", 'r"URI:urn:tideline:sensor:([A-Za-z0-9][A-Za-z0-9._-]{0,63})(?=[,\\s]|$)"' in src
    and 'URN = "urn:tideline:sensor:"' in msrc)
+ok("tool", 'TOOL = "run-recon"' in src)
 ok("endpoints", all(e in src for e in ('"/v1/runs"', '"/v1/runs/%s/parts/%d"', '"/v1/runs/%s/complete"', '"/v1/runs/%s"')))
 bad = []
 for n in sorted(os.listdir(sd)):
@@ -3724,6 +3725,7 @@ assert_grep "$B6/frozen.txt" '^envelope True$'   "frozen: the envelope schema is
 assert_grep "$B6/frozen.txt" '^header True$'     "frozen: the signature travels as 'Tideline-Signature: alg=ES256; enc=der; sig=<base64>'"
 assert_grep "$B6/frozen.txt" '^sensor True$'     "frozen: the sensor is the URI SAN urn:tideline:sensor:<id> (1-64 of A-Z a-z 0-9 . _ -)"
 assert_grep "$B6/frozen.txt" '^endpoints True$'  "frozen: the /v1/runs endpoints"
+assert_grep "$B6/frozen.txt" '^tool True$'       "frozen: the envelope's tool id stays run-recon (Outcrop's machine id)"
 assert_grep "$B6/frozen.txt" '^schemaids True$'  "frozen: every schema's \$id is urn:tideline:schema:<id>, its file <id>.json, major version 1"
 assert_grep "$B6/frozen.txt" '^sumslist True$'   "schemas/SHA256SUMS lists every schema file, and only those"
 if ( cd "$SCHEMAS6" && sha256sum --quiet -c SHA256SUMS ) >/dev/null 2>&1; then _pass "the frozen schemas match schemas/SHA256SUMS (a change needs a new major id, or x-minor and new sums)"
@@ -3747,6 +3749,30 @@ if [ "$_rc" = 0 ] && python3 -c 'import json,sys; e=json.load(open(sys.argv[1]))
   _pass "the envelope names the sensor and carries no tenant (ingest takes it from the certificate)"; else _fail "the envelope names the sensor and carries no tenant"; fi
 _rc=0; _ship check --url "https://127.0.0.1:9" --cert "$T6/combined.pem" --key "$T6/combined.key" --ca "$P6/root.pem" || _rc=$?
 _rc_is "$_rc" 1                                                        "a combined urn:tideline:sensor:<tenant>:<id> is refused (no colon in a sensor id)"
+
+section "Outcrop (1.21): the run-recon.sh wrapper runs outcrop.sh"
+OW="$TMP/outcrop-wrapper"; rm -rf "$OW"; mkdir -p "$OW/bin" "$OW/a" "$OW/b"
+WRAP="$(dirname "$RUN_RECON")/run-recon.sh"
+OCVER="$(sed -n 's/^VERSION="\(.*\)"$/\1/p' "$RUN_RECON")"
+if [ "$(bash "$RUN_RECON" --version 2>&1)" = "outcrop v$OCVER" ]; then _pass "outcrop --version: 'outcrop v$OCVER'"; else _fail "outcrop --version  [$(bash "$RUN_RECON" --version 2>&1)]"; fi
+if [ "$(bash "$WRAP" --version 2>&1)" = "outcrop v$OCVER" ]; then _pass "run-recon.sh --version runs outcrop.sh"; else _fail "run-recon.sh --version runs outcrop.sh  [$(bash "$WRAP" --version 2>&1)]"; fi
+ln -sf "$WRAP" "$OW/bin/run-recon"
+if [ "$("$OW/bin/run-recon" --version 2>&1)" = "outcrop v$OCVER" ]; then _pass "through a symlink (the installed run-recon command) it finds outcrop.sh"; else _fail "through a symlink it finds outcrop.sh"; fi
+_rc=0; bash "$WRAP" --no-such-option >/dev/null 2>&1 || _rc=$?
+_rc_is "$_rc" 2                                                          "the wrapper passes outcrop's exit status through (bad argument: 2)"
+timeout 25 env PATH="$TESTPATH" HTTPX_BIN=httpx SECLISTS="$SECLISTS_TEST" RECON_CLOUD_CACHE="$OW/c.tsv" TLS_CHAIN_CHECK=0 \
+  bash "$RUN_RECON" -i "$DOMAINS" -D "$OW/a" -o "$OW/a/r.csv" --no-report > /dev/null 2> "$OW/a.err"
+timeout 25 env PATH="$TESTPATH" HTTPX_BIN=httpx SECLISTS="$SECLISTS_TEST" RECON_CLOUD_CACHE="$OW/c.tsv" TLS_CHAIN_CHECK=0 \
+  bash "$WRAP" -i "$DOMAINS" -D "$OW/b" -o "$OW/b/r.csv" --no-report > /dev/null 2> "$OW/b.err"
+if [ -s "$OW/b/r.csv" ] && cmp -s "$OW/a/r.csv" "$OW/b/r.csv"; then _pass "a run through run-recon.sh writes the same CSV as outcrop.sh"; else _fail "a run through run-recon.sh writes the same CSV as outcrop.sh"; fi
+assert_grep  "$OW/b/r.csv.run.json" '"tool": "run-recon"'                "run.json keeps the frozen tool id, run-recon"
+assert_grep  "$OW/b/r.csv.run.json" "\"version\": \"${OCVER//./\\.}\""     "...and records Outcrop's version"
+mkdir -p "$OW/lonely"; cp "$WRAP" "$OW/lonely/run-recon.sh"
+_rc=0; bash "$OW/lonely/run-recon.sh" --version > /dev/null 2> "$OW/lonely.err" || _rc=$?
+_rc_is "$_rc" 2                                                          "the wrapper without outcrop.sh next to it: exit 2..."
+assert_grep  "$OW/lonely.err" 'outcrop\.sh not found next to it'          "...with a message saying what is missing"
+assert_grep  "$(dirname "$RUN_RECON")/setup-recon-env.sh" 'ln -sf "\$INSTALL_ROOT/bin/outcrop\.sh" /usr/local/bin/outcrop' "setup installs the outcrop command..."
+assert_grep  "$(dirname "$RUN_RECON")/setup-recon-env.sh" 'ln -sf "\$INSTALL_ROOT/bin/run-recon\.sh" /usr/local/bin/run-recon' "...and keeps run-recon, the former name"
 
 # --- 53) service health check: --resolvers catches dead resolvers ----------
 # (placed last: swaps the dig mock for one that reports no reply)

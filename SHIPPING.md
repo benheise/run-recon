@@ -1,6 +1,6 @@
 # Shipping runs to Tideline
 
-Tideline is the recon results platform (project doc `claude/recon-platform-plan-v0.5.md`). run-recon
+Tideline is the recon results platform (project doc `claude/recon-platform-plan-v0.5.md`). Outcrop
 sends it a finished run as a signed manifest plus one gzip part per file, over HTTPS with mutual TLS.
 Shipping is an output stage. It reads the files the run already wrote and changes none of them, and
 it sends nothing to a scan target. `--ship` changes neither the scan nor the CSV.
@@ -8,7 +8,7 @@ it sends nothing to a scan target. `--ship` changes neither the scan nor the CSV
 ## Quick start
 
 ```bash
-run-recon -i seeds.txt --tls --ipv6 --engagement eng-2026-014 \
+outcrop -i seeds.txt --tls --ipv6 --engagement eng-2026-014 \
   --ship https://tideline.internal:8443 \
   --ship-cert ~/.tideline/rr-kali01.crt --ship-key ~/.tideline/rr-kali01.key \
   --ship-ca ~/.tideline/root_ca.crt
@@ -42,7 +42,7 @@ parts Tideline does not have yet.
 
 `--engagement` and `--job-id` take 1–128 characters of `A-Z a-z 0-9 . _ : -`.
 
-**Checked before the scan.** With `--ship`, run-recon checks the settings before anything is sent to
+**Checked before the scan.** With `--ship`, Outcrop checks the settings before anything is sent to
 a target. A missing file, a certificate with no sensor URI, an expired certificate, a key that is not
 ECDSA P-256 or does not belong to the certificate, or a URL that is not https stops the run with
 exit 2. Nothing has been scanned at that point. No connection is made for this check.
@@ -94,6 +94,7 @@ sensor.
 
 | Identifier | Value |
 |---|---|
+| Tool id | `run-recon`: the manifest's `tool`, run.json's `tool` and the record schemas' prefix. Outcrop was named run-recon until 1.21 and keeps this id, the way WebInventory keeps `webinventory` |
 | Manifest schema | `tideline-envelope/1` (the `schema` field) |
 | Signature header | `Tideline-Signature: alg=ES256; enc=der; sig=<base64>` (`enc=p1363` from Windows PowerShell) |
 | Sensor identity | the certificate's URI SAN `urn:tideline:sensor:<id>`, with `<id>` 1–64 of `A-Z a-z 0-9 . _ -` |
@@ -114,7 +115,7 @@ sensor.
     `urn:tideline:sensor:<tenant>:<id>` is refused.
 
 **Source of truth.** The `tideline-schemas` repository (project doc `claude/tideline-schemas-v1.md`) holds
-these schemas unchanged. Once it has a tagged release, run-recon vendors its `schemas/` and `SHA256SUMS` from
+these schemas unchanged. Once it has a tagged release, Outcrop vendors its `schemas/` and `SHA256SUMS` from
 that release.
 
 ## Transport
@@ -136,7 +137,7 @@ that release.
 
 ## Exit status
 
-| Code | run-recon | ship-recon.sh |
+| Code | Outcrop | ship-recon.sh |
 |---|---|---|
 | 0 | finished with results (and delivered, with `--ship`) | delivered, or Tideline already had the run |
 | 1 | — | local problem: a missing or changed file, an unusable certificate or key, a missing tool, or a run without `--json` |
@@ -210,7 +211,7 @@ only when their stage ran.
 - **Versions.** A field added in a later release is a minor version: the schema id stays `/1`, and
   consumers accept unknown string fields. A renamed or removed field is a new major version.
 
-The suite checks that each schema lists exactly the fields run-recon writes. It reads `CSV_HEADER` and
+The suite checks that each schema lists exactly the fields Outcrop writes. It reads `CSV_HEADER` and
 each TSV header from the source, so a new column fails the suite until its schema is updated.
 
 ## Enrolling a sensor with step-ca
@@ -223,7 +224,7 @@ certificate's URI SAN. In outline (plan section 9):
    step-ca requires the request to carry exactly the token's SANs.
 2. **Get the certificate.** On the sensor, use the token with `step ca certificate` (EC P-256 is
    step's default key type). Fetch the root once (`step ca root`) and keep it as the `--ship-ca` file.
-3. **Protect the key.** Keep the key readable only by the run-recon user (`chmod 600`).
+3. **Protect the key.** Keep the key readable only by the user Outcrop runs as (`chmod 600`).
 4. **Renew.** Keep the certificate current with `step ca renew --daemon` under systemd; the plan
    suggests 7-day certificates. ship-recon refuses an expired certificate and warns 24 hours ahead.
 
@@ -255,7 +256,7 @@ another CA, one without a sensor URI, an RSA sensor, and a server from another C
 - delivery, a second delivery, resume after a 503 and after a dropped connection;
 - a changed file, a conflicting manifest, another sensor, a rogue client CA, a server from another
   CA, the pinning check, export;
-- `run-recon --ship`'s preflight, delivery and exit 4.
+- `outcrop --ship`'s preflight, delivery and exit 4.
 
 **Lab** (`bench-run-recon.sh ship`): a real lab run with screenshots is shipped to the mock. Tideline
 must store every part byte for byte, and the shipped URL records must equal the CSV row for row. A

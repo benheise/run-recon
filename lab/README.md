@@ -1,10 +1,10 @@
-# run-recon benchmark lab
+# Outcrop benchmark lab
 
 A self-contained web range you run **on a host you own** (your Kali VM or any
-Docker host) to benchmark and regression-test `run-recon.sh`. It reuses
+Docker host) to benchmark and regression-test `outcrop.sh`. It reuses
 WebInventory's regression-farm composition — nginx, WordPress, a 120 KB
 single-page app and a TLS CI service — at **pinned versions**, so the products,
-versions and CPEs run-recon should report are fixed and line up with what
+versions and CPEs Outcrop should report are fixed and line up with what
 WebInventory's rules expect for the same service types.
 
 Everything binds to loopback and every name is under `.test`, which RFC 6761
@@ -23,7 +23,7 @@ control; never point the scanner anywhere else.
 | `Caddyfile` | vhost routing; serves every name on both `http://` and `https://` with certificates from Caddy's local CA, plus the HTTP-detail fixtures below |
 | `Corefile` | CoreDNS: authoritative for `test.`, `walk.test.` and `xfr.test.` from the generated zone files; forwards `nsec3.test.` to BIND |
 | `named.conf` | BIND: authoritative only, for `nsec3.test.`, transfers refused; shares the `dns` container's network and listens on `:5353` |
-| `resolvers.txt` | the lab DNS server, passed to run-recon as `--resolvers` (dnsx/tlsx/httpx use it) |
+| `resolvers.txt` | the lab DNS server, passed to Outcrop as `--resolvers` (dnsx/tlsx/httpx use it) |
 | `targets.txt` | lab seeds: `nginx.test wp.test spa.test ci.test` |
 | `targets-http.txt`, `targets-tls.txt` | *generated*: the seeds of the `http` and `tls` checks |
 | `tls/` | *generated*: the TLS fixtures' certificates and throwaway keys (gitignored) |
@@ -47,7 +47,7 @@ control; never point the scanner anywhere else.
 | `targets-http.txt` | seeds for the HTTP-detail check: the four sites, `vpn-legacy.walk.test`, `www.walk.test` |
 | `targets-farm.txt`, `expected-farm.csv` | farm seeds and their ground truth |
 
-## Pinned services and what run-recon must report
+## Pinned services and what Outcrop must report
 
 | name | backend | status | technologies | CPEs | IPv6 (`--ipv6`) |
 |---|---|---|---|---|---|
@@ -113,7 +113,7 @@ rule ("faster **and** identical").
 - **HTTP(S) proxy.** If your shell exports `HTTPS_PROXY`, the harness adds
   `.test` to `NO_PROXY` for its own commands so lab traffic stays on loopback. The
   proxy still applies to everything else.
-- **Passive sources.** run-recon skips internet archives and subdomain APIs for
+- **Passive sources.** Outcrop skips internet archives and subdomain APIs for
   special-use names such as `.test` (`SKIP_SPECIAL_USE=1`, the default): they can
   hold nothing for a name that can never exist. `SKIP_SPECIAL_USE=0` sends those
   queries anyway; use it only to measure the passive collectors' latency.
@@ -127,7 +127,7 @@ The zone carries two CNAMEs so `--takeover` can be checked with the real tools:
 | `alias.test` | `nginx.test` (exists) | listed in `<out>.cname.tsv`, **not** flagged |
 | `orphan.test` | `gone.cloud.test` (does not exist: NXDOMAIN) | `dangling-cname [medium]` in `<out>.takeover.txt` |
 
-`./bench-run-recon.sh takeover` runs run-recon with `--takeover --resolve` on
+`./bench-run-recon.sh takeover` runs Outcrop with `--takeover --resolve` on
 `targets-takeover.txt` and checks exactly that, plus that subzy's settings banner is not
 recorded as a finding. The `[high]` grade (a dangling CNAME into a takeover-prone service
 such as `*.azurewebsites.net`) needs real provider domains, so it is covered by the test
@@ -147,7 +147,7 @@ appears in the CSV. CoreDNS's file plugin cannot serve an NSEC3-signed zone (a f
 also keeps the previous configuration live), so `nsec3.test` is served by BIND, which runs in
 the `dns` container's network: CoreDNS forwards the zone to it, and the zone check reaches it
 directly as the zone's name server. CoreDNS answers denials so that `ldns-walk` stops at the
-apex; run-recon walks by asking for each owner name's NSEC record
+apex; Outcrop walks by asking for each owner name's NSEC record
 (`dig +dnssec +norec NSEC <name>`), which works against CoreDNS, BIND and Knot alike. Neither
 signed zone has a DS in its parent (CoreDNS answers a zone's DS query from the zone itself), so
 the `ds=yes` case is covered by the suite's mocks.
@@ -167,7 +167,7 @@ that `<out>.edge.tsv` names the edge and the origin software.
 expects `origin-protected [info] host=spa.test origin=127.0.0.6 via=origin.spa.test
 reason=443:refused,80:status-403-other-content`, and nothing at all for `wp.test`.
 
-## Email/DNS posture fixtures (run-recon 1.20)
+## Email/DNS posture fixtures (Outcrop 1.20)
 
 `posture.test` gets everything wrong and its subdomain `good.posture.test` everything right. Both are
 served by CoreDNS from `db.posture.test`; the MTA-STS policies come from the Caddy ingress, whose
@@ -188,7 +188,7 @@ ingress container and passes it with `--mta-sts-ca` (certificate verification st
 (cloudlist's Terraform provider reads it offline): `127.0.0.1` is matched to the scan's inventory, and
 `127.0.0.8`, which nothing in the lab serves, is `cloud-asset-unseen [info]`.
 
-## Discovery fixtures (run-recon 1.20)
+## Discovery fixtures (Outcrop 1.20)
 
 `bench-run-recon.sh discovery` runs the discovery tools for real: a baseline run on `nginx.test`, then a
 second with `--ports --port-spec 80,443,8443 --permute --brute --origin --monitor --notify` against it.
@@ -200,12 +200,12 @@ second with `--ports --port-spec 80,443,8443 --permute --brute --origin --monito
 | shuffledns + massdns | `backup-db.nginx.test` exists; `brute-wordlist.txt` holds `backup-db` | a row with source `bruteforce` |
 | cdncheck | the loopback edge; and `104.16.0.1` checked directly | no CDN tag; `104.16.0.1 [waf] [cloudflare]` in the format `--origin` parses |
 | notify | a webhook on a random loopback port, `NOTIFY_CONFIG` pointing at it | one message (`-bulk`) naming the new `:8443` asset |
-| uncover | run with an empty `HOME` (no keys) | the "requires keys" message that run-recon turns into a warning |
+| uncover | run with an empty `HOME` (no keys) | the "requires keys" message that Outcrop turns into a warning |
 
 The baseline run must not have the alterx or wordlist names. massdns has no package on most systems; the
 setup scripts build it from source (`github.com/blechschmidt/massdns`).
 
-## Scope, resume and history checks (run-recon 1.20)
+## Scope, resume and history checks (Outcrop 1.20)
 
 These need no new fixtures; they use the lab's names and the origin fixture.
 
@@ -234,9 +234,9 @@ the first run's under `compare --exact`, with the second run as the noise floor.
 3. With `RECON_DB_DSN` set (a PostgreSQL database), both runs also go to the store (`--db`), and
    `recon-db.sh changes` / `history` must find the event and nginx.test's first/last seen there.
 
-## HTTP-detail fixtures (run-recon 1.19)
+## HTTP-detail fixtures (Outcrop 1.19)
 
-| name | what the lab serves | run-recon must report |
+| name | what the lab serves | Outcrop must report |
 |---|---|---|
 | `nginx.test` | nginx defaults: no security headers. Caddy adds a robots.txt (`Disallow: /private/`, a wildcard rule, a sitemap) and an **expired** security.txt; `/private/` asks for basic auth | `missing_sec_headers` = all four; robots `200 disallow=2 allow=0 sitemap=1`; `security-txt-expired [low]`; a `https://nginx.test/private/` row from robots.txt with status 401 and `auth=Basic realm="Lab Private"`, not `CleartextAuth` (it is HTTPS) |
 | `spa.test` | CSP with `frame-ancestors`, HSTS one year, nosniff; a valid security.txt | nothing missing (CSP covers X-Frame-Options); `hsts_max_age=31536000`; security.txt present |
@@ -249,25 +249,25 @@ the first run's under `compare --exact`, with the second run as the noise floor.
 The basic-auth password in the Caddyfile is a throwaway lab value. katana reads robots.txt too, so
 `/private/` and the sitemap URL also appear in default runs of the lab, for every version alike.
 
-## Redirect and login-form fixtures (run-recon 1.20)
+## Redirect and login-form fixtures (Outcrop 1.20)
 
 Part of `bench-run-recon.sh http` (`--extras`), from the Caddyfile:
 
-| URL | what the lab serves | run-recon must report |
+| URL | what the lab serves | Outcrop must report |
 |---|---|---|
 | `https://redir.test/` | `302` → `/login`, a page with a password form whose `action` is `http://redir.test/session` | `final_url=https://redir.test/login`, `redirect_chain=302->https://redir.test/login` (`/login` is a hop `--extras` fetched, not a URL row), `login_form=http://redir.test/session`, `auth=Form`, `CleartextAuth` on the HTTPS row |
 | `http://redir.test/session` | found by the crawl in that form; `301` → `https://redir.test/session` (`200`) | the http:// → https:// hop followed |
 | `https://redir.test/old` | `301` → `https://elsewhere.test/` (no such site) | the hop listed in `redirect_chain`, not followed; `final_url` stays `https://redir.test/old` |
 | `http://plainlogin.redir.test/` | a password form on a plain-HTTP page | `login_form=http://plainlogin.redir.test/login`, `http_flags=PlainHttp;CleartextAuth` |
 
-## TLS fixtures (run-recon 1.20)
+## TLS fixtures (Outcrop 1.20)
 
 `bench-run-recon.sh tls` runs `--tls-enum` against `targets-tls.txt`. One nginx 1.21.6 (OpenSSL 1.1.1n)
 serves four names, each on its own loopback address so each has its own protocol and cipher policy
 (`tls-nginx.conf`). The certificates are made at `up` by `gen-tls-certs.py`; the legacy one with the
 `openssl` command, since python3-cryptography refuses to sign with SHA-1.
 
-| name | what it serves | run-recon must report |
+| name | what it serves | Outcrop must report |
 |---|---|---|
 | `legacy.tls.test` | TLS 1.0–1.2; CBC-SHA suites, and `NULL-SHA` when a client offers only weak suites; RSA 1024 / SHA-1, self-signed | `tls_supported=TLS 1.2;TLS 1.1;TLS 1.0`, `tls_weak_cipher=TLS 1.2:TLS_RSA_WITH_NULL_SHA`, `cert_key=RSA 1024`; `WeakTLS`, `WeakCipher`, `WeakKey`, `WeakSig`, `SelfSigned`, `CertUntrusted` |
 | `future.tls.test` | a certificate valid from 30 days after `up` | `CertNotYetValid` (tlsx sets no `expired` for it) |
@@ -284,7 +284,7 @@ local TLS speaker instead.
 and protocol before it gets to the chain, so the first handshake fails without a verdict. The
 second try, at security level 0, reaches one (`self-signed certificate` → `CertUntrusted`).
 
-## Tideline shipping check (run-recon 1.20)
+## Tideline shipping check (Outcrop 1.20)
 
 `bench-run-recon.sh ship` sends a lab run to `mock-tideline.py`, a stand-in for Tideline's ingest
 service, over mutual TLS on loopback. The run is `--tls --ipv6 --takeover --dns-posture --screenshots

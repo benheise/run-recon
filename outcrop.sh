@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 #
-# run-recon.sh  --  URL enumeration for External Attack Surface Management (EASM)
+# outcrop.sh  --  URL enumeration for External Attack Surface Management (EASM)
+#
+# Outcrop was named run-recon until 1.21. run-recon.sh still works: it is a wrapper that runs this
+# script. Machine-readable ids keep the old name (run.json's "tool", the Tideline envelope's "tool",
+# the run-recon.*/1 record schemas): they are frozen (SHIPPING.md).
 #
 # Reads a list of domains from a text file and produces a CSV that maps each
 # input (seed) domain to the URLs discovered on it. Built to run inside the
@@ -23,7 +27,7 @@
 #
 set -euo pipefail
 
-VERSION="1.20.0"
+VERSION="1.21.0-dev"
 
 # Resolve our own directory early (BEFORE the worker-dispatch block below) so we
 # can locate sibling helper scripts (recon-db.sh, generate-report.sh) in both the
@@ -1029,7 +1033,7 @@ scope_filter() {
 #   scope_addr_filter IN OUT SEED  names that resolve into an excluded range are dropped
 #                                  before anything connects to them (non-resolving names
 #                                  stay: the takeover check needs them)
-#   scope_ip_filter SEED KIND      addresses run-recon picks itself (internet-scan hits,
+#   scope_ip_filter SEED KIND      addresses Outcrop picks itself (internet-scan hits,
 #                                  origin candidates) must be inside an allowed range
 # Everything held back is recorded in parts/scopeskip.<seed>.tsv (-> <out>.scope.txt).
 # ---------------------------------------------------------------------------
@@ -3383,10 +3387,10 @@ fi
 # ===========================================================================
 usage() {
   cat >&2 <<EOF
-run-recon.sh v$VERSION  --  map seed domains to discovered URLs (CSV)
+outcrop v$VERSION  --  map seed domains to discovered URLs (CSV)
 
 USAGE:
-  ./run-recon.sh -i domains.txt [-o results.csv] [options]
+  outcrop -i domains.txt [-o results.csv] [options]     (./outcrop.sh; run-recon.sh, the old name, still works)
 
 REQUIRED:
   -i, --input FILE        Text file with one domain per line (# comments ok)
@@ -3399,7 +3403,7 @@ SCOPE (checked before anything is sent):
                             !dev.example.com an exclusion (any form above, ! or -); exclusions win
                           A seed outside the scope, an invalid input line or a malformed entry stops the
                           run (exit 2). Discovered names outside it are dropped; names resolving into an
-                          excluded range are not contacted; addresses run-recon picks itself (--origin
+                          excluded range are not contacted; addresses Outcrop picks itself (--origin
                           candidates, --favicon hits, range sweeps) are contacted only inside the allowed
                           ranges; the crawl, nuclei (no redirects) and the screenshot browser stay inside
                           it. What was held back -> <out>.scope.txt
@@ -3767,7 +3771,7 @@ while [ $# -gt 0 ]; do
     --job-id)          JOB_ID="${2:?}"; shift 2;;
     --limits)          LIMITS_FILE="${2:?}"; shift 2;;
     -h|--help)         usage; exit 0;;
-    --version)         echo "run-recon.sh v$VERSION"; exit 0;;
+    --version)         echo "outcrop v$VERSION"; exit 0;;
     *) err "Unknown argument: $1"; usage; exit 2;;
   esac
 done
@@ -3804,7 +3808,7 @@ SCOPE_ON=0; SCOPE_DIR=""; SCOPE_TMP=""; SCOPE_DENY=""; SCOPE_DENY_NETS=0; INPUT_
 if [ -n "$SCOPE_FILE" ] || [ "$LIST_TARGETS" = "1" ]; then
   if ! have python3; then err "python3 is required"; exit 1; fi
   if [ -n "$SCOPE_FILE" ] && [ ! -f "$SCOPE_FILE" ]; then err "Scope file not found: $SCOPE_FILE"; exit 2; fi
-  SCOPE_TMP="$(mktemp -d "${TMPDIR:-/tmp}/run-recon-scope.XXXXXX")" || { err "cannot create a temporary directory"; exit 1; }
+  SCOPE_TMP="$(mktemp -d "${TMPDIR:-/tmp}/outcrop-scope.XXXXXX")" || { err "cannot create a temporary directory"; exit 1; }
   trap '[ -n "${HEARTBEAT_PID:-}" ] && kill "$HEARTBEAT_PID" 2>/dev/null; [ -n "${SCOPE_TMP:-}" ] && rm -rf "$SCOPE_TMP"; true' EXIT
   _scrc=0
   python3 - "$INPUT" "${SCOPE_FILE:-}" "$SCOPE_TMP" "$DROP_OUT_OF_SCOPE" <<'PYSCOPE' || _scrc=$?
@@ -3994,7 +3998,7 @@ PYSCOPE
   _scsum="$(python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); print("%d entr%s (%d name(s), %d range(s), %d ASN(s); %d exclusion(s))" % (s["entries"], "y" if s["entries"]==1 else "ies", s["allow_names"], s["allow_ranges"], s["asns"], s["deny_names"]+s["deny_ranges"]+s["deny_asns"]))' "$SCOPE_TMP/summary.json" 2>/dev/null || echo '?')"
   if [ "$LIST_TARGETS" = "1" ]; then
     {
-      printf 'run-recon %s --list-targets: the plan; nothing is sent\n' "$VERSION"
+      printf 'outcrop %s --list-targets: the plan; nothing is sent\n' "$VERSION"
       printf 'input  : %s\n' "$INPUT"
       if [ -n "$SCOPE_FILE" ]; then printf 'scope  : %s (sha256 %s): %s\n' "$SCOPE_FILE" "$(sha256sum "$SCOPE_FILE" | cut -c1-16)" "$_scsum"
       else printf 'scope  : none (no --scope: every seed runs)\n'; fi
@@ -4010,7 +4014,7 @@ PYSCOPE
       else printf '\n'; fi
       printf 'traffic: %s\n' "$([ "$PASSIVE_ONLY" = 1 ] && echo 'passive sources only (--passive-only): nothing is sent to the targets' || echo 'live probes and crawling of the names found under these seeds')"
       if [ -n "$SCOPE_FILE" ]; then
-        printf 'scope  : names are kept to the allowed names minus the exclusions; addresses run-recon picks itself\n'
+        printf 'scope  : names are kept to the allowed names minus the exclusions; addresses Outcrop picks itself\n'
         printf '         (origin candidates, internet-scan hits, range scans) only inside the allowed ranges\n'
       fi
       [ "${#RUN_ARGS[@]}" -gt 0 ] && printf 'options: %s\n' "$(printf '%s ' "${RUN_ARGS[@]}" | sed -E 's#(://)[^/@ ]*@#\1***@#g; s/ $//')"
@@ -4249,7 +4253,7 @@ if [ -n "$SHIP_URL" ]; then
   SHIP_SH="$RECON_DIR/ship-recon.sh"
   [ -f "$SHIP_SH" ] || SHIP_SH="$(command -v ship-recon.sh 2>/dev/null || true)"
   if [ -z "$SHIP_SH" ] || [ ! -f "$SHIP_SH" ]; then
-    err "--ship needs ship-recon.sh next to run-recon (not found). Nothing was sent."; exit 2
+    err "--ship needs ship-recon.sh next to outcrop.sh (not found). Nothing was sent."; exit 2
   fi
   _shargs=(--url "$SHIP_URL" --cert "$SHIP_CERT" --key "$SHIP_KEY" --ca "$SHIP_CA")
   [ -n "$SHIP_PROXY" ] && _shargs+=(--proxy "$SHIP_PROXY")
@@ -4798,7 +4802,7 @@ fi
 # call the fail-soft cache functions; any problem here downgrades to an uncached run.
 if [ "$USE_DB" = "1" ]; then
   if [ "$RECON_DB_LIB_LOADED" != "1" ]; then
-    warn "  DB: recon-db.sh not found next to run-recon; running without the DB cache."
+    warn "  DB: recon-db.sh not found next to outcrop.sh; running without the DB cache."
     USE_DB=0
   elif db_available && db_schema; then
     ok "  DB: PostgreSQL reachable; database '$RECON_DB_NAME' ready - caching on (TTL ${CACHE_TTL}s)."
@@ -7103,14 +7107,14 @@ if [ "$MONITOR" = "1" ]; then
         warn " --monitor: the field-by-field comparison failed (see $WORKDIR/delta.err)"
       fi
     else
-      warn " --monitor: recon-db.sh not found next to run-recon; no field-by-field comparison (<out>.delta.tsv)"
+      warn " --monitor: recon-db.sh not found next to outcrop.sh; no field-by-field comparison (<out>.delta.tsv)"
     fi
     if [ "$NN" -gt 0 ]; then
       ok " Monitoring      : $NN new asset(s) vs $(basename "$PREV") -> $NEWASSETS"
       if [ "$NOTIFY" = "1" ] && have notify; then
         # one message per run (-bulk), to the providers in NOTIFY_CONFIG when set
         _nf=(-silent -bulk); [ -n "$NOTIFY_CONFIG" ] && _nf+=(-pc "$NOTIFY_CONFIG"); [ -n "$PROXY" ] && _nf+=(-proxy "$PROXY")
-        { printf 'run-recon: %s new asset(s) vs %s\n' "$NN" "$(basename "$PREV")"
+        { printf 'outcrop: %s new asset(s) vs %s\n' "$NN" "$(basename "$PREV")"
           [ -n "$_dline" ] && printf 'services: %s (see %s)\n' "$_dline" "$(basename "$OUTPUT").delta.tsv"
           cat "$NEWASSETS"; } \
           | _to 60 notify "${_nf[@]}" >/dev/null 2>>"$WORKDIR/notify.err" || warn " --notify: notify failed (see $WORKDIR/notify.err)"
@@ -7185,6 +7189,7 @@ for part in (E("RR_TOOLVERS") or "").split(","):
     f = part.split()
     if len(f) == 2:
         tv[f[0]] = f[1]
+# "tool" stays "run-recon": the frozen machine id (the Tideline envelope and schemas use it too)
 rec = {
     "tool": "run-recon", "version": E("RR_VERSION", ""),
     "run_id": E("RR_RUN_ID", ""), "engagement": E("RR_ENGAGEMENT") or None, "job_id": E("RR_JOB_ID") or None,
@@ -7231,7 +7236,7 @@ if [ "$REPORT" = "1" ]; then
       warn " HTML report generation failed (run '$RPT $OUTPUT' manually to see why)."
     fi
   else
-    warn " generate-report.sh not found next to run-recon; skipping the HTML report (--no-report to silence)."
+    warn " generate-report.sh not found next to outcrop.sh; skipping the HTML report (--no-report to silence)."
   fi
 fi
 

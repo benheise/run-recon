@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# recon-db.sh  --  optional PostgreSQL cache + storage layer for run-recon.
+# recon-db.sh  --  optional PostgreSQL cache + storage layer for Outcrop (run-recon).
 #
 # Reuses the local PostgreSQL service that Kali already runs for Metasploit
 # (msfdb). Stores expensive lookups (passive-crawl URL sets, OSINT API
