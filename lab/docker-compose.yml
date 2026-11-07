@@ -45,6 +45,10 @@ services:
     image: caddy:2.7.6
     restart: unless-stopped
     command: ["caddy", "run", "--config", "/lab/Caddyfile", "--adapter", "caddyfile"]
+    # on: every request is logged as JSON with its headers (bench-run-recon.sh policy); the
+    # benchmark runs with it off
+    environment:
+      - LAB_ACCESS_LOG=${LAB_ACCESS_LOG:-off}
     ports:
       - "127.0.0.1:80:80"
       - "127.0.0.1:443:443"
@@ -111,6 +115,39 @@ services:
   jenkins:
     image: jenkins/jenkins:2.426.1-lts-jdk17
     restart: unless-stopped
+
+  # ModSecurity v3 + the OWASP Core Rule Set 4.30 at its defaults (paranoia 1, inbound anomaly
+  # threshold 5) in front of the ingress: *.crs.test -> LAB_WAF_IP -> CRS -> Caddy (plain HTTP)
+  # -> the lab backends. The User-Agent A/B (bench-run-recon.sh ua): CRS rule 913100 blocks
+  # scanner User-Agents (nuclei, ffuf's "Fuzz Faster U Fool", feroxbuster, wpscan, whatweb, ...)
+  crs:
+    image: owasp/modsecurity-crs:4.30.0-nginx-202610180210
+    restart: unless-stopped
+    environment:
+      - BACKEND=http://ingress:80
+      - PORT=8080
+      - SSL_PORT=8443
+      - BLOCKING_PARANOIA=1
+      - ANOMALY_INBOUND=5
+      - MODSEC_AUDIT_ENGINE=Off
+    ports:
+      - "${LAB_WAF_IP:-127.0.0.13}:80:8080"
+      - "${LAB_WAF_IP:-127.0.0.13}:443:8443"
+    depends_on: [ingress]
+
+  # the rate-limiting fixture (lab/throttle-nginx.conf): throttle.test answers 2 requests a
+  # second (a burst of 5), then 429; /closed drops the connection without an answer; HTTPS
+  # refuses any other server name (unrecognized_name). The run-health check (bench-run-recon.sh
+  # throttle) must mark the host throttled.
+  throttle:
+    image: nginx:1.21.6
+    restart: unless-stopped
+    ports:
+      - "${LAB_THROTTLE_IP:-127.0.0.14}:80:8080"
+      - "${LAB_THROTTLE_IP:-127.0.0.14}:443:8443"
+    volumes:
+      - ./throttle-nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./:/lab:ro
 
 volumes:
   caddy_data:

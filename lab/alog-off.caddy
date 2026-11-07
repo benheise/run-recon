@@ -1,0 +1,1 @@
+# included by lab/Caddyfile when LAB_ACCESS_LOG is off (the default): no access log

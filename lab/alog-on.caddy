@@ -1,0 +1,6 @@
+# included by lab/Caddyfile when LAB_ACCESS_LOG=on: every request, as JSON with its headers, on the
+# ingress container's stderr (docker logs), for bench-run-recon.sh policy
+log {
+	output stderr
+	format json
+}
