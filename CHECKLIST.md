@@ -1559,4 +1559,54 @@ Tracked in `PLAN.md` section 9 (O1, O2), on `outcrop-v1.21`. The repository was 
       - the companion and dev script names;
       - `~/.cache/run-recon/` for the cloud feeds.
 
-      run-recon sends no custom User-Agent to targets, so a SOC rule keyed on it cannot break.
+      run-recon sent no custom User-Agent to targets, so no SOC rule could key on the old name. (From Batch 7
+      below, every tool sends one User-Agent: a current Chrome's by default, Outcrop's own with
+      `--user-agent outcrop`.)
+
+### Batch 7: the request policy and run health (PLAN.md section 10, OA1–OA6)
+
+On `batch-7-request-policy`, from the AutoAR review's "blind spots".
+
+- [x] **OA5, one request policy.** `--user-agent` (`browser`, the default: Chrome 157, Ben's choice after the
+      A/B; `outcrop`; `tool`; or a string),
+      `--header` (repeatable) and `--req-timeout`, with `--rate`, are turned into each tool's own flags in one
+      function (`_policy_init`): httpx (all its calls), katana, nuclei, ffuf, feroxbuster, gospider, hakrawler,
+      xnLinkFinder, getJS, subjs, arjun, secretfinder, whatweb, wpscan, droopescan, joomscan, cmseek, gowitness,
+      every curl request to a target and the MTA-STS fetch. The hard-coded 10 s timeouts became `REQ_TIMEOUT`,
+      and nuclei now gets `-rl` and `-timeout` (the same values as its defaults). Headers are checked before
+      anything is sent (exit 2). run.json records the policy with header names only; the command line there
+      shows `--header 'Name: ***'`. HTTP results in the `--db` cache are kept per policy (`httpx_json_v4@ua…`).
+      Suite: every HTTP tool's logged argv carries the policy, and a static check of outcrop.sh finds every
+      HTTP tool invocation (36) takes a policy array. Lab: `bench-run-recon.sh policy`.
+- [x] **OA3, ffuf calibration.** The ffuf fallbacks of `--fuzz` and `--activescan`, and the `--active`
+      WordPress slug brute, pass `-ac`.
+- [x] **OA6, a stopped run stops the traffic.** SIGTERM, Ctrl-C and the new `--max-runtime` (exit 124, state
+      `timed-out`) freeze the run's processes, send SIGTERM, and Outcrop exits only when they are gone: SIGKILL
+      after `STOP_GRACE` (10 s). The processes are the tree below Outcrop plus any carrying the run's
+      `OUTCROP_RUN` tag (a daemonized child). Long stages of the main process run through `_fg`, so a signal
+      stops them at once. Suite: a crawler that ignores SIGTERM and its daemonized child stop; the deadline;
+      a hanging dig in the zone check. Lab: `bench-run-recon.sh stop`, a packet capture after the exit.
+- [x] **OA2, `waf_blocked`.** Block pages of 12 WAF vendors are recognized in the enrichment response (status,
+      headers, title, and body markers matched by a second httpx `-er`): a warning names the host and the vendor.
+- [x] **OA4, `throttled`.** 429s, resets, timeouts and TLS name errors per host, from the enrichment pass
+      (httpx `-probe`: failed requests go to `hx_failed.jsonl`, never to rows) and the crawl's and nuclei's
+      `-elog`; over `THROTTLE_MIN` (5) and `THROTTLE_PCT` (10 %) a warning. Both kinds go to
+      `<out>.health.tsv`, the report's Run health table and `warnings.jsonl` (`run-recon.warning/1` x-minor 1:
+      `kind`, `seed`, `host`, `fields`, `counts`; Tideline TA9).
+- [x] **OA1, the User-Agent A/B.** `bench-run-recon.sh ua`, behind ModSecurity + OWASP CRS 4.30 at its defaults,
+      on `wp.crs.test`, `ci.crs.test` and `nginx.crs.test`, with `--nuclei --fuzz`, 3 runs per mode (medians):
+
+      | mode | URL rows | `--fuzz` hits | nuclei findings | fuzz requests CRS blocked |
+      |---|---:|---:|---:|---:|
+      | `tool` (1.20's behavior) | 3 | 0 | 7 | 336 (all of them) |
+      | `outcrop` | 180 | 177 | 7 | 0 |
+      | `browser` | 180 | 177 | 7 | 0 |
+
+      CRS blocks feroxbuster's and ffuf's own User-Agents, so with them `--fuzz` silently found nothing behind
+      the WAF. nuclei 3.11 already sends random browser User-Agents, so its findings did not change; CRS blocked
+      the same ~20,500 of its ~36,700 requests in every mode, on their payloads. Wall time was equal (160–161 s).
+      Ben chose `browser` as the default.
+- [x] **Checks.** Suite 1071/1071 (from 971); shellcheck clean on every script. Lab: `waf`, `throttle` and `stop`
+      PASS; `policy` found the exceptions now documented (and a bench probe inside its log window, fixed).
+- [ ] **Still to run in the lab:** the release A/B against `main` on the default path, and a clean `policy` pass
+      (the Docker daemon reached the session's two-hour limit first).

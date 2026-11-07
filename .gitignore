@@ -29,3 +29,7 @@ lab/targets-tls.txt
 *.tideline.tar
 *.ship-state.json
 __pycache__/
+lab/targets-waf.txt
+lab/targets-crs.txt
+lab/targets-throttle.txt
+lab/throttle-www/

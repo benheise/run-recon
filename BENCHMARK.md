@@ -755,3 +755,73 @@ default path (`--tls --ipv6`), interleaved run by run with the order switched ea
   the leaf-certificate parsing and the password-form regex that Batch 5 added to requests the run
   already makes. On the farm, the CPU is the same.
 - **Lab checks.** All eleven pass on the release code (Batch 6's lab checks above).
+
+## v1.21.0: Batch 7, the request policy and run health
+
+Measured in the lab with the real toolchain:
+- httpx 1.12.0, katana 1.8.0, nuclei 3.11.1 with nuclei-templates v10.5.1;
+- ffuf 2.1.0, feroxbuster 2.11.0, gospider 1.1.6, hakrawler (master, Aug 2026), subjs, getJS 2;
+- xnLinkFinder 8.2 and arjun.
+
+The WAF front is ModSecurity v3 with the OWASP Core Rule Set 4.30 (image
+`owasp/modsecurity-crs:4.30.0-nginx-202610180210`) at its defaults: paranoia 1, inbound anomaly threshold 5.
+
+**What each tool sends by default** (a logging server; `--user-agent tool` keeps these):
+
+| Tool | Its own User-Agent | With the policy |
+|---|---|---|
+| httpx | a random browser string per run (e.g. Firefox 108) | the policy's (`-H`) |
+| katana | Chrome 113 on macOS | the policy's (`-H`) |
+| nuclei | a random browser string per request | the policy's (`-H`), except raw templates |
+| ffuf | `Fuzz Faster U Fool v2.1.0-dev` | the policy's (`-H`) |
+| feroxbuster | `feroxbuster/2.11.0` | the policy's (`-a`) |
+| gospider | `Go-http-client/1.1` (robots.txt), a random one (pages), `colly` (JavaScript) | lowercased (`-u`), and no headers on JavaScript |
+| hakrawler | Firefox 78 | the policy's (`-h`) |
+| arjun | Firefox 83 | the policy's (`--headers`) |
+| subzy | `Go-http-client/1.1` | no option |
+| curl | `curl/8.5.0` | the policy's (`-A`) |
+| httpx's screenshot browser | Chrome 114 on macOS | its own (the extra headers do go) |
+
+**OA1, the User-Agent A/B** (`bench-run-recon.sh ua --runs 3`). `wp.crs.test`, `ci.crs.test` and `nginx.crs.test`
+behind the CRS, with `--nuclei --fuzz` (a 14-path WordPress list). Medians of 3 runs per mode:
+
+| `--user-agent` | URL rows | `--fuzz` hits | nuclei findings | CRS: requests / blocked | fuzz requests blocked | wall s |
+|---|---:|---:|---:|---:|---:|---:|
+| `tool` (1.20) | 3 | 0 | 7 | 36,586 / 20,466 | 336 (all) | 160 |
+| `outcrop` | 180 | 177 | 7 | 36,704 / 20,439 | 0 | 161 |
+| `browser` | 180 | 177 | 7 | 36,823 / 20,509 | 0 | 161 |
+
+- **`--fuzz`.** CRS rule 913100 blocks feroxbuster's (and ffuf's) own User-Agent, so in 1.20 the content
+  discovery found nothing behind the WAF, and nothing in the output said so.
+- **nuclei.** 3.11 already sends random browser User-Agents, so its findings did not depend on the mode.
+  CRS blocked about 56% of its requests in every mode, on their payloads.
+- **The default.** Ben chose `browser` (Chrome 157).
+
+**The checks** (`checks` now has fifteen):
+
+| Check | Result |
+|---|---|
+| `waf` | PASS: nine vendor block pages each reported `waf_blocked` with the right vendor, in the log and in `warnings.jsonl`; the plain 403 and the page that names vendors not reported |
+| `throttle` | PASS: `throttle.test` throttled (429: 4, resets: 3, of 13 requests; the crawl ran into the limit first), the dropped `/closed` counted as a reset |
+| `stop` | PASS: SIGTERM during a fuzz pass over the 50-host farm; exit 143 after 200 ms; a 2 s capture during the run saw 178 packets, a 10 s capture after the exit saw 0; no process of the run left |
+| `policy` | see below |
+
+**`policy`.** Two runs over nginx, spa and wp, with the ingress's access log on:
+
+1. **Every stage but nuclei:** `--extras --origin --takeover --tls --crawlers-all --js --screenshots --fuzz --params`,
+   1,149 requests in all. The rest carried the policy's User-Agent and the `--header`, apart from:
+
+   | Requests | From | Why |
+   |---:|---|---|
+   | 22 | httpx's screenshot browser | its own User-Agent |
+   | 25 | gospider | lowercased User-Agent |
+   | 3 | subjs | User-Agent, no header |
+   | 1 | the bench's own readiness probe (curl) | it fell inside the log window; the window now starts after it |
+
+2. **nuclei alone:** 36,236 of 36,272 requests carried the policy. The other 36 came from raw (`unsafe`)
+   templates:
+   - CVE-2024-23897's `/cli` requests (no User-Agent);
+   - a few templates that send no User-Agent or set their own.
+
+The check now accepts those documented exceptions. A clean run of it, and the release A/B against `main` on
+the default path, are still to do: the lab's Docker daemon reached the session's two-hour limit before them.

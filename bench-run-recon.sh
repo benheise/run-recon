@@ -56,8 +56,19 @@
 #   ship                   --ship to lab/mock-tideline.py (mutual TLS on loopback, a throwaway step-ca-shaped
 #                          PKI): the shipped records equal the local CSV row for row, screenshots travel
 #                          as artifacts, a second delivery sends nothing, a 503 then a retry resumes
+#   waf                    the WAF block-page fixtures: each vendor's page is a waf_blocked warning naming it
+#                          (log and warnings.jsonl); a plain 403 and a page that only names a vendor are not
+#   throttle               the rate-limited fixture (429 past 2 requests a second, a dropped connection): the
+#                          host is marked throttled, with the counts
+#   policy                 every request of a run, read at the ingress's access log, carries the policy's
+#                          User-Agent and --header; the only others are the documented exceptions
+#   stop                   SIGTERM during a fuzz pass over the farm: after Outcrop exits, a loopback packet
+#                          capture sees no more traffic to the lab, and no process of the run is left
+#   ua [--runs N] [--modes "tool outcrop browser"]
+#                          the User-Agent A/B against the CRS-fronted names (ModSecurity + OWASP CRS):
+#                          live hosts, rows, fuzz hits, nuclei findings and CRS blocks per mode (medians)
 #   checks                 takeover + zone + origin + http + tls + posture + discovery + scope + resume + history
-#                          + ship; non-zero if any fails
+#                          + ship + waf + throttle + policy + stop; non-zero if any fails
 #   help
 #
 # Needs docker (+compose) and the run-recon toolchain for up/run/bench; compare
@@ -87,7 +98,13 @@ LAB_TLS_LEGACY_IP="${LAB_TLS_LEGACY_IP:-127.0.0.9}"
 LAB_TLS_FUTURE_IP="${LAB_TLS_FUTURE_IP:-127.0.0.10}"
 LAB_TLS_DEFAULT_IP="${LAB_TLS_DEFAULT_IP:-127.0.0.11}"
 LAB_TLS_MODERN_IP="${LAB_TLS_MODERN_IP:-127.0.0.12}"
-LAB_IP_VARS="LAB_DNS_IP LAB_ORIGIN_IP LAB_PROTECTED_IP LAB_NSEC3_IP LAB_TLS_LEGACY_IP LAB_TLS_FUTURE_IP LAB_TLS_DEFAULT_IP LAB_TLS_MODERN_IP"
+# ModSecurity + OWASP CRS in front of the ingress (*.crs.test), and the rate-limiting fixture
+# (throttle.test): Outcrop 1.21's User-Agent A/B and run-health checks
+LAB_WAF_IP="${LAB_WAF_IP:-127.0.0.13}"
+LAB_THROTTLE_IP="${LAB_THROTTLE_IP:-127.0.0.14}"
+LAB_IP_VARS="LAB_DNS_IP LAB_ORIGIN_IP LAB_PROTECTED_IP LAB_NSEC3_IP LAB_TLS_LEGACY_IP LAB_TLS_FUTURE_IP LAB_TLS_DEFAULT_IP LAB_TLS_MODERN_IP LAB_WAF_IP LAB_THROTTLE_IP"
+# the WAF block-page fixtures (lab/Caddyfile): <vendor>.waf.test and the two controls
+WAF_FIXTURES="cloudflare ratelimit akamai imperva cloudfront f5 sucuri modsecurity wordfence plain403 app"
 LAB_HOSTS="nginx.test wp.test spa.test ci.test"
 FARM_N_DEFAULT=50
 FARM_BACKENDS=(nginx wordpress spa jenkins)
@@ -143,13 +160,13 @@ gen_lab(){ # <farm_n>
     case "$b" in
       wordpress)
         # WordPress serves its configured site name; present that Host upstream
-        printf 'http://%s, https://%s {\n\treverse_proxy wordpress:80 {\n\t\theader_up Host wp.test\n\t}\n}\n\n' "$name" "$name" >> "$LAB/farm.caddy"
+        printf 'http://%s, https://%s {\n\timport alog\n\treverse_proxy wordpress:80 {\n\t\theader_up Host wp.test\n\t}\n}\n\n' "$name" "$name" >> "$LAB/farm.caddy"
         printf '%s,200,WordPress;PHP;Apache HTTP Server,cpe:2.3:a:wordpress:wordpress:6.4.3;cpe:2.3:a:apache:http_server:2.4.57;cpe:2.3:a:php:php:8.2.17,CertExpiring;CertUntrusted,-,1\n' "$name" >> "$LAB/expected-farm.csv";;
       jenkins)
-        printf 'http://%s, https://%s {\n\treverse_proxy jenkins:8080\n}\n\n' "$name" "$name" >> "$LAB/farm.caddy"
+        printf 'http://%s, https://%s {\n\timport alog\n\treverse_proxy jenkins:8080\n}\n\n' "$name" "$name" >> "$LAB/farm.caddy"
         printf '%s,403,Jenkins;Jetty,cpe:2.3:a:jenkins:jenkins:2.426.1;cpe:2.3:a:eclipse:jetty:10.0.17,CertExpiring;CertUntrusted,-,1\n' "$name" >> "$LAB/expected-farm.csv";;
       *)
-        printf 'http://%s, https://%s {\n\treverse_proxy %s:80\n}\n\n' "$name" "$name" "$b" >> "$LAB/farm.caddy"
+        printf 'http://%s, https://%s {\n\timport alog\n\treverse_proxy %s:80\n}\n\n' "$name" "$name" "$b" >> "$LAB/farm.caddy"
         printf '%s,200,Nginx,cpe:2.3:a:f5:nginx:1.21.6,CertExpiring;CertUntrusted,-,1\n' "$name" >> "$LAB/expected-farm.csv";;
     esac
     printf '127.0.0.1 %s\n' "$name" >> "$LAB/lab.hosts"
@@ -182,6 +199,10 @@ gen_lab(){ # <farm_n>
     printf 'redir.test. IN A 127.0.0.1\nplainlogin.redir.test. IN A 127.0.0.1\n'
     printf 'legacy.tls.test. IN A %s\nfuture.tls.test. IN A %s\ndefault.tls.test. IN A %s\nmodern.tls.test. IN A %s\n' \
       "$LAB_TLS_LEGACY_IP" "$LAB_TLS_FUTURE_IP" "$LAB_TLS_DEFAULT_IP" "$LAB_TLS_MODERN_IP"
+    # run-health fixtures (1.21): the WAF block pages, the CRS-fronted names, the rate-limited host
+    for f in $WAF_FIXTURES; do printf '%s.waf.test. IN A 127.0.0.1\n' "$f"; done
+    printf 'wp.crs.test. IN A %s\nci.crs.test. IN A %s\nnginx.crs.test. IN A %s\n' "$LAB_WAF_IP" "$LAB_WAF_IP" "$LAB_WAF_IP"
+    printf 'throttle.test. IN A %s\nbadsni.throttle.test. IN A %s\n' "$LAB_THROTTLE_IP" "$LAB_THROTTLE_IP"
   } > "$LAB/db.test"
   printf 'www\nbackup-db\nnot-there-1\nnot-there-2\n' > "$LAB/brute-wordlist.txt"
   printf 'nginx.test\n' > "$LAB/targets-discovery.txt"
@@ -252,6 +273,17 @@ gen_lab(){ # <farm_n>
   # HTTP-detail check (bench-run-recon.sh http): the four sites, the cleartext-auth VPN and a
   # catch-all name from the walk.test zone
   printf 'nginx.test\nspa.test\nwp.test\nci.test\nvpn-legacy.walk.test\nwww.walk.test\nredir.test\nplainlogin.redir.test\n' > "$LAB/targets-http.txt"
+  for f in $WAF_FIXTURES; do printf '%s.waf.test\n' "$f"; done > "$LAB/targets-waf.txt"
+  printf 'wp.crs.test\nci.crs.test\nnginx.crs.test\n' > "$LAB/targets-crs.txt"
+  printf 'throttle.test\nbadsni.throttle.test\n' > "$LAB/targets-throttle.txt"
+  mkdir -p "$LAB/throttle-www"
+  { printf '<!doctype html><html><head><title>Throttled lab page</title></head><body>'
+    i=1; while [ "$i" -le 40 ]; do printf '<a href="/p%02d">%d</a> ' "$i" "$i"; i=$((i+1)); done
+    printf '<a href="/closed">closed</a></body></html>\n'; } > "$LAB/throttle-www/index.html"
+  i=1; while [ "$i" -le 40 ]; do
+    printf '<!doctype html><html><head><title>Lab page %d</title></head><body>page %d of the throttled host</body></html>\n' "$i" "$i" > "$LAB/throttle-www/$(printf 'p%02d' "$i").html"
+    i=$((i+1))
+  done
   log "generated: SPA (120 KB), farm of $n vhosts, zones db.test db.walk.test db.xfr.test db.nsec3.test db.posture.test db.127, targets and ground truth"
 }
 
@@ -336,6 +368,8 @@ cmd_down(){ export $LAB_IP_VARS; compose -f "$COMPOSE_FILE" down -v 2>/dev/null;
 cmd_hosts(){
   printf '127.0.0.1 %s\n' "$LAB_HOSTS"
   printf '127.0.0.1 redir.test plainlogin.redir.test\n'
+  printf '127.0.0.1'; for f in $WAF_FIXTURES; do printf ' %s.waf.test' "$f"; done; printf '\n'
+  printf '%s wp.crs.test ci.crs.test nginx.crs.test\n%s throttle.test badsni.throttle.test\n' "$LAB_WAF_IP" "$LAB_THROTTLE_IP"
   printf '%s legacy.tls.test\n%s future.tls.test\n%s default.tls.test\n%s modern.tls.test\n' \
     "$LAB_TLS_LEGACY_IP" "$LAB_TLS_FUTURE_IP" "$LAB_TLS_DEFAULT_IP" "$LAB_TLS_MODERN_IP"
   [ -f "$LAB/targets-farm.txt" ] && while IFS= read -r h; do [ -n "$h" ] && printf '127.0.0.1 %s\n' "$h"; done < "$LAB/targets-farm.txt"
@@ -1131,6 +1165,244 @@ PYSHIP
   return "$fail"
 }
 
+# ---- Outcrop 1.21 (Batch 7): the request policy and run health ----------------------------------
+# PATH extras for the checks below: the fuzzers, extra crawlers and JS miners when installed in the
+# lab's tool dirs (PDTOOLS_EXTRA), so every tool the policy covers is exercised
+# (Go and Rust tools first; a Python venv's bin last, so its python3 never shadows the system's)
+PDTOOLS_EXTRA="${PDTOOLS_EXTRA:-/opt/pdtools-web}"; PDTOOLS_APPEND="${PDTOOLS_APPEND:-/opt/pyweb/bin}"
+# waf: the WAF block-page fixtures (lab/Caddyfile): each vendor's page is a waf_blocked warning naming
+# the vendor, in the log and in warnings.jsonl; the plain 403 and the page that only names a vendor are not
+cmd_waf(){
+  lab_env
+  [ -f "$RUN_RECON" ] || die "outcrop.sh not found at $RUN_RECON"
+  [ -s "$LAB/targets-waf.txt" ] || die "no lab/targets-waf.txt (run: $0 up)"
+  local t fail=0 f v want; t="$(mktemp -d /tmp/bench-waf.XXXXXX)"
+  log "WAF block-page check against lab/targets-waf.txt -> $t"
+  ( cd "$t" && bash "$RUN_RECON" -i "$LAB/targets-waf.txt" -o "$t/w.csv" --resolvers "$RESOLVERS_FILE" --json --no-report \
+      >"$t/run.out" 2>"$t/run.err" ) || true
+  for f in $WAF_FIXTURES; do
+    case "$f" in
+      cloudflare|ratelimit) want=cloudflare;; cloudfront) want='aws-waf (cloudfront)';; f5) want=f5-asm;;
+      plain403|app) want="";; *) want="$f";;
+    esac
+    if [ -n "$want" ]; then
+      v="$(grep -oE "waf_blocked: $f\.waf\.test \(seed $f\.waf\.test\): [0-9]+ of [0-9]+ URL\(s\) got [^']+'s" "$t/run.err" | head -n 1 | sed -E "s/.* got (.*)'s$/\1/")"
+      if [ "$v" = "$want" ] && grep -q "\"kind\":\"waf_blocked\",\"seed\":\"$f\.waf\.test\".*\"vendor\":\"$want\"" "$t/w.csv.warnings.jsonl" 2>/dev/null; then
+        log "  ok   $f.waf.test: waf_blocked, vendor $want (log and warnings.jsonl)"
+      else log "  FAIL $f.waf.test: want waf_blocked by $want, got '${v:-nothing}' (see $t/run.err)"; fail=1; fi
+    elif grep -q "waf_blocked: $f\.waf\.test" "$t/run.err"; then log "  FAIL $f.waf.test was reported as blocked (it is not)"; fail=1
+    else log "  ok   $f.waf.test: not reported (the control)"; fi
+  done
+  if grep -qE '^cloudflare\.waf\.test	' "$t/w.csv" 2>/dev/null || grep -q ',cloudflare\.waf\.test,' "$t/w.csv"; then
+    log "  ok   the blocked hosts keep their rows (a block page is what the scan saw; the warning says it is not the site)"
+  else log "  FAIL cloudflare.waf.test has no row in the CSV"; fail=1; fi
+  [ "$fail" = 0 ] && log "waf check: PASS" || log "waf check: FAIL"
+  return "$fail"
+}
+# throttle: the rate-limited fixture (lab/throttle-nginx.conf): throttle.test answers 429 past 2
+# requests a second and drops /closed without an answer. The run must mark it throttled.
+cmd_throttle(){
+  lab_env
+  [ -f "$RUN_RECON" ] || die "outcrop.sh not found at $RUN_RECON"
+  [ -s "$LAB/targets-throttle.txt" ] || die "no lab/targets-throttle.txt (run: $0 up)"
+  local t fail=0; t="$(mktemp -d /tmp/bench-throttle.XXXXXX)"
+  log "throttle check against lab/targets-throttle.txt -> $t"
+  ( cd "$t" && bash "$RUN_RECON" -i "$LAB/targets-throttle.txt" -o "$t/th.csv" --resolvers "$RESOLVERS_FILE" --json --no-report \
+      >"$t/run.out" 2>"$t/run.err" ) || true
+  if grep -qE 'throttled: throttle\.test \(seed throttle\.test\): [0-9]+ of [0-9]+ request\(s\) were refused or slowed \(429: [1-9]' "$t/run.err"; then
+    log "  ok   throttle.test is throttled: $(grep -oE 'throttled: throttle\.test [^;]*' "$t/run.err" | head -n 1 | sed 's/.*were refused or slowed //')"
+  else log "  FAIL throttle.test was not marked throttled (see $t/run.err, $t/th.csv.health.tsv)"; fail=1; fi
+  if awk -F'\t' '$2 == "throttle.test" && $9 > 0 { f = 1 } END { exit !f }' "$t/th.csv.health.tsv" 2>/dev/null; then
+    log "  ok   the dropped connection (/closed) is counted as a reset"
+  else log "  FAIL no reset counted for /closed (see $t/th.csv.health.tsv)"; fail=1; fi
+  if grep -q '"kind":"throttled","seed":"throttle\.test","host":"throttle\.test"' "$t/th.csv.warnings.jsonl" 2>/dev/null; then
+    log "  ok   warnings.jsonl: kind throttled, with the counts"
+  else log "  FAIL warnings.jsonl has no throttled record"; fail=1; fi
+  [ "$fail" = 0 ] && log "throttle check: PASS" || log "throttle check: FAIL"
+  return "$fail"
+}
+# _ingress_log on|off: recreate the ingress with its access log on or off (LAB_ACCESS_LOG)
+_ingress_log(){
+  # shellcheck disable=SC2086,SC2163
+  export $LAB_IP_VARS; LAB_ACCESS_LOG="$1" compose -f "$COMPOSE_FILE" up -d --force-recreate ingress >/dev/null 2>&1
+  wait_http "http://nginx.test/" '200' 20 >/dev/null 2>&1 || true
+}
+# policy: every request a run sends to the lab carries the policy's User-Agent and extra header, read
+# at the ingress's access log. Two runs: (1) every stage but nuclei: the only other requests allowed
+# are the documented exceptions (httpx's screenshot browser keeps its own User-Agent, gospider
+# lowercases it, subzy has no option; subjs takes the User-Agent but no header, on the live roots);
+# (2) nuclei alone: its raw ("unsafe") templates send the template's own headers, so there the check
+# reports their share and wants at least 99% of nuclei's requests to carry the policy.
+_policy_count(){ # <access.jsonl> <ua> <header-name>: the per-request classification, as "key count" lines
+  python3 -I - "$@" <<'PYPOL'
+import json, re, sys, collections
+f, ua, hn = sys.argv[1:4]
+EXC = [("httpx's screenshot browser (its own User-Agent)", re.compile(r"^Mozilla/5\.0 \(Macintosh; Intel Mac OS X 10_15_7\) AppleWebKit/537\.36 \(KHTML, like Gecko\) (Headless)?Chrome/[0-9.]+ Safari/537\.36$")),
+       ("gospider (lowercases it)", re.compile("^" + re.escape(ua.lower()) + "$")),
+       ("subzy (no option)", re.compile(r"^Go-http-client/"))]
+n, ok, hdr, roots, other, exc = 0, 0, 0, 0, collections.Counter(), collections.Counter()
+for l in open(f, encoding="utf-8", errors="replace"):
+    try:
+        r = json.loads(l[l.index("{"):])["request"]
+    except (ValueError, KeyError):
+        continue
+    h = {k.lower(): v for k, v in (r.get("headers") or {}).items()}
+    u = (h.get("user-agent") or [""])[0]
+    n += 1
+    if u == ua:
+        ok += 1
+        if h.get(hn.lower()):
+            hdr += 1
+        elif r.get("uri") == "/" and set(h) <= {"user-agent", "accept-encoding"}:
+            roots += 1           # subjs: the User-Agent, no header option, the live roots
+        else:
+            other["%s (policy User-Agent, no header) %s %s" % (r.get("method"), r.get("host"), r.get("uri", "")[:50])] += 1
+        continue
+    for name, rx in EXC:
+        if rx.match(u):
+            exc[name] += 1
+            break
+    else:
+        other["%s %s %s" % (u or "(no User-Agent)", r.get("host"), r.get("uri", "")[:50])] += 1
+print("requests %d" % n)
+print("policy %d" % ok)
+print("header %d" % hdr)
+if roots:
+    print("exception %d subjs (the User-Agent, no header option)" % roots)
+for k, v in exc.items():
+    print("exception %d %s" % (v, k))
+for k, v in other.most_common(25):
+    print("OTHER %d %s" % (v, k))
+PYPOL
+}
+cmd_policy(){
+  lab_env
+  [ -f "$RUN_RECON" ] || die "outcrop.sh not found at $RUN_RECON"
+  local t fail=0 since cid n okn hd no ua="${POLICY_CHECK_UA:-}"
+  # the default policy User-Agent, read from outcrop.sh (the browser preset)
+  [ -n "$ua" ] || ua="$(sed -n "s/^UA_BROWSER='\(.*\)'$/\1/p" "$RUN_RECON" | head -n 1)"
+  t="$(mktemp -d /tmp/bench-policy.XXXXXX)"
+  log "request-policy check -> $t (the ingress's access log on for the check)"
+  _ingress_log on
+  cid="$(compose -f "$COMPOSE_FILE" ps -q ingress 2>/dev/null | head -n 1)"
+  printf 'admin\nlogin\nwp-login.php\nrobots.txt\nnot-there\n' > "$t/wl.txt"
+  printf 'nginx.test\nspa.test\nwp.test\n' > "$t/in.txt"
+  # 1. every stage but nuclei
+  sleep 1; since="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"; sleep 1
+  ( cd "$t" && PATH="$PDTOOLS_EXTRA:$PATH:$PDTOOLS_APPEND" bash "$RUN_RECON" -i "$t/in.txt" -o "$t/p.csv" --resolvers "$RESOLVERS_FILE" \
+      --header 'X-Outcrop-Lab: policy' --extras --origin --takeover --tls --crawlers-all --js --screenshots \
+      --fuzz --wordlist "$t/wl.txt" --params --no-report >"$t/run.out" 2>"$t/run.err" ) || true
+  sleep 2; docker logs --since "$since" "$cid" 2>&1 | grep '"request"' > "$t/access.jsonl" || true
+  # 2. nuclei alone
+  sleep 1; since="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"; sleep 1
+  ( cd "$t" && bash "$RUN_RECON" -i "$t/in.txt" -o "$t/n.csv" --resolvers "$RESOLVERS_FILE" \
+      --header 'X-Outcrop-Lab: policy' --nuclei --no-report >"$t/nrun.out" 2>"$t/nrun.err" ) || true
+  sleep 2; docker logs --since "$since" "$cid" 2>&1 | grep '"request"' > "$t/access-nuclei.jsonl" || true
+  _ingress_log off
+  _policy_count "$t/access.jsonl" "$ua" 'X-Outcrop-Lab' > "$t/policy.txt"
+  _policy_count "$t/access-nuclei.jsonl" "$ua" 'X-Outcrop-Lab' > "$t/policy-nuclei.txt"
+  n="$(sed -n 's/^requests //p' "$t/policy.txt")"; okn="$(sed -n 's/^policy //p' "$t/policy.txt")"; hd="$(sed -n 's/^header //p' "$t/policy.txt")"
+  if [ "${n:-0}" -gt 50 ]; then log "  ok   every stage but nuclei: the ingress logged $n request(s)"; else log "  FAIL only ${n:-0} request(s) logged (see $t/access.jsonl)"; fail=1; fi
+  if ! grep -q '^OTHER' "$t/policy.txt"; then
+    log "  ok   $okn carry the policy User-Agent ($hd with the --header too); the rest are the documented exceptions:"
+  else log "  FAIL request(s) outside the policy and its documented exceptions:"; fail=1; fi
+  sed -n 's/^exception \([0-9]*\) \(.*\)/         \1 \2/p; s/^OTHER \([0-9]*\) \(.*\)/         OTHER \1 \2/p' "$t/policy.txt" >&2
+  n="$(sed -n 's/^requests //p' "$t/policy-nuclei.txt")"; okn="$(sed -n 's/^policy //p' "$t/policy-nuclei.txt")"
+  no="$(grep '^OTHER' "$t/policy-nuclei.txt" | awk '{s += $2} END {print s + 0}')"
+  if [ "${n:-0}" -gt 50 ] && [ $(( ${okn:-0} * 100 )) -ge $(( n * 99 )) ]; then
+    log "  ok   nuclei: $okn of $n request(s) carry the policy; $no came from raw templates that set their own headers:"
+  else log "  FAIL nuclei: ${okn:-0} of ${n:-0} request(s) carry the policy (want 99%):"; fail=1; fi
+  grep '^OTHER' "$t/policy-nuclei.txt" | head -n 8 | sed 's/^OTHER /         /' >&2
+  [ "$fail" = 0 ] && log "policy check: PASS" || log "policy check: FAIL"
+  return "$fail"
+}
+# stop: a run sending steadily (a fuzz pass over the farm) is stopped with SIGTERM; once Outcrop has
+# exited, a packet capture on loopback sees nothing more reach a lab service, and no process of the
+# run is left. A capture during the run is the control (it does see the traffic).
+cmd_stop(){
+  lab_env
+  [ -f "$RUN_RECON" ] || die "outcrop.sh not found at $RUN_RECON"
+  [ -s "$LAB/targets-farm.txt" ] || die "no lab/targets-farm.txt (run: $0 up --farm 50)"
+  local t fail=0 pid rc i t0 el ips="127.0.0.1,$LAB_WAF_IP,$LAB_THROTTLE_IP,$LAB_ORIGIN_IP,$LAB_PROTECTED_IP" ports="80,443,8443,53"
+  t="$(mktemp -d /tmp/bench-stop.XXXXXX)"
+  log "stop check -> $t"
+  python3 -I -c 'import random; random.seed(7); print("\n".join("lab-%06d" % random.randrange(10**6) for _ in range(40000)))' > "$t/wl.txt"
+  ( cd "$t" && PATH="$PDTOOLS_EXTRA:$PATH:$PDTOOLS_APPEND" exec bash "$RUN_RECON" -i "$LAB/targets-farm.txt" -o "$t/s.csv" --resolvers "$RESOLVERS_FILE" \
+      --fuzz --wordlist "$t/wl.txt" -t 5 --no-report >"$t/run.out" 2>"$t/run.err" ) & pid=$!
+  for i in $(seq 1 300); do grep -q 'content discovery\|fuzz' "$t/run.err" 2>/dev/null && break; sleep 0.5; done
+  sleep 3
+  python3 -I "$LAB/lo-sniff.py" 2 "$ips" "$ports" > "$t/during.json" 2>"$t/sniff.err"
+  t0="$(date +%s%N)"; kill -TERM "$pid" 2>/dev/null; rc=0; wait "$pid" || rc=$?; el=$(( ($(date +%s%N) - t0) / 1000000 ))
+  sleep 1
+  python3 -I "$LAB/lo-sniff.py" 10 "$ips" "$ports" > "$t/after.json" 2>>"$t/sniff.err"
+  if grep -q '"packets": [1-9]' "$t/during.json"; then log "  ok   control: during the run the capture sees its traffic ($(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["packets"])' "$t/during.json") packets in 2 s)"
+  else log "  FAIL control: no traffic seen during the run, so the check proves nothing (see $t/during.json, $t/sniff.err)"; fail=1; fi
+  if [ "$rc" = 143 ]; then log "  ok   SIGTERM: exit 143 after $el ms"; else log "  FAIL SIGTERM: exit $rc"; fail=1; fi
+  if grep -q '"packets": 0,' "$t/after.json"; then log "  ok   after Outcrop exited: 0 packets to the lab in 10 s"
+  else log "  FAIL traffic after Outcrop exited: $(cat "$t/after.json")"; fail=1; fi
+  if pgrep -f "$t/" >/dev/null 2>&1; then log "  FAIL processes of the run are still running: $(pgrep -af "$t/" | head -3 | tr '\n' ';')"; fail=1
+  else log "  ok   no process of the run is left"; fi
+  [ "$fail" = 0 ] && log "stop check: PASS" || log "stop check: FAIL"
+  return "$fail"
+}
+# ua: the User-Agent A/B (OA1) against the CRS-fronted names: per --user-agent mode, live hosts, URL
+# rows, fuzz hits, nuclei findings and the requests CRS blocked, median of N runs. Not a pass/fail check.
+cmd_ua(){
+  lab_env
+  [ -f "$RUN_RECON" ] || die "outcrop.sh not found at $RUN_RECON"
+  [ -s "$LAB/targets-crs.txt" ] || die "no lab/targets-crs.txt (run: $0 up)"
+  local runs=3 modes="tool outcrop browser" t m i cid since
+  while [ "$#" -gt 0 ]; do case "$1" in --runs) runs="${2:?}"; shift 2;; --modes) modes="${2:?}"; shift 2;; *) shift;; esac; done
+  t="$(mktemp -d /tmp/bench-ua.XXXXXX)"
+  cid="$(compose -f "$COMPOSE_FILE" ps -q crs 2>/dev/null | head -n 1)"
+  printf 'wp-login.php\nwp-admin/\nreadme.html\nlicense.txt\nxmlrpc.php\nwp-content/\nwp-includes/\nwp-json/\nlogin\nscript\nadmin\nmanage\nnot-there-1\nnot-there-2\n' > "$t/wl.txt"
+  log "User-Agent A/B against lab/targets-crs.txt (ModSecurity + OWASP CRS), $runs run(s) per mode -> $t"
+  printf 'mode\trun\twall_s\tlive_hosts\turl_rows\trows_403\tfuzz_hits\tnuclei\tcrs_blocked\tcrs_requests\n' > "$t/ua.tsv"
+  for m in $modes; do
+    for i in $(seq 1 "$runs"); do
+      sleep 1; since="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"; sleep 1
+      local s0; s0="$(date +%s)"
+      ( cd "$t" && PATH="$PDTOOLS_EXTRA:$PATH:$PDTOOLS_APPEND" bash "$RUN_RECON" -i "$LAB/targets-crs.txt" -o "$t/$m.$i.csv" --resolvers "$RESOLVERS_FILE" \
+          --user-agent "$m" --nuclei --fuzz --wordlist "$t/wl.txt" --no-report >"$t/$m.$i.out" 2>"$t/$m.$i.err" ) || true
+      local w=$(( $(date +%s) - s0 ))
+      sleep 1
+      docker logs --since "$since" "$cid" 2>/dev/null | grep -E '"(GET|POST|HEAD|PUT|OPTIONS) ' > "$t/$m.$i.crs.log" || true
+      python3 -I - "$t/$m.$i.csv" "$t/$m.$i.csv.nuclei.txt" "$t/$m.$i.crs.log" "$m" "$i" "$w" >> "$t/ua.tsv" <<'PYUA'
+import csv, sys, re
+c, nu, cl, m, i, w = sys.argv[1:7]
+try:
+    rows = list(csv.DictReader(open(c, newline="", encoding="utf-8")))
+except OSError:
+    rows = []
+live = {r["host"] for r in rows if (r.get("status_code") or "0") not in ("", "0")}
+r403 = sum(1 for r in rows if r.get("status_code") == "403")
+fz = sum(1 for r in rows if re.search(r"feroxbuster|ffuf", r.get("sources") or ""))
+try:
+    nn = sum(1 for l in open(nu, encoding="utf-8", errors="replace") if l.strip())
+except OSError:
+    nn = 0
+blk = req = 0
+for l in open(cl, encoding="utf-8", errors="replace"):
+    mm = re.search(r'" (\d{3}) ', l)
+    if mm:
+        req += 1
+        blk += mm.group(1) == "403"
+print("\t".join(map(str, [m, i, w, len(live), len(rows), r403, fz, nn, blk, req])))
+PYUA
+    done
+  done
+  python3 -I - "$t/ua.tsv" <<'PYUAS' >&2
+import csv, sys, statistics
+rows = list(csv.DictReader(open(sys.argv[1]), delimiter="\t"))
+cols = ["wall_s", "live_hosts", "url_rows", "rows_403", "fuzz_hits", "nuclei", "crs_blocked", "crs_requests"]
+print("[bench] User-Agent A/B, medians (%s run(s) per mode):" % (len(rows) // max(1, len({r["mode"] for r in rows}))))
+print("[bench]   %-8s %s" % ("mode", " ".join("%12s" % c for c in cols)))
+for m in dict.fromkeys(r["mode"] for r in rows):
+    rr = [r for r in rows if r["mode"] == m]
+    print("[bench]   %-8s %s" % (m, " ".join("%12s" % statistics.median(int(r[c]) for r in rr) for c in cols)))
+PYUAS
+  log "per-run numbers: $t/ua.tsv"
+}
 cmd_checks(){
   local rc=0
   cmd_takeover || rc=1
@@ -1144,7 +1416,11 @@ cmd_checks(){
   cmd_resume || rc=1
   cmd_history || rc=1
   cmd_ship || rc=1
-  [ "$rc" = 0 ] && log "lab checks: PASS (takeover, zone, origin, http, tls, posture, discovery, scope, resume, history, ship)" || log "lab checks: FAIL"
+  cmd_waf || rc=1
+  cmd_throttle || rc=1
+  cmd_policy || rc=1
+  cmd_stop || rc=1
+  [ "$rc" = 0 ] && log "lab checks: PASS (takeover, zone, origin, http, tls, posture, discovery, scope, resume, history, ship, waf, throttle, policy, stop)" || log "lab checks: FAIL"
   return "$rc"
 }
 
@@ -1161,6 +1437,11 @@ case "${1:-help}" in
   http)     cmd_http;;
   tls)      cmd_tls;;
   ship)     cmd_ship;;
+  waf)      cmd_waf;;
+  throttle) cmd_throttle;;
+  policy)   cmd_policy;;
+  stop)     cmd_stop;;
+  ua)       shift; cmd_ua "$@";;
   checks)   cmd_checks;;
   down)     cmd_down;;
   hosts)    cmd_hosts;;

@@ -17,6 +17,11 @@ control; never point the scanner anywhere else.
 |---|---|
 | `docker-compose.yml` | the range: `dns` (CoreDNS), `bind` (BIND 9.18, for the NSEC3 zone), `ingress` (Caddy TLS vhost router), `nginx`, `wordpress` + `db`, `spa`, `jenkins` — all pinned. `nginx` is also published directly on `LAB_ORIGIN_IP:80` (default `127.0.0.5`): the "forgotten origin" fixture. The ingress also answers `403` to everything on `LAB_PROTECTED_IP:80` (default `127.0.0.6`): the "protected origin". BIND answers as `ns.nsec3.test` on `LAB_NSEC3_IP:53` (default `127.0.0.7`). `tlslab` (nginx 1.21.6) serves the TLS fixtures, each on its own address: `LAB_TLS_LEGACY_IP` … `LAB_TLS_MODERN_IP` (default `127.0.0.9`–`127.0.0.12`) |
 | `tls-nginx.conf` | the TLS fixtures' nginx: one listener per fixture, its own protocols and ciphers (see "TLS fixtures" below) |
+| `crs` (compose) | ModSecurity v3 + the OWASP Core Rule Set 4.30 at its defaults (paranoia 1, anomaly threshold 5), image pinned to `owasp/modsecurity-crs:4.30.0-nginx-202610180210`, on `LAB_WAF_IP` (default `127.0.0.13`) in front of the ingress: `wp.crs.test`, `ci.crs.test`, `nginx.crs.test` (1.21, `ua`) |
+| `throttle-nginx.conf` | the rate-limited host `throttle.test` on `LAB_THROTTLE_IP` (default `127.0.0.14`): 2 requests a second, a burst of 5, then 429; `/closed` drops the connection; HTTPS refuses other names (`unrecognized_name`). Its pages are in `throttle-www/` (*generated*) |
+| `alog-on.caddy`, `alog-off.caddy` | the ingress's access log, on only with `LAB_ACCESS_LOG=on` (JSON with the request headers, on the container's stderr); `policy` turns it on for its runs |
+| `lo-sniff.py` | counts the packets sent to the lab's services on loopback (a raw socket: root or CAP_NET_RAW); `stop` uses it |
+| `targets-waf.txt`, `targets-crs.txt`, `targets-throttle.txt` | *generated*: the seeds of the `waf`, `ua` and `throttle` checks |
 | `gen-tls-certs.py` | makes the TLS fixtures' certificates at `up` (needs `openssl` and `python3-cryptography`) |
 | `mock-tideline.py` | a stand-in for Tideline's ingest service (loopback only): mutual TLS, the sensor from the certificate, ES256 manifest signatures, part hashes and schema validation, fault injection; used by `ship` and the suite |
 | `gen-ship-certs.sh` | a throwaway step-ca-shaped PKI for `mock-tideline.py`: root, intermediate, server and sensor certificates, plus the misfits the tests need (needs `openssl`) |
@@ -83,7 +88,12 @@ sudo sh -c './bench-run-recon.sh hosts >> /etc/hosts'   # once: names for tools 
 ./bench-run-recon.sh resume                                                    # SIGTERM mid-run, --resume, CSV equals an uninterrupted run
 RECON_DB_DSN=postgresql://... ./bench-run-recon.sh history                     # --monitor delta + recon-db history (store with RECON_DB_DSN)
 ./bench-run-recon.sh ship                                                      # --ship to a mock Tideline ingest: round trip, re-ship, resume
-./bench-run-recon.sh checks                                                    # all eleven; non-zero if any fails
+./bench-run-recon.sh waf                                                       # WAF block pages: waf_blocked, naming the vendor (1.21)
+./bench-run-recon.sh throttle                                                  # a rate-limited host: throttled, with the counts (1.21)
+./bench-run-recon.sh policy                                                    # every request carries the User-Agent and --header (1.21)
+./bench-run-recon.sh stop                                                      # SIGTERM: no traffic after Outcrop exits, packet capture (1.21)
+./bench-run-recon.sh ua --runs 3                                               # the User-Agent A/B behind ModSecurity + OWASP CRS (1.21)
+./bench-run-recon.sh checks                                                    # all fifteen checks (not ua); non-zero if any fails
 
 ./bench-run-recon.sh down                # tear down and remove volumes
 ```
@@ -91,9 +101,9 @@ RECON_DB_DSN=postgresql://... ./bench-run-recon.sh history                     #
 `up` needs **ldnsutils** (`sudo apt install ldnsutils`; the setup scripts install it) to sign
 `walk.test` and `nsec3.test`; without it the zones are served unsigned and `zone` skips the NSEC and
 NSEC3 cases. It also needs **python3-cryptography** and `openssl` for the TLS fixtures' certificates
-(the setup scripts install it too). If `127.0.0.5`, `127.0.0.6`, `127.0.0.7` or `127.0.0.9`–`127.0.0.12` is taken,
-set `LAB_ORIGIN_IP`, `LAB_PROTECTED_IP`, `LAB_NSEC3_IP` or `LAB_TLS_LEGACY_IP` … `LAB_TLS_MODERN_IP` to
-another loopback address for `up` and the checks.
+(the setup scripts install it too). If `127.0.0.5`, `127.0.0.6`, `127.0.0.7` or `127.0.0.9`–`127.0.0.14` is taken,
+set `LAB_ORIGIN_IP`, `LAB_PROTECTED_IP`, `LAB_NSEC3_IP`, `LAB_TLS_LEGACY_IP` … `LAB_TLS_MODERN_IP`, `LAB_WAF_IP`
+or `LAB_THROTTLE_IP` to another loopback address for `up` and the checks.
 
 First boot takes a minute or two (WordPress install, Jenkins start). `up`
 installs WordPress with a throwaway admin password that is generated, used once
@@ -306,6 +316,45 @@ its schema in `schemas/`.
 The suite covers the refusals: a changed file, a conflicting manifest, another sensor's run, a client
 certificate from another CA, a server from another CA, and a trust store in `SSL_CERT_DIR` that
 must not be used. See [SHIPPING.md](../SHIPPING.md).
+
+## Run-health and request-policy fixtures (Outcrop 1.21)
+
+**WAF block pages** (`waf`). Each `<vendor>.waf.test` answers with that vendor's block response: its
+status, headers and page as the vendor sends them. Each must be reported `waf_blocked` with its vendor, in
+the log and in `warnings.jsonl`.
+
+| name | status | what identifies it | reported as |
+|---|---|---|---|
+| `cloudflare.waf.test` | 403 | `Server: cloudflare`, `CF-RAY`, "Attention Required! \| Cloudflare", `cf-error-details` | cloudflare |
+| `ratelimit.waf.test` | 429 | `Server: cloudflare`, "error code: 1015" | cloudflare |
+| `akamai.waf.test` | 403 | `Server: AkamaiGHost`, "Access Denied", "Reference #18…" | akamai |
+| `imperva.waf.test` | 403 | `X-Iinfo`, `X-CDN: Imperva`, "Incapsula incident ID" | imperva |
+| `cloudfront.waf.test` | 403 | `Server: CloudFront`, `X-Amz-Cf-Id`, "Request blocked." | aws-waf (cloudfront) |
+| `f5.waf.test` | **200** | "The requested URL was rejected… Your support ID is" | f5-asm |
+| `sucuri.waf.test` | 403 | `Server: Sucuri/Cloudproxy`, `X-Sucuri-ID` | sucuri |
+| `modsecurity.waf.test` | 406 | "This error was generated by Mod_Security." | modsecurity |
+| `wordfence.waf.test` | 503 | "Generated by Wordfence" | wordfence |
+| `plain403.waf.test` | 403 | a plain `Forbidden` | not reported |
+| `app.waf.test` | 200 | a page that mentions Cloudflare, Akamai and Imperva | not reported |
+
+**Rate limits** (`throttle`). `throttle.test` and `badsni.throttle.test` share one limit (per client
+address). The run must mark `throttle.test` throttled, with 429s and the reset from `/closed` counted.
+
+**Behind a WAF** (`ua`). The `crs` service forwards `*.crs.test` to the ingress over plain HTTP. CRS rule
+913100 blocks scanner User-Agents: nuclei's, ffuf's, feroxbuster's, wpscan's and whatweb's. `ua` runs the
+same scan (`--nuclei --fuzz`) once per `--user-agent` mode and compares what each saw. It is a measurement,
+not a pass/fail check.
+
+**Request policy** (`policy`). With the ingress's access log on, two runs over nginx, spa and wp:
+1. every stage but nuclei: every request must carry the policy's User-Agent and `--header`, except the
+   documented exceptions (httpx's screenshot browser, gospider's lowercased User-Agent, subzy, and subjs, which
+   takes no header);
+2. nuclei alone: at least 99% of its requests must carry the policy. Its raw (`unsafe`) templates send their
+   own headers, and the check lists them.
+
+**Stopping** (`stop`). A fuzz pass over the farm is stopped with SIGTERM. A packet capture during the run is
+the control. After Outcrop has exited, a 10 s capture must see no packet to a lab service, and no process
+of the run may be left.
 
 ## Accuracy notes
 

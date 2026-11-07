@@ -22,14 +22,28 @@
 #                action is http:// (cleartext from an HTTPS page); /login links /old, which
 #                leaves the host (301 elsewhere.test: listed, not followed)
 #   plainlogin.redir.test   a password form on a plain-HTTP page (CleartextAuth)
+# WAF and run-health fixtures (Outcrop 1.21, `bench-run-recon.sh waf`, `ua`, `policy`):
+#   <vendor>.waf.test   one WAF vendor's block page each (status, headers, body as the vendor sends
+#                       them): cloudflare, akamai, imperva, cloudfront, f5 (200!), sucuri,
+#                       modsecurity (406), wordfence (503), ratelimit (Cloudflare 1015, 429);
+#                       plain403.waf.test (a plain 403) and app.waf.test (a page that only mentions
+#                       a vendor) must not be reported
+#   *.crs.test          behind ModSecurity + the OWASP CRS (the crs service, LAB_WAF_IP), which
+#                       forwards here over plain HTTP: wp.crs.test, ci.crs.test, nginx.crs.test
+# Access log: off unless LAB_ACCESS_LOG=on (the request-policy check reads it; the benchmark
+# runs without it). Every site imports it.
 # The basic-auth password is a throwaway lab value ("lab-only-not-a-secret").
 {
 	local_certs
 	auto_https disable_redirects
 }
+(alog) {
+	import /lab/alog-{$LAB_ACCESS_LOG:off}.caddy
+}
 
 # --- lab: the four named services (accuracy scenario) ---
 http://nginx.test, https://nginx.test {
+	import alog
 	handle /robots.txt {
 		header Content-Type "text/plain; charset=utf-8"
 		respond `User-agent: *
@@ -56,10 +70,12 @@ Expires: 2024-01-01T00:00:00Z
 }
 
 http://wp.test, https://wp.test {
+	import alog
 	reverse_proxy wordpress:80
 }
 
 http://spa.test, https://spa.test {
+	import alog
 	header {
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"
 		Content-Security-Policy "default-src 'self' 'unsafe-inline'; frame-ancestors 'none'"
@@ -79,14 +95,17 @@ Policy: https://spa.test/security-policy
 }
 
 http://ci.test, https://ci.test {
+	import alog
 	reverse_proxy jenkins:8080
 }
 
 # --- redirect chains and login forms (--extras follows the same-host hops) ---
 http://redir.test {
+	import alog
 	redir https://redir.test{uri} 301
 }
 https://redir.test {
+	import alog
 	handle / {
 		redir * /login 302
 	}
@@ -105,6 +124,7 @@ https://redir.test {
 	}
 }
 http://plainlogin.redir.test {
+	import alog
 	header Content-Type "text/html; charset=utf-8"
 	respond `<!doctype html><html><head><title>Plain login</title></head><body>
 <form method="post" action="/login"><input name="user"><input type="password" name="pass"></form></body></html>
@@ -113,6 +133,7 @@ http://plainlogin.redir.test {
 
 # --- zone-fixture names with a role of their own ---
 http://vpn-legacy.walk.test {
+	import alog
 	basicauth bcrypt "Legacy VPN" {
 		vpnuser $2a$14$dhDYrJi/7xGUNdoaC5R...6fFGmjdchIglc1nhldDum/yd9qOSCgK
 	}
@@ -121,12 +142,14 @@ http://vpn-legacy.walk.test {
 
 # --- an alternate port (--ports): nginx.test also answers on 8443 (127.0.0.1:8443) ---
 https://nginx.test:8443 {
+	import alog
 	respond "lab alternate-port service" 200
 }
 
 # --- MTA-STS policies (--dns-posture): posture.test in testing mode, listing only one of its
 # two MX hosts; good.posture.test enforced and complete ---
 https://mta-sts.posture.test {
+	import alog
 	handle /.well-known/mta-sts.txt {
 		header Content-Type "text/plain; charset=utf-8"
 		respond `version: STSv1
@@ -137,6 +160,7 @@ max_age: 86400
 	}
 }
 https://mta-sts.good.posture.test {
+	import alog
 	handle /.well-known/mta-sts.txt {
 		header Content-Type "text/plain; charset=utf-8"
 		respond `version: STSv1
@@ -149,7 +173,142 @@ max_age: 604800
 
 # --- the protected origin (origin.spa.test -> LAB_PROTECTED_IP:80 -> :8080) ---
 http://:8080 {
+	import alog
 	respond "direct access denied" 403
+}
+
+# --- WAF block pages (OA2: a block page is a waf_blocked warning naming the vendor, not a result) ---
+http://cloudflare.waf.test, https://cloudflare.waf.test {
+	import alog
+	header Server cloudflare
+	header CF-RAY "8f2d1c3b4a5e6f70-IAD"
+	header Content-Type "text/html; charset=UTF-8"
+	respond `<!DOCTYPE html><html lang="en-US"><head><title>Attention Required! | Cloudflare</title></head>
+<body><div id="cf-wrapper"><div id="cf-error-details" class="p-0"><h1>Sorry, you have been blocked</h1>
+<h2>You are unable to access waf.test</h2><p>Cloudflare Ray ID: <strong>8f2d1c3b4a5e6f70</strong></p></div></div></body></html>
+` 403
+}
+http://ratelimit.waf.test, https://ratelimit.waf.test {
+	import alog
+	header Server cloudflare
+	header CF-RAY "8f2d1c3b4a5e6f71-IAD"
+	header Content-Type "text/plain; charset=UTF-8"
+	header Retry-After 60
+	respond "error code: 1015" 429
+}
+http://akamai.waf.test, https://akamai.waf.test {
+	import alog
+	header Server AkamaiGHost
+	header Mime-Version 1.0
+	header Content-Type text/html
+	respond `<HTML><HEAD>
+<TITLE>Access Denied</TITLE>
+</HEAD><BODY>
+<H1>Access Denied</H1>
+You don't have permission to access "http&#58;&#47;&#47;akamai&#46;waf&#46;test&#47;" on this server.<P>
+Reference&#32;&#35;18&#46;6f1c2c17&#46;1794030000&#46;2a1b3c4
+<P>https&#58;&#47;&#47;errors&#46;edgesuite&#46;net&#47;18&#46;6f1c2c17
+</BODY>
+</HTML>
+` 403
+}
+http://imperva.waf.test, https://imperva.waf.test {
+	import alog
+	header X-Iinfo "7-12345678-0 0NNN RT(1794030000000 0) q(0 -1 -1 -1) r(0 -1)"
+	header X-CDN Imperva
+	header Content-Type text/html
+	respond `<html style="height:100%"><head><META NAME="ROBOTS" CONTENT="NOINDEX, NOFOLLOW"><meta name="format-detection" content="telephone=no"></head>
+<body style="margin:0px;height:100%"><iframe id="main-iframe" src="/_Incapsula_Resource?CWUDNSAI=23&xinfo=7-12345678-0%200NNN%20RT&incident_id=0-123456789012345678&edet=12" frameborder=0 width="100%" height="100%" marginheight="0px" marginwidth="0px">Request unsuccessful. Incapsula incident ID: 0-123456789012345678</iframe></body></html>
+` 403
+}
+http://cloudfront.waf.test, https://cloudfront.waf.test {
+	import alog
+	header Server CloudFront
+	header X-Cache "Error from cloudfront"
+	header X-Amz-Cf-Id "Lab0Lab0Lab0Lab0Lab0Lab0Lab0Lab0Lab0Lab0Lab0Lab0Lab0Aw=="
+	header Content-Type text/html
+	respond `<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
+<HTML><HEAD><META HTTP-EQUIV="Content-Type" CONTENT="text/html; charset=iso-8859-1">
+<TITLE>ERROR: The request could not be satisfied</TITLE>
+</HEAD><BODY>
+<H1>403 ERROR</H1>
+<H2>The request could not be satisfied.</H2>
+<HR noshade size="1px">
+Request blocked.
+We can't connect to the server for this app or website at this time. There might be too much traffic or a configuration error.
+<BR clear="all">
+<HR noshade size="1px">
+<PRE>
+Generated by cloudfront (CloudFront)
+Request ID: Lab0Lab0Lab0Lab0Lab0Lab0Lab0Lab0Lab0Lab0Lab0Lab0Lab0Aw==
+</PRE>
+</BODY></HTML>
+` 403
+}
+http://f5.waf.test, https://f5.waf.test {
+	import alog
+	header Content-Type text/html
+	header Set-Cookie "TS01a2b3c4=01lab0lab0lab0; Path=/"
+	respond `<html><head><title>Request Rejected</title></head><body>The requested URL was rejected. Please consult with your administrator.<br><br>Your support ID is: 1234567890123456789<br><br><a href='javascript:history.back();'>[Go Back]</a></body></html>
+` 200
+}
+http://sucuri.waf.test, https://sucuri.waf.test {
+	import alog
+	header Server Sucuri/Cloudproxy
+	header X-Sucuri-ID 15016
+	header X-Sucuri-Block BLK001
+	header Content-Type text/html
+	respond `<!DOCTYPE html><html lang="en"><head><title>Sucuri WebSite Firewall - Access Denied</title></head>
+<body><div id="main-container"><h1>Access Denied - Sucuri Website Firewall</h1><p>Block reason: An attempted attack was detected and blocked.</p></div></body></html>
+` 403
+}
+http://modsecurity.waf.test, https://modsecurity.waf.test {
+	import alog
+	header Server Apache
+	header Content-Type "text/html; charset=iso-8859-1"
+	respond `<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 2.0//EN">
+<html><head>
+<title>406 Not Acceptable</title>
+</head><body>
+<h1>Not Acceptable</h1>
+<p>An appropriate representation of the requested resource could not be found on this server.</p>
+<p>This error was generated by Mod_Security.</p>
+</body></html>
+` 406
+}
+http://wordfence.waf.test, https://wordfence.waf.test {
+	import alog
+	header Content-Type "text/html; charset=UTF-8"
+	respond `<!DOCTYPE html><html><head><title>wordfence.waf.test &lsaquo; Your access to this site has been limited by the site owner</title></head>
+<body><h1>Your access to this site has been limited by the site owner</h1><p>Generated by Wordfence at Sat, 7 Nov 2026 6:00:00 GMT.</p></body></html>
+` 503
+}
+# the controls: a plain 403 is the site's own answer, and a page that only names a vendor is content
+http://plain403.waf.test, https://plain403.waf.test {
+	import alog
+	respond "Forbidden" 403
+}
+http://app.waf.test, https://app.waf.test {
+	import alog
+	header Content-Type "text/html; charset=utf-8"
+	respond `<!doctype html><html><head><title>Lab app</title></head><body><p>We use Cloudflare, Akamai and Imperva in front of our other sites.</p></body></html>
+` 200
+}
+
+# --- behind ModSecurity + OWASP CRS (the crs service forwards *.crs.test here, plain HTTP) ---
+http://wp.crs.test {
+	import alog
+	reverse_proxy wordpress:80 {
+		header_up Host wp.test
+	}
+}
+http://ci.crs.test {
+	import alog
+	reverse_proxy jenkins:8080
+}
+http://nginx.crs.test {
+	import alog
+	reverse_proxy nginx:80
 }
 
 # --- farm: generated by `bench-run-recon.sh up --farm N` (throughput scenario) ---

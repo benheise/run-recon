@@ -1480,7 +1480,7 @@ assert_grep   "$MOCKLOG/psql.args" 'recon_hosts'                  "run inventory
 assert_grep   "$CSV" 'example\.com'                               "run completes with a populated CSV under --db"
 assert_grep   "$MOCKLOG/psql.args" 'httpx_json'                   "httpx per-URL enrichment keyed/cached (skips re-probing URLs)"
 assert_grep   "$MOCKLOG/psql.args" 'live_probe'                   "httpx live-host probe cached per host"
-assert_grep   "$MOCKLOG/psql.args" "'katana'"                     "katana crawl output cached per live host"
+assert_grep   "$MOCKLOG/psql.args" "'katana@ua[0-9a-f]{8}'"       "katana crawl output cached per live host (under the request policy's tag)"
 # A1: subdomain-enum results cached per seed; A2: ASN synced; negative cache namespace used
 run_case subs_db --db --subs
 assert_grep   "$MOCKLOG/psql.args" "source='subs'"             "A1: passive subdomain-enum results keyed/cached per seed"
@@ -2091,9 +2091,9 @@ PSQLEOF
 chmod +x "$MOCKBIN/psql"
 export MOCK_HTTPX_DEAD="https://example.com/katana-path"
 run_case noneg_db --db
-assert_grep   "$MOCKLOG/psql.args" "'httpx_json_v3','https://example\.com/" "--db: enrichment records that came back are cached (key httpx_json_v3: records cached before 1.20 have no login-form matches)"
-assert_grep   "$MOCKLOG/psql.args" "'live_probe!neg'|'live_probe','"      "--db: the live probe keeps its cache entries (dead hosts may be negative-cached)"
-refute_grep   "$MOCKLOG/psql.args" "\\('httpx_json_v3!neg','"                  "--db: a URL with no record is NOT negative-cached (retried next run, not blank for NEG_TTL)"
+assert_grep   "$MOCKLOG/psql.args" "'httpx_json_v4@ua[0-9a-f]{8}','https://example\.com/" "--db: enrichment records that came back are cached (key httpx_json_v4: records cached before 1.21 have no WAF block-page markers)"
+assert_grep   "$MOCKLOG/psql.args" "'live_probe@ua[0-9a-f]{8}!neg'|'live_probe@ua[0-9a-f]{8}','"      "--db: the live probe keeps its cache entries (dead hosts may be negative-cached)"
+refute_grep   "$MOCKLOG/psql.args" "\\('httpx_json_v4(@ua[0-9a-f]{8})?!neg','"                  "--db: a URL with no record is NOT negative-cached (retried next run, not blank for NEG_TTL)"
 unset MOCK_HTTPX_DEAD
 
 
@@ -2517,7 +2517,7 @@ assert_grep  "$ERRLOG" 'ORIGIN_PORTS must be a space-separated port list'       
 rm -f "$MOCKBIN/gowitness" "$MOCKBIN/chromium"
 
 # F8: one chain-check pass over every seed's records, one handshake per (address, port, name)
-assert_grep  "$RUN_RECON" '^  tls_chain_check "\$WORKDIR/tlsx\.jsonl"$'         "the chain check runs once, on the merged TLS records"
+assert_grep  "$RUN_RECON" '^  _fg tls_chain_check "\$WORKDIR/tlsx\.jsonl"$'     "the chain check runs once, on the merged TLS records"
 if [ "$(grep -c 'tls_chain_check "' "$RUN_RECON")" = 1 ]; then _pass "no per-seed chain-check call is left"; else _fail "no per-seed chain-check call is left"; fi
 mk curl <<'EOF'
 #!/usr/bin/env bash
@@ -2547,6 +2547,7 @@ assert_grep  "$P" '^\[example\.com\] dmarc-no-rua \[info\] host=example\.com '  
 assert_grep  "$P" '^\[example\.com\] mta-sts-mx-mismatch \[medium\] host=example\.com mx=mx-old\.gone-mail\.net ' "an MX host the enforced policy does not list -> mta-sts-mx-mismatch"
 refute_grep  "$P" 'mta-sts-(testing|none|invalid|missing|policy)'          "an enforced, fetched policy is not itself a finding"
 assert_fgrep "$MOCKLOG/curl.args" '--proto =https --resolve mta-sts.example.com:443:192.0.2.80 https://mta-sts.example.com/.well-known/mta-sts.txt' "the policy is fetched over HTTPS only, from the address DNS gave"
+assert_grep  "$MOCKLOG/curl.args" -- '-A Mozilla/5\.0 \(Windows NT 10\.0; Win64; x64\) .*Chrome/[0-9.]+ Safari/537\.36 --proto =https --resolve mta-sts\.example\.com' "...with the run's request policy (the User-Agent every tool sends)"
 refute_grep  "$MOCKLOG/curl.args" -- ' -k | --insecure '                    "the policy fetch verifies the certificate (RFC 8461)"
 assert_grep  "$P" '^\[example\.com\] tlsrpt-missing \[info\] host=example\.com '                               "no TLS-RPT -> tlsrpt-missing [info]"
 assert_grep  "$P" '^\[example\.com\] mx-dangling \[high\] host=example\.com mx=mx-old\.gone-mail\.net '          "an MX host whose domain does not exist -> mx-dangling [high]"
@@ -2878,12 +2879,12 @@ case "$sql" in "SELECT 1") echo 1;; esac
 exit 0
 PSQLEOF
 run_case mon_db --db --monitor --monitor-prev "$TMP/mon_prev.csv"
-refute_grep  "$MOCKLOG/psql.args" "c\.source = 'live_probe'"                   "--monitor --db: the live probe is not read from the cache"
-refute_grep  "$MOCKLOG/psql.args" "c\.source = 'httpx_json_v3'"                "--monitor --db: nor the enrichment records"
-assert_grep  "$MOCKLOG/psql.args" "'live_probe'"                                "--monitor --db: the fresh probe results are still stored"
+refute_grep  "$MOCKLOG/psql.args" "c\.source = 'live_probe@ua[0-9a-f]{8}'"                   "--monitor --db: the live probe is not read from the cache"
+refute_grep  "$MOCKLOG/psql.args" "c\.source = 'httpx_json_v4@ua[0-9a-f]{8}'"                "--monitor --db: nor the enrichment records"
+assert_grep  "$MOCKLOG/psql.args" "'live_probe@ua[0-9a-f]{8}'"                                "--monitor --db: the fresh probe results are still stored"
 assert_grep  "$MOCKLOG/psql.args" "source='urls'"                               "--monitor --db: passive lookups still use the cache"
 run_case nomon_db --db
-assert_grep  "$MOCKLOG/psql.args" "c\.source = 'live_probe'"                   "--db without --monitor: the live probe cache is read (unchanged)"
+assert_grep  "$MOCKLOG/psql.args" "c\.source = 'live_probe@ua[0-9a-f]{8}'"                   "--db without --monitor: the live probe cache is read (unchanged)"
 rm -f "$MOCKBIN/psql"
 
 # --- Batch 4 (B4.5): an interrupted run keeps its work dir; --resume continues it -----
@@ -3776,6 +3777,296 @@ _rc_is "$_rc" 2                                                          "the wr
 assert_grep  "$OW/lonely.err" 'outcrop\.sh not found next to it'          "...with a message saying what is missing"
 assert_grep  "$(dirname "$RUN_RECON")/setup-recon-env.sh" 'ln -sf "\$INSTALL_ROOT/bin/outcrop\.sh" /usr/local/bin/outcrop' "setup installs the outcrop command..."
 assert_grep  "$(dirname "$RUN_RECON")/setup-recon-env.sh" 'ln -sf "\$INSTALL_ROOT/bin/run-recon\.sh" /usr/local/bin/run-recon' "...and keeps run-recon, the former name"
+
+# --- Batch 7 (OA5): one request policy for every tool that sends HTTP to a target -------
+section "Batch 7 (OA5): one request policy: every HTTP tool takes the User-Agent, the extra headers and the timeout"
+PUA='OutcropPolicyTest/1 lab-check'; PHD='X-Outcrop-Policy: on'
+# _pol_all TOOL [ua|nl]: every invocation the mock logged carries the policy User-Agent (and the
+# extra header). "ua": the tools with no header option. "nl": arjun and secretfinder take the
+# headers as one newline-separated argument, so an invocation spans lines of the log: there,
+# each invocation (an "-i " line) must be followed by both. Version and help calls do not count.
+_pol_all(){
+  local t="$1" mode="${2:-both}" f="$MOCKLOG/$1.args" g="$TMP/pol.$1.args" n nb
+  if [ ! -s "$f" ]; then _fail "policy: $t did not run in this case (no $f)"; return; fi
+  grep -vxE '\s*-{1,2}(version|h|help)\s*' "$f" > "$g" || true
+  if [ "$mode" = nl ]; then
+    n="$(grep -c -- '-i ' "$g" || true)"
+    nb=$(( n - $(grep -cF -- "User-Agent: $PUA" "$g" || true) + n - $(grep -cxF -- "$PHD " "$g" || true) ))
+  else
+    n="$(grep -c . "$g" || true)"; nb="$(grep -cvF -- "$PUA" "$g" || true)"
+    [ "$mode" = both ] && nb=$(( nb + $(grep -cvF -- "$PHD" "$g" || true) ))
+  fi
+  if [ "${n:-0}" -gt 0 ] && [ "$nb" = 0 ]; then _pass "policy: all $n $t invocation(s) carry the User-Agent$([ "$mode" != ua ] && printf ' and the header')"
+  else _fail "policy: $t: $nb missing in ${n:-0} invocation(s)  [$f]"; fi
+}
+POLARGS=(--user-agent "$PUA" --header "$PHD" --req-timeout 7)
+run_case pol_a --subs --resolve --crawlers-all --js --nuclei --takeover --extras --origin --dns-posture --screenshots "${POLARGS[@]}"
+for _t in httpx katana nuclei gospider hakrawler xnLinkFinder getJS; do _pol_all "$_t"; done
+_pol_all subjs ua
+assert_grep  "$MOCKLOG/hakrawler.args" -- "-h User-Agent: $PUA;;$PHD"       "hakrawler: one -h, the headers joined by ';;'"
+assert_grep  "$MOCKLOG/gospider.args" -- "-u $PUA --robots=false -H $PHD"  "gospider: -u, -H, and no robots.txt fetch (its robots client ignores -u; katana reads robots.txt)"
+assert_grep  "$MOCKLOG/xnLinkFinder.args" -- "-uc $PUA -H $PHD"            "xnLinkFinder: -uc and -H"
+assert_grep  "$MOCKLOG/httpx.args" -- '-timeout 7 '                         "--req-timeout reaches httpx..."
+assert_grep  "$MOCKLOG/katana.args" -- '-timeout 7 '                        "...katana"
+assert_grep  "$MOCKLOG/nuclei.args" -- "-rl [0-9]+ -timeout 7 -H User-Agent: $PUA" "...and nuclei, with the rate"
+assert_grep  "$MOCKLOG/subzy.args" -- '--timeout 7'                         "subzy takes the timeout (it has no User-Agent or header option)"
+_polc="$(grep -E 'https?://([a-z0-9-]+\.)*example\.com' "$MOCKLOG/curl.args" 2>/dev/null | grep -cvF -- "$PUA" || true)"
+if grep -qE 'https?://([a-z0-9-]+\.)*example\.com' "$MOCKLOG/curl.args" 2>/dev/null && [ "$_polc" = 0 ]; then
+  _pass "policy: every curl request to a target carries the User-Agent (third-party lookups are not target traffic)"
+else _fail "policy: curl requests to a target without the User-Agent: $_polc  [$MOCKLOG/curl.args]"; fi
+assert_grep  "$ERRLOG" "Requests      : User-Agent custom \($PUA\); extra headers 1; timeout 7s"  "the banner shows the policy"
+assert_grep  "$CSV.run.json" '"user_agent_mode": "custom"'                 "run.json records the policy..."
+assert_grep  "$CSV.run.json" '"X-Outcrop-Policy"'                          "...with the header's name..."
+refute_grep  "$CSV.run.json" 'X-Outcrop-Policy: on'                         "...never its value (a token can be one): not in the policy, not in the command line"
+assert_grep  "$CSV.run.json" '"X-Outcrop-Policy: \*\*\*"'                  "...the command line keeps the name, the value is ***"
+run_case pol_f --fuzz --wordlist "$WL" --vhost --brute-wordlist "$WL" --params --secrets "${POLARGS[@]}"
+_pol_all feroxbuster; _pol_all ffuf; _pol_all arjun nl; _pol_all secretfinder nl
+assert_grep  "$MOCKLOG/arjun.args" -- "--rate-limit [0-9]+ -T 7 --headers User-Agent: $PUA" "arjun: the rate, the timeout and the headers"
+run_case pol_c --active "${POLARGS[@]}"
+_pol_all whatweb; _pol_all wpscan; _pol_all droopescan ua; _pol_all joomscan ua
+assert_grep  "$MOCKLOG/wpscan.args" -- "--ua $PUA --headers $PHD"          "wpscan: --ua and --headers..."
+refute_grep  "$MOCKLOG/wpscan.args" -- '--random-user-agent'               "...not its random User-Agent"
+mv "$MOCKBIN/whatweb" "$TMP/whatweb.hidden"
+run_case pol_g --active "${POLARGS[@]}"
+mv "$TMP/whatweb.hidden" "$MOCKBIN/whatweb"
+_pol_all cmseek ua; _pol_all nuclei
+# the fallbacks: no feroxbuster (ffuf), no wpscan (curl + the ffuf slug brute), no secretfinder
+# (curl downloads for trufflehog), gowitness for the screenshots
+for _t in feroxbuster wpscan secretfinder; do mv "$MOCKBIN/$_t" "$TMP/$_t.hidden"; done
+mk gowitness <<'EOF'
+#!/usr/bin/env bash
+printf '%s ' "$@" >> "$MOCKLOG/gowitness.args"; echo >> "$MOCKLOG/gowitness.args"
+exit 0
+EOF
+mk chromium <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+SCREENSHOT_TOOL=gowitness run_case pol_b --fuzz --wordlist "$WL" --activescan --active --cms-wordlist "$WL" --secrets --screenshots "${POLARGS[@]}"
+for _t in feroxbuster wpscan secretfinder; do mv "$TMP/$_t.hidden" "$MOCKBIN/$_t"; done
+rm -f "$MOCKBIN/gowitness" "$MOCKBIN/chromium"
+_pol_all ffuf; _pol_all nuclei; _pol_all gowitness
+assert_grep  "$MOCKLOG/gowitness.args" -- "--chrome-user-agent $PUA --chrome-header $PHD" "gowitness: --chrome-user-agent and --chrome-header"
+assert_grep  "$MOCKLOG/ffuf.args" -- '-mc 200 -ac -s'                      "OA3: the WordPress slug brute (ffuf) calibrates (-ac): a catch-all host answered every slug"
+assert_grep  "$MOCKLOG/ffuf.args" -- '-mc 200,204,301,302,307,308,401,403,405 .*-ac -s' "OA3: the --fuzz / --activescan ffuf fallback calibrates (-ac), as feroxbuster filters wildcards"
+refute_grep  "$MOCKLOG/ffuf.args" -- '-mc 200,204,301,302,307,308,401,403,405 -t [0-9]+ -rate [0-9]+ -timeout [0-9]+ -s' "...no ffuf content run without -ac is left"
+_polc="$(grep -E 'https?://([a-z0-9-]+\.)*example\.com' "$MOCKLOG/curl.args" 2>/dev/null | grep -cvF -- "$PUA" || true)"
+if [ "$_polc" = 0 ] && grep -qE '/readme\.html|\.js ' "$MOCKLOG/curl.args" 2>/dev/null; then _pass "policy: the curl fallbacks (CMS probes, JS downloads) carry it"
+else _fail "policy: curl fallbacks without the User-Agent: $_polc  [$MOCKLOG/curl.args]"; fi
+# the default: Outcrop's own User-Agent; "tool": each tool's own, as before 1.21
+run_case pol_def
+assert_grep  "$MOCKLOG/httpx.args" -- '-H User-Agent: Mozilla/5\.0 \(Windows NT 10\.0; Win64; x64\) AppleWebKit/537\.36 \(KHTML, like Gecko\) Chrome/[0-9]+\.0\.0\.0 Safari/537\.36 ' "default: every tool sends a current Chrome's User-Agent"
+assert_grep  "$MOCKLOG/katana.args" -- '-H User-Agent: Mozilla/5\.0 \(Windows NT 10\.0; Win64; x64\) .*Chrome/'  "...katana too"
+run_case pol_oc --user-agent outcrop
+assert_grep  "$MOCKLOG/httpx.args" -- '-H User-Agent: Mozilla/5\.0 \(X11; Linux x86_64\) Outcrop \(authorized asset inventory\)' "--user-agent outcrop: Outcrop's own (WebInventory's form)"
+run_case pol_tool --active --user-agent tool
+refute_grep  "$MOCKLOG/httpx.args" -- 'User-Agent'                          "--user-agent tool: no User-Agent is set (each tool's own)..."
+assert_grep  "$MOCKLOG/wpscan.args" -- '--random-user-agent'                "...and wpscan keeps its random one, as before"
+run_case pol_br --user-agent browser
+assert_grep  "$MOCKLOG/httpx.args" -- '-H User-Agent: Mozilla/5\.0 \(Windows NT 10\.0; Win64; x64\) AppleWebKit/537\.36 \(KHTML, like Gecko\) Chrome/[0-9]+' "--user-agent browser: a current Chrome's"
+for _pa in "--header|Host: x|cannot be overridden" "--header|User-Agent: x|set the User-Agent with --user-agent" \
+           "--header|X-A: 1;2|no ';' in the value" "--header|bad header|want 'Name: value'" \
+           "--user-agent|a;;b|no ';;'" "--req-timeout|0|whole number of seconds"; do
+  IFS='|' read -r _o _v _m <<< "$_pa"; _rc=0
+  bash "$RUN_RECON" -i "$DOMAINS" "$_o" "$_v" --list-targets > /dev/null 2> "$TMP/pol.err" || _rc=$?
+  if [ "$_rc" = 2 ] && grep -q -- "$_m" "$TMP/pol.err"; then _pass "refused before anything is sent: $_o '$_v' (exit 2)"
+  else _fail "$_o '$_v': exit $_rc  [$(tail -n 1 "$TMP/pol.err")]"; fi
+done
+# every invocation of an HTTP tool in outcrop.sh takes its arguments from the policy (a static
+# check of every call path, including the ones no case above reaches): its command line, or the
+# argument array it runs with, names a PA_* array (the policy's flags for that tool)
+python3 - "$RUN_RECON" > "$TMP/pol-lint.txt" <<'PYLINT'
+import re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+lines, buf = [], ""
+for l in src.split("\n"):
+    buf += l
+    if buf.endswith("\\"):
+        buf = buf[:-1] + " "; continue
+    lines.append(buf); buf = ""
+TOOLS = r'(?:"\$HTTPX_BIN"|katana|nuclei|ffuf|feroxbuster|gospider|hakrawler|whatweb|wpscan|xnLinkFinder|arjun|secretfinder|gowitness|subjs|getJS|droopescan|joomscan|cmseek)'
+inv = re.compile(r'(?:_to\s+(?:"\$[A-Z_]+"|\d+)\s+|cache_or_run\s+\S+\s+\S+\s+--\s+_to\s+\S+\s+)' + TOOLS + r'(?=\s)')
+arrs = {}
+for l in lines:
+    for m in re.finditer(r'\b(?:local\s+)?([A-Za-z_][A-Za-z0-9_]*)(\+?)=\(([^)]*)\)', l):
+        if "PA_" in m.group(3):
+            arrs[m.group(1)] = True
+bad, n = [], 0
+for i, l in enumerate(lines):
+    if l.lstrip().startswith("#"):
+        continue
+    for m in inv.finditer(l):
+        n += 1
+        rest = l[m.start():]
+        if "PA_" in rest or any(('"${%s[@]}"' % a) in rest for a in arrs):
+            continue
+        bad.append(l.strip()[:160])
+print("invocations=%d" % n)
+for b in bad:
+    print("MISSING " + b)
+PYLINT
+if grep -q '^invocations=[1-9]' "$TMP/pol-lint.txt" && ! grep -q '^MISSING' "$TMP/pol-lint.txt"; then
+  _pass "every HTTP tool call path in outcrop.sh takes the policy ($(sed -n 's/^invocations=//p' "$TMP/pol-lint.txt") invocations)"
+else _fail "HTTP tool invocations without the policy  [$(grep -c '^MISSING' "$TMP/pol-lint.txt") in $TMP/pol-lint.txt]"; fi
+
+# --- Batch 7 (OA2, OA4): run health: WAF block pages and throttling, from what the run already has ----
+section "Batch 7 (OA2, OA4): run health: a WAF's block page is a waf_blocked warning naming the vendor; 429s, resets, timeouts make a host throttled"
+RH="$TMP/rh"; rm -rf "$RH"; mkdir -p "$RH/w/parts" "$RH/w/raw/lab.test" "$RH/w/raw/quiet.test"
+awk "/^# RUN-HEALTH/{f=1} f&&/^PYHEALTH\$/{f=0} f" "$RUN_RECON" > "$RH/health.py"
+printf 'lab.test\nquiet.test\n' > "$RH/domains.txt"
+python3 - "$RH/w/parts/httpx.lab.test.jsonl" <<'PYRH'
+import json, sys
+R = []
+def rec(host, st, title="", hdr=None, marks=(), n=1):
+    for i in range(n):
+        R.append({"url": "https://%s/p%d" % (host, i), "status_code": st, "title": title, "header": hdr or {},
+                  "extracts": {"waf": list(marks)} if marks else {}, "failed": False})
+rec("cf.lab.test", 403, "Attention Required! | Cloudflare", {"server": "cloudflare", "cf_ray": "8f2d-IAD"}, ["cf-error-details"], 3)
+rec("cf.lab.test", 200, "Home", {"server": "cloudflare", "cf_ray": "8f2e-IAD"})
+rec("ak.lab.test", 403, "Access Denied", {"server": "AkamaiGHost"}, ["Reference&#32;&#35;1"])
+rec("im.lab.test", 403, "", {"x_iinfo": "7-1-0 0NNN", "x_cdn": "Imperva"}, ["Incapsula incident ID", "_Incapsula_Resource"])
+rec("cfr.lab.test", 403, "ERROR: The request could not be satisfied", {"server": "CloudFront", "x_amz_cf_id": "x"}, ["Request blocked."])
+rec("f5.lab.test", 200, "Request Rejected", {}, ["The requested URL was rejected"])
+rec("su.lab.test", 403, "Sucuri WebSite Firewall - Access Denied", {"server": "Sucuri/Cloudproxy", "x_sucuri_id": "1"})
+rec("ms.lab.test", 406, "406 Not Acceptable", {"server": "Apache"}, ["Mod_Security"])
+rec("wf.lab.test", 503, "Your access to this site has been limited by the site owner", {}, ["Generated by Wordfence"])
+rec("plain.lab.test", 403, "403 Forbidden", {"server": "nginx"}, n=4)         # a plain 403: the site's own answer
+rec("app.lab.test", 200, "Lab app", {"server": "cloudflare", "cf_ray": "1"})  # behind Cloudflare, not blocked
+rec("cdnerr.lab.test", 403, "Forbidden", {"server": "cloudflare", "cf_ray": "1"})  # Cloudflare passing the origin's own 403
+rec("busy.lab.test", 429, "Too Many Requests", {}, n=6)
+rec("busy.lab.test", 200, "ok", {}, n=4)
+rec("few.lab.test", 429, "Too Many Requests", {}, n=2)                       # below THROTTLE_MIN
+rec("few.lab.test", 200, "ok", {}, n=30)
+open(sys.argv[1], "w").write("".join(json.dumps(r) + "\n" for r in R))
+PYRH
+for _i in 1 2 3; do printf '{"url":"https://slow.lab.test/x%d","error":"context deadline exceeded (Client.Timeout exceeded while awaiting headers)","status_code":0,"failed":true}\n' "$_i"; done > "$RH/w/raw/lab.test/hx_failed.jsonl"
+printf '{"url":"https://slow.lab.test/r","error":"read: connection reset by peer","failed":true}\n{"url":"https://sni.lab.test/","error":"cause=\\"tls: unrecognized name\\" chain=\\"could not tls handshake\\"","failed":true}\n' >> "$RH/w/raw/lab.test/hx_failed.jsonl"
+printf '{"url":"https://slow.lab.test/ok","status_code":200,"failed":false}\n' >> "$RH/w/parts/httpx.lab.test.jsonl"
+printf '{"timestamp":"t","endpoint":"https://slow.lab.test/c1","error":"Get \\"https://slow.lab.test/c1\\": read: connection reset by peer"}\n{"timestamp":"t","endpoint":"https://slow.lab.test/c2","error":"context deadline exceeded"}\n' > "$RH/w/raw/lab.test/katana_elog.jsonl"
+printf '{"template":"t.yaml","type":"http","input":"https://sni.lab.test/","address":"10.0.0.1:443","error":"tls: unrecognized name"}\n' > "$RH/w/raw/lab.test/nuclei_elog.scan.jsonl"
+python3 "$RH/health.py" "$RH/w" "$RH/domains.txt" "$RH/health.tsv" "$RH/kinds.jsonl" 5 10 > "$RH/out.txt" 2> "$RH/err.txt"
+for _v in "cf\.lab\.test.*cloudflare's block page \(status 403\)" "ak\.lab\.test.*akamai's" "im\.lab\.test.*imperva's" \
+          "cfr\.lab\.test.*aws-waf \(cloudfront\)'s" "f5\.lab\.test.*f5-asm's block page \(status 200\)" "su\.lab\.test.*sucuri's" \
+          "ms\.lab\.test.*modsecurity's block page \(status 406\)" "wf\.lab\.test.*wordfence's block page \(status 503\)"; do
+  assert_grep "$RH/out.txt" "^waf_blocked: $_v"                             "waf_blocked: ${_v%%\\*}... named with its vendor"
+done
+assert_grep  "$RH/out.txt" '^waf_blocked: cf\.lab\.test \(seed lab\.test\): 3 of 4 URL\(s\)'  "...counting the block pages among the host's answers"
+refute_grep  "$RH/out.txt" 'plain\.lab\.test|app\.lab\.test|cdnerr\.lab\.test'  "not flagged: a plain 403, a page behind Cloudflare, Cloudflare passing on the origin's own 403"
+assert_grep  "$RH/out.txt" '^throttled: busy\.lab\.test \(seed lab\.test\): 6 of 10 request\(s\).*429: 6' "throttled: 6 of 10 requests got 429"
+assert_grep  "$RH/out.txt" '^throttled: slow\.lab\.test .*timeouts: 4, resets: 2' "throttled: timeouts and resets, from httpx (-probe) and the crawl's error log"
+refute_grep  "$RH/out.txt" 'few\.lab\.test'                                "below the threshold (2 of 32): not throttled..."
+assert_grep  "$RH/health.tsv" '^lab\.test	few\.lab\.test	-	-	32	0	2	'  "...but listed in health.tsv"
+assert_grep  "$RH/health.tsv" '^lab\.test	sni\.lab\.test	-	-	1	0	0	0	0	2	'  "TLS name errors (httpx and nuclei) are counted"
+assert_grep  "$RH/kinds.jsonl" '"kind":"waf_blocked","seed":"lab\.test","host":"cf\.lab\.test","fields":\{"vendor":"cloudflare","statuses":"403"\}' "the structured warning: kind, seed, host, vendor..."
+assert_grep  "$RH/kinds.jsonl" '"kind":"throttled".*"counts":\{"requests":10,"blocked":0,"http_429":6' "...and the counts"
+python3 "$RH/health.py" "$RH/w" "$RH/domains.txt" "$RH/health2.tsv" "$RH/kinds2.jsonl" 50 10 > "$RH/out2.txt" 2>&1
+refute_grep  "$RH/out2.txt" '^throttled'                                   "THROTTLE_MIN=50: nothing is throttled"
+# end to end: an httpx that returns a Cloudflare block page, and requests it could not complete
+HB="$TMP/hbin"; rm -rf "$HB"; mkdir -p "$HB"
+cat > "$HB/httpx" <<EOF
+#!/usr/bin/env bash
+probe=0; json=0; for a in "\$@"; do [ "\$a" = -probe ] && probe=1; [ "\$a" = -json ] && json=1; done
+"$MOCKBIN/httpx" "\$@"; rc=\$?
+if [ "\$probe\$json" = 11 ]; then
+  for i in 1 2 3 4 5 6; do printf '{"url":"https://example.com/dead-%d","input":"https://example.com/dead-%d","error":"read: connection reset by peer","status_code":0,"failed":true}\n' \$i \$i; done
+  printf '{"url":"https://example.com/blocked","input":"https://example.com/blocked","status_code":403,"title":"Attention Required! | Cloudflare","header":{"server":"cloudflare","cf_ray":"8f2d-IAD"},"extracts":{"w":["cf-error-details"]},"failed":false}\n'
+fi
+exit \$rc
+EOF
+chmod +x "$HB/httpx"
+OUTDIR="$TMP/out_rh"; rm -rf "$OUTDIR"; mkdir -p "$OUTDIR"; CSV="$OUTDIR/r.csv"; ERRLOG="$OUTDIR/stderr.log"; rm -f "$MOCKLOG"/*.args
+timeout 25 env PATH="$HB:$TESTPATH" HTTPX_BIN=httpx SECLISTS="$SECLISTS_TEST" RECON_CLOUD_CACHE="$OUTDIR/c.tsv" TLS_CHAIN_CHECK=0 \
+  bash "$RUN_RECON" -i "$DOMAINS" -D "$OUTDIR" -o "$CSV" --keep-work --json > /dev/null 2> "$ERRLOG" || true
+assert_grep  "$MOCKLOG/httpx.args" -- '-json -probe .*-er \(\?i\)incapsula incident id\|'  "the enrichment request: -probe, and the WAF markers matched in the same response (-er)"
+assert_grep  "$(ls -d "$OUTDIR"/_work-* | head -n 1)/raw/example.com/hx_failed.jsonl" 'connection reset by peer' "requests httpx could not complete are kept apart (hx_failed.jsonl)..."
+refute_grep  "$CSV" 'dead-[0-9]'                                            "...and never become rows"
+assert_grep  "$ERRLOG" 'waf_blocked: example\.com \(seed example\.com\): 1 of [0-9]+ URL\(s\) got cloudflare' "the run warns: waf_blocked..."
+assert_grep  "$ERRLOG" 'throttled: example\.com \(seed example\.com\): [0-9]+ of [0-9]+ request\(s\)' "...and throttled"
+assert_grep  "$CSV.warnings.jsonl" '"kind":"waf_blocked","seed":"example\.com","host":"example\.com","fields":\{"vendor":"cloudflare"' "warnings.jsonl carries the kind (run-recon.warning/1, x-minor 1)"
+python3 "$B6/validate.py" "$SCHEMAS6" "run-recon.warning/1=$CSV.warnings.jsonl" > "$RH/valid.txt" 2>&1
+python3 -S "$B6/validate.py" "$SCHEMAS6" "run-recon.warning/1=$CSV.warnings.jsonl" > "$RH/valid-s.txt" 2>&1
+if grep -qx valid "$RH/valid.txt" && grep -qx valid "$RH/valid-s.txt"; then _pass "the kinded warnings validate against run-recon.warning/1 (both validators)"
+else _fail "kinded warnings do not validate  [$(cat "$RH/valid.txt" "$RH/valid-s.txt" | head -3)]"; fi
+assert_grep  "$CSV.health.tsv" '^example\.com	example\.com	waf_blocked\+throttled	cloudflare	'  "<out>.health.tsv: the host, both signals, the vendor"
+assert_grep  "$CSV.manifest.sha256" '  r\.csv\.health\.tsv$'                 "...listed in the run's manifest"
+bash "$(dirname "$RUN_RECON")/generate-report.sh" "$CSV" -o "$OUTDIR/r.html" > /dev/null 2>&1 || true
+assert_grep  "$OUTDIR/r.html" '<h3[^>]*>Run health</h3>'                     "report: a Run health section..."
+assert_grep  "$OUTDIR/r.html" '1 host\(s\) blocked the scan or slowed it down' "...saying the host's results are incomplete"
+run_case rh_passive --passive-only
+assert_absent "$CSV.health.tsv"                                            "--passive-only: no run-health check (nothing was sent)"
+
+# --- Batch 7 (OA6): a stopped run stops the traffic ------------------------------------
+section "Batch 7 (OA6): SIGTERM, Ctrl-C and --max-runtime stop every process of the run before Outcrop exits"
+SB="$TMP/stopbin"; rm -rf "$SB"; mkdir -p "$SB" "$TMP/stop"
+# a crawler that ignores SIGTERM and leaves a child that daemonized (double fork, its own session:
+# re-parented away from the run's tree, so only the run's OUTCROP_RUN tag can find it); each
+# appends a line every 0.1 s, the stand-in for requests to a target
+cat > "$SB/katana" <<'EOF'
+#!/usr/bin/env bash
+case " $* " in *" -version "*) echo "v1.0.0-stubborn"; exit 0;; esac
+trap '' TERM
+( setsid bash -c 'trap "" TERM; while :; do echo d >> "$MOCKLOG/stop.daemon"; sleep 0.1; done' < /dev/null > /dev/null 2>&1 & )
+while :; do echo k >> "$MOCKLOG/stop.beat"; sleep 0.1; done
+EOF
+chmod +x "$SB/katana"
+_st_bg(){ # <name> [args...]: the run in the background (exec: $! is outcrop itself), stubborn katana first on PATH
+  local n="$1"; shift
+  exec env PATH="$SB:$TESTPATH" HTTPX_BIN=httpx SECLISTS="$SECLISTS_TEST" RECON_CLOUD_CACHE="$TMP/stop/c.tsv" TLS_CHAIN_CHECK=0 \
+    STOP_GRACE=2 bash "$RUN_RECON" -i "$DOMAINS" -D "$TMP/stop/$n" -o "$TMP/stop/$n/r.csv" --no-report "$@" > /dev/null 2> "$TMP/stop/$n.err"
+}
+_st_wait(){ local _; for _ in $(seq 1 100); do [ -s "$MOCKLOG/stop.beat" ] && [ -s "$MOCKLOG/stop.daemon" ] && return 0; sleep 0.2; done; return 1; }
+_st_quiet(){ # nothing of the run is left: neither writer adds a line
+  local a b c d; a="$(wc -l < "$MOCKLOG/stop.beat")"; c="$(wc -l < "$MOCKLOG/stop.daemon")"; sleep 0.8
+  b="$(wc -l < "$MOCKLOG/stop.beat")"; d="$(wc -l < "$MOCKLOG/stop.daemon")"; [ "$a" = "$b" ] && [ "$c" = "$d" ]; }
+rm -f "$MOCKLOG"/stop.*; mkdir -p "$TMP/stop/term"
+_st_bg term & SP=$!
+if _st_wait; then
+  _t0="$(date +%s%N)"; kill -TERM "$SP" 2>/dev/null; _rc=0; wait "$SP" || _rc=$?; _t1="$(date +%s%N)"
+  _rc_is "$_rc" 143                                                         "SIGTERM: exit 143"
+  if _st_quiet; then _pass "SIGTERM: when Outcrop has exited, nothing of the run still sends (a tool ignoring SIGTERM, and its daemonized child)"
+  else _fail "SIGTERM: a process of the run kept going after Outcrop exited"; fi
+  _el=$(( (_t1 - _t0) / 1000000 ))
+  if [ "$_el" -ge 1500 ] && [ "$_el" -lt 5000 ]; then _pass "SIGTERM: the stubborn ones get STOP_GRACE (2 s) before SIGKILL (took ${_el} ms)"
+  else _fail "SIGTERM: took ${_el} ms (want 2 s grace, then SIGKILL)"; fi
+  assert_grep "$TMP/stop/term.err" 'stopped: [0-9]+ process\(es\) were still running 2s after SIGTERM and were killed \(SIGKILL\)' "...and says so"
+  assert_grep "$TMP/stop/term.err" 'interrupted: .*The work so far is kept in'  "...the work dir is kept for --resume, as before"
+else _fail "SIGTERM: the stubborn crawler did not start  [$TMP/stop/term.err]"; kill -KILL "$SP" 2>/dev/null; fi
+pkill -KILL -f 'stop\.daemon' 2>/dev/null || true
+rm -f "$MOCKLOG"/stop.*; mkdir -p "$TMP/stop/dl"
+_st_bg dl --max-runtime 3 & SP=$!
+_rc=0; wait "$SP" || _rc=$?
+_rc_is "$_rc" 124                                                           "--max-runtime 3: the run stops itself at the deadline, exit 124 (SIGTERM: 143)"
+assert_grep "$TMP/stop/dl.err" 'stopped: --max-runtime 3s reached'          "...it says the deadline was reached"
+if grep -qx 'status=timed-out' "$TMP"/stop/dl/_work-*/state 2>/dev/null; then _pass "...the work dir says timed-out (a run Tideline stopped at its deadline, not one that failed)"
+else _fail "--max-runtime: state $(grep -h '^status=' "$TMP"/stop/dl/_work-*/state 2>/dev/null)"; fi
+if [ -s "$MOCKLOG/stop.beat" ] && _st_quiet; then _pass "--max-runtime: nothing of the run keeps sending after the deadline"
+else _fail "--max-runtime: traffic after the deadline (or the crawler never ran)"; fi
+pkill -KILL -f 'stop\.daemon' 2>/dev/null || true
+_rc=0; bash "$RUN_RECON" -i "$DOMAINS" --max-runtime soon --list-targets > /dev/null 2> "$TMP/stop/bad.err" || _rc=$?
+_rc_is "$_rc" 2                                                             "--max-runtime: a non-number is refused (exit 2)"
+_rc=0; env PATH="$TESTPATH" HTTPX_BIN=httpx SECLISTS="$SECLISTS_TEST" RECON_CLOUD_CACHE="$TMP/stop/c.tsv" TLS_CHAIN_CHECK=0 \
+  bash "$RUN_RECON" -i "$DOMAINS" -D "$TMP/stop/ok" -o "$TMP/stop/ok/r.csv" --no-report --max-runtime 617 > /dev/null 2> "$TMP/stop/ok.err" || _rc=$?
+_rc_is "$_rc" 0                                                             "--max-runtime on a run that ends in time: exit 0..."
+if pgrep -f 'sleep 617' > /dev/null 2>&1; then _fail "...its watchdog outlived the run"; pkill -f 'sleep 617' 2>/dev/null || true
+else _pass "...and its watchdog is gone with it"; fi
+# a long stage of the main process (here the zone check, waiting on a dig that hangs): a SIGTERM
+# stops the run at once, not when the stage ends
+cat > "$SB/dig" <<'EOF'
+#!/usr/bin/env bash
+echo hang >> "$MOCKLOG/stop.dig"; exec sleep 30
+EOF
+chmod +x "$SB/dig"; rm -f "$MOCKLOG"/stop.*; mkdir -p "$TMP/stop/fg"
+_st_bg fg --zone-exposure & SP=$!
+for _ in $(seq 1 100); do [ -s "$MOCKLOG/stop.dig" ] && break; sleep 0.2; done
+if [ -s "$MOCKLOG/stop.dig" ]; then
+  sleep 0.3; _t0="$(date +%s%N)"; kill -TERM "$SP" 2>/dev/null; _rc=0; wait "$SP" || _rc=$?; _t1="$(date +%s%N)"
+  _el=$(( (_t1 - _t0) / 1000000 ))
+  if [ "$_rc" = 143 ] && [ "$_el" -lt 4000 ]; then _pass "SIGTERM during a main-process stage (the zone check): stopped in ${_el} ms, not after the stage"
+  else _fail "SIGTERM during the zone check: exit $_rc after ${_el} ms"; fi
+  if ! pgrep -f 'sleep 30' > /dev/null 2>&1 || [ -z "$(pgrep -f -P 1 'sleep 30')" ]; then _pass "...and its hanging dig is gone"
+  else _fail "...a hanging dig survived the run"; fi
+else _fail "the zone check never reached dig  [$TMP/stop/fg.err]"; kill -KILL "$SP" 2>/dev/null; fi
+rm -f "$SB/dig"
 
 # --- 53) service health check: --resolvers catches dead resolvers ----------
 # (placed last: swaps the dig mock for one that reports no reply)
