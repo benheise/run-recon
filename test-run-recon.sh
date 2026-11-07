@@ -3383,6 +3383,8 @@ import json, os, re, sys
 sd, rr, rdb = sys.argv[1:4]
 S = {}
 for n in sorted(os.listdir(sd)):
+    if not n.endswith(".json"):
+        continue
     s = json.load(open(os.path.join(sd, n)))
     S[s["x-tideline-schema"]] = s
 src = open(rr, encoding="utf-8").read()
@@ -3424,6 +3426,8 @@ import json, os, re, sys
 sd = sys.argv[1]
 S = {}
 for n in os.listdir(sd):
+    if not n.endswith(".json"):
+        continue
     s = json.load(open(os.path.join(sd, n)))
     S[s["x-tideline-schema"]] = s
 try:
@@ -3678,7 +3682,7 @@ assert_grep  "$B6/s1/r.csv.ship-state.json" '"state": "complete"'               
 assert_exists "$B6/s1/r.csv.urls.jsonl"                                                "--ship implies --json"
 refute_grep  "$B6/s1/r.csv.manifest.sha256" 'ship-state'                               "ship-state.json is written after the manifest, not listed in it"
 _rr6 "$B6/j1" --json --engagement eng-1 || true
-if [ "$(cd "$B6/j1" && ls | grep -v '^_work\|stderr.log' | sort | tr '\n' ' ')" = "$(cd "$B6/s1" && ls | grep -v '^_work\|stderr.log\|ship-state' | sort | tr '\n' ' ')" ]; then
+if [ "$(find "$B6/j1" -mindepth 1 -maxdepth 1 -printf '%f\n' | grep -v '^_work\|stderr.log' | sort | tr '\n' ' ')" = "$(find "$B6/s1" -mindepth 1 -maxdepth 1 -printf '%f\n' | grep -v '^_work\|stderr.log\|ship-state' | sort | tr '\n' ' ')" ]; then
   _pass "--ship writes the same files as --json, plus ship-state.json only"; else _fail "--ship writes the same files as --json, plus ship-state.json only"; fi
 if diff <(sort "$B6/j1/r.csv") <(sort "$B6/s1/r.csv") >/dev/null && cmp -s "$B6/j1/r.csv.urls.jsonl" "$B6/s1/r.csv.urls.jsonl"; then _pass "--ship: the CSV and urls.jsonl equal the --json run's"; else _fail "--ship: the CSV and urls.jsonl equal the --json run's"; fi
 _rc=0; _rr6 "$B6/s2" --ship "https://127.0.0.1:9" --ship-cert "$P6/rr-test01.pem" --ship-key "$P6/rr-test01.key" --ship-ca "$P6/root.pem" || _rc=$?
@@ -3689,6 +3693,60 @@ assert_grep  "$B6/s2/stderr.log" 'retry with: .*ship-recon\.sh ship .*r\.csv'   
 assert_grep  "$B6/s2/r.csv.run.json" '"exit_status": 0'                                "run.json keeps the scan's own exit status"
 mv "$MOCKBIN/curl.b6" "$MOCKBIN/curl"
 kill "$B6PID" 2>/dev/null; wait "$B6PID" 2>/dev/null || true
+
+section "Tideline identifiers are frozen (decided 2026-11-06): envelope, header, sensor URN, schema ids, checksums"
+python3 - "$SCHEMAS6" "$SHIP6" "$LABDIR6/mock-tideline.py" > "$B6/frozen.txt" 2>&1 <<'PYFRZ'
+import json, os, re, sys
+sd, ship, mock = sys.argv[1:4]
+src, msrc = open(ship, encoding="utf-8").read(), open(mock, encoding="utf-8").read()
+def ok(k, c):
+    print(k, bool(c))
+ok("envelope", 'ENVELOPE = "tideline-envelope/1"' in src and '{"schema": ENVELOPE,' in src)
+ok("header", '"Tideline-Signature: " + sig' in src and '"alg=ES256; enc=der; sig="' in src
+   and 'self.headers.get("Tideline-Signature")' in msrc)
+ok("sensor", 'r"URI:urn:tideline:sensor:([A-Za-z0-9][A-Za-z0-9._-]{0,63})(?=[,\\s]|$)"' in src
+   and 'URN = "urn:tideline:sensor:"' in msrc)
+ok("endpoints", all(e in src for e in ('"/v1/runs"', '"/v1/runs/%s/parts/%d"', '"/v1/runs/%s/complete"', '"/v1/runs/%s"')))
+bad = []
+for n in sorted(os.listdir(sd)):
+    if not n.endswith(".json"):
+        continue
+    s = json.load(open(os.path.join(sd, n)))
+    sid = s.get("x-tideline-schema", "")
+    if s.get("$id") != "urn:tideline:schema:" + sid or n != sid.replace("/", ".") + ".json" or not re.fullmatch(r"[a-z][a-z0-9.-]*/1", sid):
+        bad.append(n)
+env = json.load(open(os.path.join(sd, "tideline-envelope.1.json")))
+ok("schemaids", not bad and env["properties"]["schema"] == {"const": "tideline-envelope/1"})
+listed = {l.split()[1].lstrip("*") for l in open(os.path.join(sd, "SHA256SUMS")) if l.strip()}
+ok("sumslist", listed == {n for n in os.listdir(sd) if n.endswith(".json")})
+PYFRZ
+assert_grep "$B6/frozen.txt" '^envelope True$'   "frozen: the envelope schema is tideline-envelope/1"
+assert_grep "$B6/frozen.txt" '^header True$'     "frozen: the signature travels as 'Tideline-Signature: alg=ES256; enc=der; sig=<base64>'"
+assert_grep "$B6/frozen.txt" '^sensor True$'     "frozen: the sensor is the URI SAN urn:tideline:sensor:<id> (1-64 of A-Z a-z 0-9 . _ -)"
+assert_grep "$B6/frozen.txt" '^endpoints True$'  "frozen: the /v1/runs endpoints"
+assert_grep "$B6/frozen.txt" '^schemaids True$'  "frozen: every schema's \$id is urn:tideline:schema:<id>, its file <id>.json, major version 1"
+assert_grep "$B6/frozen.txt" '^sumslist True$'   "schemas/SHA256SUMS lists every schema file, and only those"
+if ( cd "$SCHEMAS6" && sha256sum --quiet -c SHA256SUMS ) >/dev/null 2>&1; then _pass "the frozen schemas match schemas/SHA256SUMS (a change needs a new major id, or x-minor and new sums)"
+else _fail "the frozen schemas match schemas/SHA256SUMS  [a frozen schema changed: add a field as x-minor+1 and regenerate the sums, or make a /2]"; fi
+T6="$B6/tenant"; mkdir -p "$T6"
+_t6cert(){ # <name> <subjectAltName>: a sensor certificate from the test intermediate
+  openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$T6/$1.key" 2>/dev/null; chmod 600 "$T6/$1.key"
+  openssl req -new -key "$T6/$1.key" -subj "/CN=$1" -out "$T6/$1.csr" 2>/dev/null
+  printf 'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\nsubjectAltName=%s\n' "$2" > "$T6/$1.ext"
+  openssl x509 -req -in "$T6/$1.csr" -CA "$P6/int.pem" -CAkey "$P6/int.key" -CAserial "$T6/int.srl" -CAcreateserial -days 7 \
+    -out "$T6/$1.crt" -extfile "$T6/$1.ext" 2>/dev/null
+  cat "$T6/$1.crt" "$P6/int.pem" > "$T6/$1.pem"
+}
+_t6cert tenant 'URI:urn:tideline:sensor:rr-t1,URI:urn:tideline:tenant:acme'
+_t6cert combined 'URI:urn:tideline:sensor:acme:rr-t1'
+_rc=0; _ship check --url "https://127.0.0.1:9" --cert "$T6/tenant.pem" --key "$T6/tenant.key" --ca "$P6/root.pem" || _rc=$?
+_rc_is "$_rc" 0                                                        "a certificate that also carries urn:tideline:tenant:acme passes"
+assert_grep "$B6/ship.err" 'settings ok: sensor rr-t1,'                "...and the sensor is its urn:tideline:sensor: URI, not the tenant"
+_rc=0; _ship envelope "$B6/run1/r.csv" --cert "$T6/tenant.pem" || _rc=$?
+if [ "$_rc" = 0 ] && python3 -c 'import json,sys; e=json.load(open(sys.argv[1])); sys.exit(0 if e["sensor"] == "rr-t1" and "acme" not in json.dumps(e) else 1)' "$B6/ship.out"; then
+  _pass "the envelope names the sensor and carries no tenant (ingest takes it from the certificate)"; else _fail "the envelope names the sensor and carries no tenant"; fi
+_rc=0; _ship check --url "https://127.0.0.1:9" --cert "$T6/combined.pem" --key "$T6/combined.key" --ca "$P6/root.pem" || _rc=$?
+_rc_is "$_rc" 1                                                        "a combined urn:tideline:sensor:<tenant>:<id> is refused (no colon in a sensor id)"
 
 # --- 53) service health check: --resolvers catches dead resolvers ----------
 # (placed last: swaps the dig mock for one that reports no reply)

@@ -663,7 +663,7 @@ if [ "$RUNNER_FOUND" = "yes" ]; then
   # the JSON Schemas of --json's records and of the Tideline envelope (1.20), for consumers
   if [ -d "$SCRIPT_DIR/schemas" ]; then
     if as_root install -d -m 0755 "$INSTALL_ROOT/bin/schemas" \
-       && as_root install -m 0644 "$SCRIPT_DIR"/schemas/*.json "$INSTALL_ROOT/bin/schemas/"; then
+       && as_root install -m 0644 "$SCRIPT_DIR"/schemas/*.json "$SCRIPT_DIR"/schemas/SHA256SUMS "$INSTALL_ROOT/bin/schemas/"; then
       ok "Installed: $INSTALL_ROOT/bin/schemas/  (JSON Schemas of the --json records and the Tideline envelope)"
     else
       warn "Could not install schemas/."

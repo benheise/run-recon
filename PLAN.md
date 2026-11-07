@@ -10,16 +10,17 @@ justified accuracy fix).
 **Last updated:** 2026-11-06, follow-ups F1–F10 done on `followups-v1.18` (PR #3), Batch 3 on
 `batch-3-email-dns` (PR #4), Batch 4 on `batch-4-evidence` (PR #5) and Batch 5 on `batch-5-redirects-tls`
 (PR #6, stacked on #5). Section 8 (JSON output and shipping to Tideline, P1–P3) was brought forward at
-Ben's request and is done as Batch 6 on `batch-6-json-ship` (PR #7, stacked on #6). v1.20.0 can be released
-once the pull requests are merged. The V-list (section 2) still needs Ben's Kali VM.
+Ben's request and is done as Batch 6 on `batch-6-json-ship` (PR #7, stacked on #6). `release-v1.20.0` (PR #8,
+stacked on #7) sets `VERSION` to 1.20.0: merge #3 → #8 in order, then create the v1.20.0 release and tag in the
+GitHub UI. The V-list (section 2) still needs Ben's Kali VM.
 
 ## 0. Source of truth
 
 | ID | Item | Status | Check |
 |---|---|---|---|
 | R1 | Git repository, `main` = v1.18.0, generated lab files ignored | Done | `git log` |
-| R2 | Push to GitHub (private `benheise/run-recon`) | Done: `main` pushed; releases v1.18.0 and v1.19.0 published. Tags cannot be pushed from Claude's sessions (HTTP 403), so releases/tags are created in the GitHub UI | tags `v1.18.0`, `v1.19.0` on GitHub |
-| R3 | Each batch on its own branch, merged by pull request | Done for Batch 2 (#1, merged); follow-ups #3; Batch 3 #4; Batch 4 #5; Batch 5 #6 (stacked on #5); Batch 6 #7 (stacked on #6) | PR per batch |
+| R2 | Push to GitHub (private `benheise/run-recon`) | Done: `main` pushed; releases v1.18.0 and v1.19.0 published; v1.20.0 ready (PR #8, release notes drafted). Tags cannot be pushed from Claude's sessions (HTTP 403), so releases/tags are created in the GitHub UI | tags `v1.18.0`, `v1.19.0` on GitHub; `v1.20.0` after #8 |
+| R3 | Each batch on its own branch, merged by pull request | Done for Batch 2 (#1, merged); follow-ups #3; Batch 3 #4; Batch 4 #5; Batch 5 #6 (stacked on #5); Batch 6 #7 (stacked on #6); release #8 (stacked on #7) | PR per batch |
 
 ## 1. Batch 2: HTTP detail (WebInventory A4, A5, A6, A11)
 
@@ -100,19 +101,20 @@ once the pull requests are merged. The V-list (section 2) still needs Ben's Kali
 
 The run-recon side of the platform plan (`claude/recon-platform-plan-v0.5.md` in the project). Tideline is
 the platform's name (`claude/naming-research.md`); the protocol identifiers use it (`tideline-envelope/1`,
-`Tideline-Signature`, `urn:tideline:sensor:<id>`). Planned for after the release, brought forward at Ben's
-request. Details: SHIPPING.md.
+`Tideline-Signature`, `urn:tideline:sensor:<id>`). **Decided 2026-11-06 (Ben): these names stay and are frozen**
+(SHIPPING.md, "Frozen identifiers"; the suite pins them and checks `schemas/SHA256SUMS`). Planned for after the
+release, brought forward at Ben's request. Details: SHIPPING.md.
 
 | ID | Item | Status | Check |
 |---|---|---|---|
 | P1 | `--json`: JSON lines per record kind with the CSV's and TSVs' field names: urls and services (from the CSV builder itself, unguarded), findings, DNS posture, edges, CNAMEs, zone names, screenshot classes, cloud assets, vulnx, delta, warnings, seeds; JSON Schemas (2020-12) in `schemas/` | Done (`batch-6-json-ship`) | suite: parity with the CSV, the findings parser, the schema contract (field lists read from the source); lab A/B |
 | P2 | `run_id` (UUID v4, kept across `--resume`), `--engagement`, `--job-id` in run.json and the manifest | Done | suite (incl. `--resume`) |
 | P3 | `--ship URL` with `--ship-cert`/`--ship-key`/`--ship-ca`/`--ship-proxy`: mTLS pinned to the Tideline CA (an empty `--capath`: `--cacert` alone still trusts the system store), signed `tideline-envelope/1` (ES256), gzip parts hashed as in the run's manifest, `ship-state.json`, exit 4; preflight before the scan; `ship-recon.sh` ship/status/export/envelope/check | Done | suite against `lab/mock-tideline.py` (delivery, re-ship, resume, refusals, pinning, export); `bench-run-recon.sh ship` (the shipped records equal the local CSV row for row) |
-| P4 | WebInventory's side (`-ShipTo`, `Send-WebInventoryRun.ps1`, `Register-WebInventorySensor.ps1`) against the same envelope, and moving `schemas/` to a `tideline-schemas` repository | Planned (WebInventory, Tideline) | contract test of both tools' lab output |
+| P4 | WebInventory's side (`-ShipTo`, `Send-WebInventoryRun.ps1`, `Register-WebInventorySensor.ps1`) against the same envelope; run-recon vendoring `schemas/` and `SHA256SUMS` from a tagged `tideline-schemas` release (the repository is drafted: `claude/tideline-schemas-v1.md`) | Planned (WebInventory, Tideline) | contract test of both tools' lab output; `sha256sum -c` of the vendored copy |
 
 ## Done (for reference)
 
-- **1.20.0 (unreleased, Batches 3–6 and the follow-ups):** see sections 3–8.
+- **1.20.0 (Batches 3–6 and the follow-ups; `VERSION` set by PR #8):** see sections 3–8.
 
 - **1.19.0 (Batch 2):** 17 HTTP columns from the enrichment request (no extra traffic); favicon hashes;
   real favicon-hash pivot feeding `--origin`; `ptr` under `--enrich`; `--extras` (robots.txt, security.txt,

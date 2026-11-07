@@ -23,7 +23,7 @@
 #
 set -euo pipefail
 
-VERSION="1.20.0-dev"
+VERSION="1.20.0"
 
 # Resolve our own directory early (BEFORE the worker-dispatch block below) so we
 # can locate sibling helper scripts (recon-db.sh, generate-report.sh) in both the

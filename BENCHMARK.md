@@ -407,7 +407,7 @@ hashed locally is listed in `PLAN.md` (F10).
   like the lab "breaking" between sessions. Started as a tracked background process it stays up. The new
   run-integrity checks reported it correctly: "no resolver answered", per-seed "none resolved", exit 3.
 
-## v1.20.0 (unreleased): the v1.18 follow-ups (F1–F10)
+## v1.20.0: the v1.18 follow-ups (F1–F10)
 
 Same lab and method; baseline v1.19.0 frozen from its tag (`938f58e`). The lab gained three fixtures for
 this work (`origin.spa.test` → a 403-only address, `nsec3.test` on BIND 9.18, nothing else changed), and
@@ -460,7 +460,7 @@ were recorded).
   part of the first. It suppressed every `origin-protected` line until the test with no exposed origin caught it.
 - **dnsx `-a -aaaa`** answers both families in one record; the mock answered only the last flag it saw.
 
-## v1.20.0 (unreleased): Batch 3, email and DNS posture and discovery coverage
+## v1.20.0: Batch 3, email and DNS posture and discovery coverage
 
 Same lab and method. The baseline is the follow-ups branch (`followups-v1.18`, frozen with `git archive`), so
 the A/B isolates Batch 3. The lab gained the `posture.test` zone, two MTA-STS policies, a Terraform state, port
@@ -509,7 +509,7 @@ in `-dm tld` mode it resolves through public DNS whatever `-r` says.
 - **`cloudlist` writes a default provider config on first run**, so "no config" could not be tested against
   `$HOME`; the test runs with an empty `HOME`.
 
-## v1.20.0 (unreleased): Batch 4, evidence and history
+## v1.20.0: Batch 4, evidence and history
 
 Same lab and method. The baseline is the Batch 3 branch (`batch-3-email-dns`, frozen with `git archive`), so the
 A/B isolates Batch 4. No lab fixture changed; the three new checks use the existing names.
@@ -578,7 +578,7 @@ applies on top of `-fs`), and `-cos` wins over `-cs`.
 - **The suite's AAAA test extracts code by a marker** (`-aaaa -json -silent`); the new dnsx call used the same
   argument order and was picked up first. The new calls use another order.
 
-## v1.20.0 (unreleased): Batch 5, redirect chains, login forms and TLS parity
+## v1.20.0: Batch 5, redirect chains, login forms and TLS parity
 
 Same lab and method. The baseline is the Batch 4 branch (`batch-4-evidence`, frozen with `git archive`), so the
 A/B isolates Batch 5. New fixtures: the redirect and login-form names in the Caddyfile, and the `tlslab` nginx
@@ -670,7 +670,7 @@ were run again once it was back, and passed.
 - **A suite file named `enum.py` shadowed Python's `enum` module** for the scripts next to it. The extracted
   probe is `tlsenum_probe.py` and runs with `-I`.
 
-## v1.20.0 (unreleased): Batch 6, JSON output and shipping to Tideline
+## v1.20.0: Batch 6, JSON output and shipping to Tideline
 
 Same lab and method. The baseline is the Batch 5 branch (`batch-5-redirects-tls`, frozen with `git archive`), so
 the A/B isolates Batch 6. Each comparison ran interleaved: the two sides alternated run by run, and the order
@@ -736,3 +736,22 @@ touch the scan: shipping starts after the run's manifest is written.
 - **The suite pulls the CSV builder out by a pattern anchored at `^python3 -`.** Exporting the `--json`
   switch kept that line as it was. A prefix assignment (`RR_JSON=… python3 - …`) would have silently
   hidden the builder from four test sections.
+
+## v1.20.0 release: A/B against v1.19.0
+
+The release against the previous one: v1.19.0 (`git archive v1.19.0`) against the release branch, on the
+default path (`--tls --ipv6`), interleaved run by run with the order switched each round.
+
+| Scenario | runs per side | v1.19.0 wall s | v1.20.0 wall s | v1.19.0 CPU s | v1.20.0 CPU s | `--exact` on the columns both write |
+|---|---:|---:|---:|---:|---:|---|
+| lab | 6 | 22.84 | 22.50 | 9.81 | 10.04 | 2 fields differ, every round: `wp-login.php`'s `auth=Form` and `CleartextAuth` (87 rows) |
+| farm, `-t 10` | 3 | 86.12 | 85.02 | 64.39 | 64.28 | identical, 50 rows, every round |
+
+- **Output.** Every existing column is identical, on the lab and on the farm. The only exception is
+  WordPress's login page, served on plain HTTP, where Batch 5's login-form detection reports a real
+  finding. The nine new columns are appended after `security_txt`. The noise floor (WordPress oEmbed's
+  random secret, eight `body_sha256` values) comes from a second run of v1.19.0.
+- **Timing.** Wall and CPU are equal within the spread. On the lab, v1.20.0 spends about 0.2 s more CPU on
+  the leaf-certificate parsing and the password-form regex that Batch 5 added to requests the run
+  already makes. On the farm, the CPU is the same.
+- **Lab checks.** All eleven pass on the release code (Batch 6's lab checks above).
